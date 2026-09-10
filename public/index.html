@@ -91,18 +91,24 @@
     </div>
   </div>
   </div><!-- /app-container -->
+  <div id="session-drop-overlay" aria-hidden="true">
+    <div id="session-drop-overlay-inner">Drop to move the session here</div>
+  </div>
   <div id="update-toast" class="hidden">
     <span id="update-toast-msg">Update ready — restart to apply</span>
     <button id="update-restart-btn">Restart</button>
     <button id="update-dismiss-btn">Later</button>
   </div>
-  <div id="status-bar"><span id="status-bar-info"></span><span id="status-bar-quota" style="display:none;"><span class="quota-track"><span class="quota-fill"></span></span><span class="quota-pct"></span></span><span id="status-bar-activity"></span><span id="status-bar-updater"></span></div>
+  <div id="status-bar"><span id="status-bar-info"></span><span id="status-bar-quota" style="display:none;"><span class="quota-track"><span class="quota-fill"></span></span><span class="quota-pct"></span></span><span id="status-bar-stop"></span><span id="status-bar-activity"></span><span id="status-bar-updater"></span></div>
   <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
   <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
   <script src="../node_modules/@xterm/addon-web-links/lib/addon-web-links.js"></script>
   <script src="../node_modules/@xterm/addon-search/lib/addon-search.js"></script>
   <script src="../node_modules/@xterm/addon-unicode-graphemes/lib/addon-unicode-graphemes.js"></script>
   <script src="../node_modules/@xterm/addon-webgl/lib/addon-webgl.js"></script>
+  <!-- Serializes a terminal's whole buffer so a session torn off into another
+       window keeps its scrollback; main's replay buffer is only a 256KB tail. -->
+  <script src="../node_modules/@xterm/addon-serialize/lib/addon-serialize.js"></script>
   <script src="../node_modules/morphdom/dist/morphdom-umd.js"></script>
   <script src="codemirror-bundle.js"></script>
   <script src="icons.js"></script>
@@ -118,6 +124,7 @@
   <script src="jsonl-viewer.js"></script>
   <script src="dialogs.js"></script>
   <script src="sidebar.js"></script>
+  <script src="session-drag.js"></script>
   <script src="plans-memory-view.js"></script>
   <script src="app.js"></script>
 </body>

@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer, webUtils } = require('electron');
+const { contextBridge, ipcRenderer, webFrame, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
   // Invoke (request-response)
@@ -26,6 +26,15 @@ contextBridge.exposeInMainWorld('api', {
   getSetting: (key) => ipcRenderer.invoke('get-setting', key),
   setSetting: (key, value) => ipcRenderer.invoke('set-setting', key, value),
   deleteSetting: (key) => ipcRenderer.invoke('delete-setting', key),
+  // Atomic merge — use this, not setSetting, for any partial update, or a
+  // concurrent save from another window silently reverts your keys.
+  mergeSetting: (key, patch) => ipcRenderer.invoke('merge-setting', key, patch),
+  // Global stop
+  getDriverStatus: () => ipcRenderer.invoke('driver-status'),
+  haltDriver: (reason) => ipcRenderer.invoke('driver-halt', reason),
+  clearDriverHalt: () => ipcRenderer.invoke('driver-clear-halt'),
+  onDriverHalted: (cb) => ipcRenderer.on('driver-halted', (_e, payload) => cb(payload)),
+  getSettingDefaults: () => ipcRenderer.invoke('get-setting-defaults'),
   getEffectiveSettings: (projectPath) => ipcRenderer.invoke('get-effective-settings', projectPath),
   getScheduleCreatorCommand: () => ipcRenderer.invoke('get-schedule-creator-command'),
   createScheduleSession: (projectPath) => ipcRenderer.invoke('create-schedule-session', projectPath),
@@ -68,6 +77,46 @@ contextBridge.exposeInMainWorld('api', {
   onStatusUpdate: (callback) => {
     ipcRenderer.on('status-update', (_event, text, type) => callback(text, type));
   },
+
+  // ── Multi-window + session tear-off ──────────────────────────────────
+  getWindowInfo: () => ipcRenderer.invoke('get-window-info'),
+  listWindows: () => ipcRenderer.invoke('list-windows'),
+  newWindow: () => ipcRenderer.invoke('new-window'),
+  getSessionOwners: () => ipcRenderer.invoke('get-session-owners'),
+  getSessionMeta: (sessionId) => ipcRenderer.invoke('get-session-meta', sessionId),
+  // targetWindowId null → tear off into a new window.
+  moveSession: (sessionId, targetWindowId, serialized) =>
+    ipcRenderer.invoke('move-session', { sessionId, targetWindowId, serialized }),
+  // The drag is driven from main (cursor tracking + a floating ghost window),
+  // because HTML5 drag-and-drop cannot cross BrowserWindows.
+  sessionDragStart: (sessionId, label, subtitle) =>
+    ipcRenderer.invoke('session-drag-start', { sessionId, label, subtitle }),
+  sessionDragEnd: (serialized) => ipcRenderer.invoke('session-drag-end', { serialized }),
+  sessionDragCancel: () => ipcRenderer.invoke('session-drag-cancel'),
+
+  // Take over a session another window (or no window) is holding.
+  onAdoptSession: (callback) => {
+    ipcRenderer.on('adopt-session', (_event, payload) => callback(payload));
+  },
+  // Drop this session's view — it now lives somewhere else. Must NOT trigger
+  // close-terminal: the new owner is already attached.
+  onReleaseSession: (callback) => {
+    ipcRenderer.on('release-session', (_event, sessionId) => callback(sessionId));
+  },
+  onSessionDragHover: (callback) => {
+    ipcRenderer.on('session-drag-hover', (_event, payload) => callback(payload));
+  },
+  onWindowsChanged: (callback) => {
+    ipcRenderer.on('windows-changed', (_event, windows) => callback(windows));
+  },
+  onSessionOwnerChanged: (callback) => {
+    ipcRenderer.on('session-owner-changed', (_event, payload) => callback(payload));
+  },
+
+  // Renderer zoom — the UI scale control. Scales text, spacing and icons
+  // together, so dense layouts stay intact at any size.
+  setZoomFactor: (f) => webFrame.setZoomFactor(f),
+  getZoomFactor: () => webFrame.getZoomFactor(),
 
   // File drag-and-drop
   getPathForFile: (file) => webUtils.getPathForFile(file),

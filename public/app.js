@@ -47,7 +47,9 @@ const jsonlViewerSessionId = document.getElementById('jsonl-viewer-session-id');
 const jsonlViewerBody = document.getElementById('jsonl-viewer-body');
 const gridViewer = document.getElementById('grid-viewer');
 const gridViewerCount = document.getElementById('grid-viewer-count');
-let gridViewActive = localStorage.getItem('gridViewActive') === '1';
+// sessionStorage: per-window. localStorage is shared across every window on
+// this origin, so it made view mode a single app-wide flag.
+let gridViewActive = sessionStorage.getItem('gridViewActive') === '1';
 
 // Map<sessionId, { terminal, element, fitAddon, session, closed }>
 const openSessions = new Map();
@@ -82,6 +84,27 @@ let cachedPlans = [];
 let visibleSessionCount = 10;
 let sessionMaxAgeDays = 3;
 const pendingSessions = new Map(); // sessionId → { session, projectPath, folder }
+
+// --- Multi-window state ---
+// myWindowId is this renderer's BrowserWindow id. sessionOwners mirrors main's
+// ownership map so the sidebar can show which sessions live in another window
+// (and so a click there is understood as "bring it here", not "open a second
+// view of it" — main enforces exclusivity either way).
+let myWindowId = null;
+let knownWindows = [];
+const sessionOwners = new Map(); // sessionId → windowId | null
+
+function ownerOf(sessionId) {
+  const id = sessionOwners.get(sessionId);
+  return id === undefined ? null : id;
+}
+function isOwnedElsewhere(sessionId) {
+  const owner = ownerOf(sessionId);
+  return owner != null && myWindowId != null && owner !== myWindowId;
+}
+window._isOwnedElsewhere = isOwnedElsewhere;
+window._getMyWindowId = () => myWindowId;
+window._getKnownWindows = () => knownWindows;
 
 // Bridge functions for settings-panel.js
 window._setVisibleSessionCount = (v) => { visibleSessionCount = v; };
@@ -205,6 +228,37 @@ window.api.onTerminalData((sessionId, data) => {
   }
 });
 
+// A session's id can change under us (fork, plan-accept). Several maps are
+// keyed by it, and gridCards / terminalWriteBuffers were being missed — leaving
+// an orphan card that showed "Stopped" with no Stop button and could not be
+// destroyed, plus a write buffer whose queued flush wrote nowhere.
+function rekeySessionMaps(oldId, newId) {
+  if (oldId === newId) return;
+  const card = gridCards.get(oldId);
+  if (card) {
+    card.dataset.sessionId = newId;
+    gridCards.delete(oldId);
+    gridCards.set(newId, card);
+  }
+  const buf = terminalWriteBuffers.get(oldId);
+  if (buf) {
+    terminalWriteBuffers.delete(oldId);
+    terminalWriteBuffers.set(newId, buf);
+  }
+  if (sessionOwners.has(oldId)) {
+    sessionOwners.set(newId, sessionOwners.get(oldId));
+    sessionOwners.delete(oldId);
+  }
+  for (const set of [attentionSessions, responseReadySessions]) {
+    if (set.has(oldId)) { set.delete(oldId); set.add(newId); }
+  }
+  if (sessionBusyState.has(oldId)) {
+    sessionBusyState.set(newId, sessionBusyState.get(oldId));
+    sessionBusyState.delete(oldId);
+  }
+  if (gridFocusedSessionId === oldId) gridFocusedSessionId = newId;
+}
+
 window.api.onSessionDetected((tempId, realId) => {
   const entry = openSessions.get(tempId);
   if (!entry) return;
@@ -215,6 +269,7 @@ window.api.onSessionDetected((tempId, realId) => {
   // Re-key in openSessions
   openSessions.delete(tempId);
   openSessions.set(realId, entry);
+  rekeySessionMaps(tempId, realId);
 
   terminalHeaderId.textContent = realId;
   terminalHeaderName.textContent = 'New session';
@@ -239,6 +294,7 @@ window.api.onSessionForked((oldId, newId) => {
 
   openSessions.delete(oldId);
   openSessions.set(newId, entry);
+  rekeySessionMaps(oldId, newId);
 
   // Re-key file panel state for the new session ID
   if (typeof rekeyFilePanelState === 'function') rekeyFilePanelState(oldId, newId);
@@ -290,7 +346,7 @@ window.api.onProcessExited((sessionId, exitCode) => {
   if (session?.type === 'terminal') {
     if (entry) destroySession(sessionId);
     if (gridViewActive) {
-      gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
+      updateGridCount();
     } else if (activeSessionId === sessionId) {
       setActiveSession(null);
       terminalHeader.style.display = 'none';
@@ -317,10 +373,99 @@ window.api.onProcessExited((sessionId, exitCode) => {
   // real session file is coming.
 
   if (gridViewActive) {
-    gridViewerCount.textContent = gridCards.size + ' session' + (gridCards.size !== 1 ? 's' : '');
+    updateGridCount();
   }
 
   pollActiveSessions();
+});
+
+// ── Session tear-off (see session-drag.js for the gesture) ──────────────
+
+// This window is taking over a session. The PTY never moved — only the view. A
+// live xterm cannot cross BrowserWindows, so we build a fresh one and paint it
+// from the serialized buffer the source window handed over, then attach with
+// skipReplay so main does not also replay its 256KB tail on top.
+window.api.onAdoptSession(async ({ sessionId, serialized, projectPath }) => {
+  try {
+    // The session may not be in this window's sidebar at all, so resolve its
+    // metadata from main rather than from the local sessionMap.
+    let session = sessionMap.get(sessionId);
+    if (!session) {
+      const meta = await window.api.getSessionMeta(sessionId);
+      if (!meta) return;
+      session = {
+        sessionId,
+        projectPath: meta.projectPath || projectPath,
+        type: meta.isPlainTerminal ? 'terminal' : undefined,
+        modified: new Date().toISOString(),
+        summary: '',
+      };
+      sessionMap.set(sessionId, session);
+    }
+
+    if (openSessions.has(sessionId)) releaseSessionView(sessionId);
+
+    const entry = createTerminalEntry(session);
+    if (serialized) {
+      // Written before attaching so the live stream lands after the history.
+      try { entry.terminal.write(serialized); } catch (e) { console.warn('[tearoff] replay failed', e); }
+    }
+
+    const result = await window.api.openTerminal(
+      sessionId, session.projectPath, false, { skipReplay: !!serialized });
+    if (!result || !result.ok) {
+      entry.terminal.write(`\r\nError adopting session: ${result && result.error}\r\n`);
+      entry.closed = true;
+      return;
+    }
+    if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
+
+    sessionOwners.set(sessionId, myWindowId);
+    showSession(sessionId);
+    // The session is probably not in this window's sidebar yet.
+    loadProjects();
+    pollActiveSessions();
+  } catch (e) {
+    console.error('[tearoff] adopt failed', e);
+  }
+});
+
+// Another window has taken this session. Drop our view WITHOUT close-terminal —
+// the new owner is already attached, and detaching would pull it out from under
+// them.
+window.api.onReleaseSession((sessionId) => {
+  if (!openSessions.has(sessionId)) return;
+  const wasActive = activeSessionId === sessionId;
+  releaseSessionView(sessionId);
+  sessionOwners.delete(sessionId);
+  if (wasActive) {
+    setActiveSession(null);
+    if (!gridViewActive) {
+      terminalHeader.style.display = 'none';
+      placeholder.style.display = '';
+    }
+  }
+  refreshSidebar();
+  updateRunningIndicators();
+});
+
+window.api.onSessionOwnerChanged(({ sessionId, windowId }) => {
+  if (windowId == null) sessionOwners.delete(sessionId);
+  else sessionOwners.set(sessionId, windowId);
+  updateRunningIndicators();
+});
+
+window.api.onWindowsChanged((windows) => {
+  knownWindows = Array.isArray(windows) ? windows : [];
+});
+
+// Highlight this window as a drop target while a session is dragged over it.
+window.api.onSessionDragHover(({ hoverWindowId, sourceWindowId, mode }) => {
+  const isTarget = hoverWindowId != null && hoverWindowId === myWindowId && myWindowId !== sourceWindowId;
+  document.body.classList.toggle('session-drop-target', !!isTarget);
+  if (mode === 'none' || hoverWindowId == null) {
+    // Nothing to show here.
+  }
 });
 
 // --- Terminal notifications (iTerm2 OSC 9 — "needs attention") ---
@@ -997,6 +1142,13 @@ initGridObservers();
   // Insert next to the resort button
   resortBtn.parentElement.insertBefore(gridToggleBtn, resortBtn);
 
+  const newWindowBtn = document.createElement('button');
+  newWindowBtn.id = 'new-window-btn';
+  newWindowBtn.title = 'New window (Ctrl/Cmd+Shift+N)';
+  newWindowBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="13" height="12" rx="2"></rect><path d="M8 21h11a2 2 0 0 0 2-2V9"></path></svg>';
+  newWindowBtn.addEventListener('click', () => window.api.newWindow());
+  resortBtn.parentElement.insertBefore(newWindowBtn, gridToggleBtn);
+
   // Global keyboard shortcuts (covers non-terminal focus)
   // When a terminal is focused, xterm's customKeyEventHandler fires first and sets
   // e._handled to prevent the document listener from double-firing the same action.
@@ -1007,6 +1159,21 @@ initGridObservers();
     if (e.key === 'g' && mod && e.shiftKey && !e.altKey) {
       e.preventDefault();
       toggleGridView();
+      return;
+    }
+    // Cmd/Ctrl+Shift+N → new window
+    if (e.key === 'n' && mod && e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      window.api.newWindow();
+      return;
+    }
+    // Cmd/Ctrl+Shift+O → tear the active session off into its own window
+    if (e.key === 'o' && mod && e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      if (activeSessionId && openSessions.has(activeSessionId)) {
+        const serialized = serializeSession(activeSessionId);
+        window.api.moveSession(activeSessionId, null, serialized);
+      }
       return;
     }
     // Session navigation: Cmd+Shift+[/], Cmd+Arrow
@@ -1044,6 +1211,9 @@ setTimeout(() => {
     if (global.sessionMaxAgeDays) {
       sessionMaxAgeDays = global.sessionMaxAgeDays;
     }
+    if (global.uiScale && typeof window.api.setZoomFactor === 'function') {
+      window.api.setZoomFactor(global.uiScale);
+    }
     if (global.terminalTheme && TERMINAL_THEMES[global.terminalTheme]) {
       currentThemeName = global.terminalTheme;
       TERMINAL_THEME = getTerminalTheme();
@@ -1051,15 +1221,38 @@ setTimeout(() => {
   }
 })();
 
-loadProjects().then(() => {
+// Learn our own window id before anything that depends on ownership renders.
+// A window that does not know its own id cannot tell "my session" from "a
+// session another window is showing", and would happily steal it back.
+const windowIdentityReady = (async () => {
+  try {
+    const info = await window.api.getWindowInfo();
+    myWindowId = info && info.windowId != null ? info.windowId : null;
+    knownWindows = (info && info.windows) || [];
+    const owners = await window.api.getSessionOwners();
+    for (const [sid, wid] of Object.entries(owners || {})) sessionOwners.set(sid, wid);
+  } catch (e) {
+    console.warn('[windows] could not resolve window identity', e);
+  }
+})();
+
+initSessionDrag();
+
+Promise.all([loadProjects(), windowIdentityReady]).then(() => {
+  updateRunningIndicators();
   // Restore grid view preference before opening sessions so they enter grid mode
-  if (localStorage.getItem('gridViewActive') === '1') {
+  if (sessionStorage.getItem('gridViewActive') === '1') {
     showGridView();
   }
-  // Restore active session after reload
+  // Restore active session after reload — but never one another window is
+  // currently displaying, or a reload here would silently steal it from there.
   if (activeSessionId && !openSessions.has(activeSessionId)) {
-    const session = sessionMap.get(activeSessionId);
-    if (session) openSession(session);
+    if (isOwnedElsewhere(activeSessionId)) {
+      setActiveSession(null);
+    } else {
+      const session = sessionMap.get(activeSessionId);
+      if (session) openSession(session);
+    }
   }
 });
 
@@ -1196,6 +1389,70 @@ function buildQuotaBar(row) {
   return wrap;
 }
 
+// Non-quota chips that sit alongside the bars: things the account cannot be
+// seen anywhere else on this machine when the member dashboard is unavailable.
+function buildStateChip({ text, title, tone }) {
+  const el = document.createElement('span');
+  el.className = 'quota-chip' + (tone ? ' quota-chip-' + tone : '');
+  el.textContent = text;
+  el.title = title || text;
+  return el;
+}
+
+function billingChips(usage) {
+  const chips = [];
+  const b = usage && usage.billing;
+
+  if (usage && usage._verdict === 'unknown') {
+    chips.push(buildStateChip({
+      text: usage._reason === 'http_429' ? 'usage: rate limited' : 'usage: unknown',
+      title: `Usage could not be read (${usage._reason || 'unknown'}). `
+        + 'Treated as unknown, never as 0% used.',
+      tone: 'warn',
+    }));
+  }
+
+  if (b && b.canBill) {
+    // extra_usage.is_enabled === true means crossing the plan limit bills
+    // rather than blocking. Worth stating plainly and permanently.
+    chips.push(buildStateChip({
+      text: b.capVisible ? 'overage: capped' : 'overage: uncapped',
+      title: b.capVisible
+        ? `Extra usage is on, with a visible limit (${b.caps.join(', ')}).`
+        : 'Extra usage is ON and no spend limit is visible on this account, so '
+          + 'crossing the plan limit bills rather than blocking. '
+          + (b.canToggle ? '' : 'This member cannot turn it off. ')
+          + (b.dashboardAvailable ? '' : 'This member cannot see what was billed.'),
+      tone: b.capVisible ? 'ok' : 'bad',
+    }));
+  }
+
+  if (usage && usage.tokenExpiresAtMs) {
+    const leftMs = usage.tokenExpiresAtMs - Date.now();
+    if (leftMs < 45 * 60 * 1000) {
+      chips.push(buildStateChip({
+        text: leftMs <= 0 ? 'token expired' : `token ${Math.max(1, Math.round(leftMs / 60000))}m`,
+        title: leftMs <= 0
+          ? 'The Claude credentials on this machine have expired; usage cannot be read '
+            + 'until the CLI refreshes them.'
+          : 'Time left on the current access token. Usage reads stop working when it expires.',
+        tone: leftMs <= 0 ? 'bad' : 'warn',
+      }));
+    }
+  }
+
+  if (usage && usage.schemaChanged) {
+    chips.push(buildStateChip({
+      text: 'usage schema changed',
+      title: 'The usage response changed shape. Percentages may refer to different '
+        + 'limits than before — worth a look before trusting them.',
+      tone: 'warn',
+    }));
+  }
+
+  return chips;
+}
+
 async function refreshQuotaGauge() {
   try {
     const usage = await window.api.getUsage();
@@ -1205,14 +1462,203 @@ async function refreshQuotaGauge() {
       : (usage?.session !== undefined
         ? [{ kind: 'session', label: 'Current session', percent: usage.session, reset: usage.sessionReset }]
         : []);
-    if (!rows.length) { quotaGaugeEl.style.display = 'none'; return; }
+    const chips = billingChips(usage);
+    if (!rows.length && !chips.length) { quotaGaugeEl.style.display = 'none'; return; }
 
-    quotaGaugeEl.replaceChildren(...rows.map(buildQuotaBar));
+    quotaGaugeEl.replaceChildren(...rows.map(buildQuotaBar), ...chips);
     quotaGaugeEl.style.display = '';
   } catch {}
 }
 refreshQuotaGauge();
 setInterval(refreshQuotaGauge, 5 * 60 * 1000);
+
+// --- Global stop control -------------------------------------------------
+//
+// Stops every scheduled Claude task and kills any that are running. The state
+// lives in a file (%LOCALAPPDATA%\switchboard-driver\HALT), so it survives a
+// restart and can be set by something other than this button — a script, or a
+// synced folder from a phone. That is the point of a kill switch: it must not
+// depend on this window being responsive.
+const stopEl = document.getElementById('status-bar-stop');
+
+let stopState = { halted: { halted: false, reason: null }, degraded: false, survivors: [] };
+// A short-lived line describing what the last action actually did. Without
+// this, pressing Stop with nothing running produces no visible effect beyond
+// the banner, which reads as an unresponsive control.
+let stopOutcome = null;   // { text, tone, untilMs }
+let stopOutcomeTimer = null;
+
+function setStopOutcome(text, tone) {
+  stopOutcome = { text, tone, untilMs: Date.now() + 7000 };
+  if (stopOutcomeTimer) clearTimeout(stopOutcomeTimer);
+  stopOutcomeTimer = setTimeout(() => { stopOutcome = null; renderStopControl(); }, 7000);
+}
+
+function renderStopControl() {
+  if (!stopEl) return;
+  const halted = !!(stopState.halted && stopState.halted.halted);
+  stopEl.replaceChildren();
+  stopEl.classList.toggle('is-stopped', halted);
+
+  const outcome = (stopOutcome && stopOutcome.untilMs > Date.now()) ? stopOutcome : null;
+
+  if (!halted) {
+    // Deliberately quiet. It is always available, but it is not the thing you
+    // should be looking at when nothing is wrong.
+    const btn = document.createElement('button');
+    btn.id = 'stop-tasks-btn';
+    btn.className = 'stop-btn';
+    btn.textContent = 'Stop tasks';
+    btn.title = 'Stop all scheduled Claude tasks and kill any that are running.\n'
+      + 'Survives a restart until you resume it.';
+    btn.addEventListener('click', engageStop);
+    stopEl.appendChild(btn);
+    if (outcome) stopEl.appendChild(buildStopOutcome(outcome));
+    return;
+  }
+
+  const label = document.createElement('span');
+  label.className = 'stop-banner';
+  label.textContent = 'Scheduled tasks stopped';
+  // Say *why* on the surface. A stop that outlives the session that set it is
+  // otherwise a mystery on the next launch.
+  if (stopState.halted.reason && stopState.halted.reason !== 'stopped from the status bar') {
+    label.textContent += ` \u00b7 ${stopState.halted.reason}`;
+  }
+  label.title = stopState.halted.reason
+    ? `Reason: ${stopState.halted.reason}`
+    : 'A global stop is in force.';
+  stopEl.appendChild(label);
+
+  // A process we could not kill is the one case that has to be loud — the
+  // alternative is reporting a clean stop while something is still running.
+  if (stopState.degraded && (stopState.survivors || []).length) {
+    const warn = document.createElement('span');
+    warn.className = 'stop-banner stop-banner-degraded';
+    warn.textContent = `${stopState.survivors.length} survived`;
+    warn.title = 'These processes did not die and are still running:\n'
+      + stopState.survivors.map(s => `pid ${s.pid}${s.commandLine ? ' — ' + s.commandLine : ''}`).join('\n');
+    stopEl.appendChild(warn);
+  }
+
+  const resume = document.createElement('button');
+  resume.className = 'stop-btn stop-btn-resume';
+  resume.textContent = 'Resume';
+  resume.title = 'Let scheduled tasks run again.';
+  resume.addEventListener('click', clearStop);
+  stopEl.appendChild(resume);
+
+  if (outcome) stopEl.appendChild(buildStopOutcome(outcome));
+}
+
+function buildStopOutcome(outcome) {
+  const el = document.createElement('span');
+  el.className = 'stop-outcome' + (outcome.tone ? ' stop-outcome-' + outcome.tone : '');
+  el.textContent = outcome.text;
+  el.title = outcome.text;
+  return el;
+}
+
+async function engageStop() {
+  // No confirmation on the way in. A stop control that asks "are you sure" is a
+  // worse stop control, and the action is recoverable via Resume.
+  const btn = document.getElementById('stop-tasks-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Stopping\u2026'; }
+
+  // Read the registry immediately before halting, so the outcome line can be
+  // specific about what was actually killed rather than guessing from a cached
+  // count. One extra round-trip on a click nobody makes often.
+  let wasRunning = 0;
+  try {
+    const pre = await window.api.getDriverStatus();
+    wasRunning = (pre && pre.children ? pre.children : []).length;
+  } catch { wasRunning = -1; }
+
+  let res;
+  try {
+    res = await window.api.haltDriver('stopped from the status bar');
+    if (res && res.degraded) {
+      stopState = { ...stopState, degraded: true, survivors: res.survivors || [] };
+    }
+  } catch (err) {
+    console.error('[stop] halt failed:', err);
+    setStopOutcome('stop failed \u2014 see console', 'bad');
+    if (btn) { btn.disabled = false; btn.textContent = 'Stop tasks'; }
+    renderStopControl();
+    return;
+  }
+
+  const survivors = (res && res.survivors ? res.survivors : []).length;
+  if (survivors) {
+    setStopOutcome(`${survivors} process(es) would not die`, 'bad');
+  } else if (wasRunning < 0) {
+    setStopOutcome('stopped', 'ok');
+  } else if (wasRunning === 0) {
+    // The common case, and the one that previously looked like a no-op.
+    setStopOutcome('stopped \u2014 nothing was running', 'ok');
+  } else {
+    setStopOutcome(`stopped \u2014 ${wasRunning} killed`, 'ok');
+  }
+
+  await refreshStopState();
+}
+
+async function clearStop() {
+  // Confirmation belongs on the way OUT. Engaging a stop is the safe direction;
+  // lifting one is not, so it should not be a single stray click.
+  const reason = stopState.halted && stopState.halted.reason;
+  const msg = 'Let scheduled tasks run again?'
+    + (reason ? `\n\nCurrent stop reason:\n${reason}` : '')
+    + ((stopState.survivors || []).length
+      ? `\n\n${stopState.survivors.length} process(es) from the last stop were never confirmed dead.`
+      : '');
+  if (!confirm(msg)) return;
+  try {
+    await window.api.clearDriverHalt();
+    setStopOutcome('scheduled tasks may run again', 'ok');
+  } catch (err) {
+    console.error('[stop] clear failed:', err);
+    setStopOutcome('resume failed \u2014 see console', 'bad');
+  }
+  await refreshStopState();
+}
+
+async function refreshStopState() {
+  try {
+    const s = await window.api.getDriverStatus();
+    stopState = {
+      halted: s.halted || { halted: false, reason: null },
+      // A fresh status read cannot know about survivors from a previous halt in
+      // another window, so keep what the broadcast told us while still halted.
+      degraded: s.halted && s.halted.halted ? stopState.degraded : false,
+      survivors: s.halted && s.halted.halted ? stopState.survivors : [],
+      children: s.children || [],
+    };
+  } catch {
+    // Leave the last known state rather than implying "not stopped".
+  }
+  renderStopControl();
+}
+
+// Instant across every window: main broadcasts on halt and on clear.
+if (typeof window.api.onDriverHalted === 'function') {
+  window.api.onDriverHalted(payload => {
+    if (payload) {
+      stopState = {
+        halted: payload.halted || { halted: false, reason: null },
+        degraded: !!payload.degraded,
+        survivors: payload.survivors || [],
+      };
+    }
+    renderStopControl();
+  });
+}
+
+renderStopControl();
+refreshStopState();
+// Catches a HALT file written by something other than this UI. Slower than the
+// broadcast on purpose — this is a fallback, not the primary path.
+setInterval(refreshStopState, 60 * 1000);
 quotaGaugeEl.addEventListener('click', () => {
   document.querySelector('.sidebar-tab[data-tab="stats"]')?.click();
 });

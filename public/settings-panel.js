@@ -11,7 +11,7 @@
     const terminalArea = document.getElementById('terminal-area');
     const terminalHeader = document.getElementById('terminal-header');
     const placeholder = document.getElementById('placeholder');
-    const gridViewActive = localStorage.getItem('gridViewActive') === '1';
+    const gridViewActive = sessionStorage.getItem('gridViewActive') === '1';
     const activeSessionId = sessionStorage.getItem('activeSessionId') || null;
     // Check if there's an active session with an open terminal
     if (activeSessionId && window._openSessions && window._openSessions.has(activeSessionId)) {
@@ -29,6 +29,16 @@
     const settingsKey = isProject ? 'project:' + projectPath : 'global';
     const current = (await window.api.getSetting(settingsKey)) || {};
     const globalSettings = isProject ? ((await window.api.getSetting('global')) || {}) : {};
+    // The app's real defaults. Every fallback below comes from here so the panel
+    // can never show a value the app would not itself have used — the literals
+    // that used to be inline had already drifted (visibleSessionCount was 10
+    // here and 5 in main.js).
+    let appDefaults = {};
+    try {
+      if (typeof window.api.getSettingDefaults === 'function') {
+        appDefaults = (await window.api.getSettingDefaults()) || {};
+      }
+    } catch { appDefaults = {}; }
 
     const shortName = isProject
       ? shortProjectPath(projectPath)
@@ -52,10 +62,11 @@
     }
 
     function fieldValue(fieldName, fallback) {
+      const base = appDefaults[fieldName] !== undefined ? appDefaults[fieldName] : fallback;
       if (isProject && (current[fieldName] === undefined || current[fieldName] === null)) {
-        return globalSettings[fieldName] !== undefined ? globalSettings[fieldName] : fallback;
+        return globalSettings[fieldName] !== undefined ? globalSettings[fieldName] : base;
       }
-      return current[fieldName] !== undefined ? current[fieldName] : fallback;
+      return current[fieldName] !== undefined ? current[fieldName] : base;
     }
 
     function fieldDisabled(fieldName) {
@@ -63,7 +74,13 @@
       return (current[fieldName] === undefined || current[fieldName] === null) ? 'disabled' : '';
     }
 
-    const permModeValue = fieldValue('permissionMode', '');
+    // Sentinel for the --dangerously-skip-permissions option in the Permission
+    // Mode picker. Not a real permission mode: it maps to its own claude flag.
+    const DANGEROUS_SKIP = '__dangerous_skip__';
+    const dangerSkipValue = fieldValue('dangerouslySkipPermissions', false);
+    const permModeValue = dangerSkipValue
+      ? DANGEROUS_SKIP
+      : fieldValue('permissionMode', '');
     const worktreeValue = fieldValue('worktree', false);
     const worktreeNameValue = fieldValue('worktreeName', '');
     const chromeValue = fieldValue('chrome', false);
@@ -71,9 +88,39 @@
     const addDirsValue = fieldValue('addDirs', '');
     const visCountValue = fieldValue('visibleSessionCount', 10);
     const maxAgeValue = fieldValue('sessionMaxAgeDays', 3);
-    const themeValue = fieldValue('terminalTheme', 'switchboard');
+    // Fall back to the theme that is actually rendering, not a hardcoded name.
+    // With a literal here, the dropdown could show a different theme than the
+    // terminal was using, and saving any unrelated setting would silently
+    // switch the user's theme out from under them.
+    const themeValue = fieldValue('terminalTheme',
+      typeof currentThemeName === 'string' ? currentThemeName : 'switchboard');
+    const uiScaleValue = fieldValue('uiScale', 1);
+    const projectBaseValue = fieldValue('projectBaseDir', '');
     const mcpEmulationValue = fieldValue('mcpEmulation', true);
     const shellProfileValue = fieldValue('shellProfile', 'auto');
+
+    // What the form is about to be rendered with. Compared against the form's
+    // contents on save so an untouched field is not written out as an explicit
+    // override. permissionMode is paired with dangerouslySkipPermissions here
+    // because the two are one control in the UI.
+    const renderedValues = {
+      dangerouslySkipPermissions: dangerSkipValue,
+      permissionMode: dangerSkipValue ? null : (permModeValue || null),
+      worktree: worktreeValue,
+      worktreeName: worktreeNameValue,
+      chrome: chromeValue,
+      preLaunchCmd: preLaunchValue,
+      addDirs: addDirsValue,
+      visibleSessionCount: visCountValue,
+      sessionMaxAgeDays: maxAgeValue,
+      terminalTheme: themeValue,
+      uiScale: uiScaleValue,
+      projectBaseDir: projectBaseValue,
+      mcpEmulation: mcpEmulationValue,
+      shellProfile: shellProfileValue,
+    };
+    const unchanged = (a, b) =>
+      a === b || (a == null && b == null) || String(a) === String(b);
 
     // Discover available shell profiles
     let shellProfiles = [];
@@ -98,6 +145,7 @@
                 ? '<option value="">Default (none)</option>'
                 : `<option value="${m.value}" ${permModeValue === m.value ? 'selected' : ''}>${escapeHtml(m.label)}</option>`
               ).join('')}
+              <option value="${DANGEROUS_SKIP}" ${permModeValue === DANGEROUS_SKIP ? 'selected' : ''}>Dangerous Skip (--dangerously-skip-permissions)</option>
             </select>
           </div>
         </div>
@@ -174,6 +222,37 @@
 
       ${!isProject ? `<div class="settings-section">
         <div class="settings-section-title">Application</div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">New project folder</span>
+            <div class="settings-description">Where "Add project" opens. You can create a new
+              folder from inside the picker. Leave empty to reopen wherever you last added
+              a project from.</div>
+          </div>
+          <div class="settings-field-control">
+            <input type="text" class="settings-input" id="sv-project-base"
+                   placeholder="remember last used"
+                   value="${escapeHtml(String(projectBaseValue || ''))}">
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">Text size</span>
+            <div class="settings-description">Scales the whole interface. Bigger text is
+              measurably easier to read, and the best size differs enough between people
+              that it is worth trying a step up from whatever looks normal.</div>
+          </div>
+          <div class="settings-field-control">
+            <select class="settings-select" id="sv-ui-scale">
+              ${[['0.9', 'Small (90%)'], ['1', 'Default (100%)'], ['1.1', 'Large (110%)'],
+                 ['1.2', 'Larger (120%)'], ['1.35', 'Largest (135%)']]
+                .map(([v, l]) => `<option value="${v}" ${String(uiScaleValue) === v ? 'selected' : ''}>${l}</option>`)
+                .join('')}
+            </select>
+          </div>
+        </div>
 
         <div class="settings-field">
           <div class="settings-field-info">
@@ -293,8 +372,18 @@
             if (fieldMap[field]) settings[field] = fieldMap[field]();
           }
         });
+        // permissionMode and dangerouslySkipPermissions are one choice in the
+        // UI and mutually exclusive in main.js, so write them together.
+        const pmCb = settingsViewerBody.querySelector('.use-global-cb[data-field="permissionMode"]');
+        if (pmCb && !pmCb.checked) {
+          const pm = settingsViewerBody.querySelector('#sv-perm-mode').value;
+          settings.dangerouslySkipPermissions = pm === DANGEROUS_SKIP;
+          settings.permissionMode = pm === DANGEROUS_SKIP ? null : (pm || null);
+        }
       } else {
-        settings.permissionMode = settingsViewerBody.querySelector('#sv-perm-mode').value || null;
+        const pm = settingsViewerBody.querySelector('#sv-perm-mode').value;
+        settings.dangerouslySkipPermissions = pm === DANGEROUS_SKIP;
+        settings.permissionMode = pm === DANGEROUS_SKIP ? null : (pm || null);
         settings.worktree = settingsViewerBody.querySelector('#sv-worktree').checked;
         settings.worktreeName = settingsViewerBody.querySelector('#sv-worktree-name').value.trim();
         settings.chrome = settingsViewerBody.querySelector('#sv-chrome').checked;
@@ -303,17 +392,44 @@
         settings.visibleSessionCount = parseInt(settingsViewerBody.querySelector('#sv-visible-count').value) || 10;
         settings.sessionMaxAgeDays = parseInt(settingsViewerBody.querySelector('#sv-max-age').value) || 3;
         settings.terminalTheme = settingsViewerBody.querySelector('#sv-terminal-theme').value || 'switchboard';
+        settings.uiScale = parseFloat(settingsViewerBody.querySelector('#sv-ui-scale').value) || 1;
+        settings.projectBaseDir = settingsViewerBody.querySelector('#sv-project-base').value.trim();
         settings.mcpEmulation = settingsViewerBody.querySelector('#sv-mcp-emulation').checked;
         settings.shellProfile = settingsViewerBody.querySelector('#sv-shell-profile').value || 'auto';
       }
 
-      // Merge form values into existing settings to preserve keys not managed by the form
+      // An absent setting means "use the app default". Writing every field on
+      // every Save turned that into a permanent explicit override for settings
+      // the user never chose — which is how dangerouslySkipPermissions ended up
+      // pinned to false. Keep only fields that were already stored or actually
+      // edited, so a Save with no changes is a real no-op.
       if (!isProject) {
-        const existing = (await window.api.getSetting('global')) || {};
-        settings = { ...existing, ...settings };
+        for (const key of Object.keys(settings)) {
+          if (current[key] === undefined && unchanged(settings[key], renderedValues[key])) {
+            delete settings[key];
+          }
+        }
       }
 
-      await window.api.setSetting(settingsKey, settings);
+      // Merge inside a transaction rather than read-modify-write out here.
+      // The old sequence (getSetting -> spread -> setSetting) drops any key a
+      // second window wrote in between, which is how a tightened setting could
+      // silently revert to its default.
+      if (typeof window.api.mergeSetting === 'function') {
+        await window.api.mergeSetting(settingsKey, settings);
+      } else {
+        if (!isProject) {
+          const existing = (await window.api.getSetting('global')) || {};
+          settings = { ...existing, ...settings };
+        }
+        await window.api.setSetting(settingsKey, settings);
+      }
+
+      // Apply immediately — a size control whose effect you cannot see is
+      // useless for finding your own optimum.
+      if (!isProject && settings.uiScale && typeof window.api.setZoomFactor === 'function') {
+        window.api.setZoomFactor(settings.uiScale);
+      }
 
       // Update visibleSessionCount, sessionMaxAgeDays, and theme
       if (!isProject) {
@@ -330,7 +446,8 @@
       }
 
       // Notify if IDE Emulation changed
-      if (!isProject && settings.mcpEmulation !== mcpEmulationValue) {
+      if (!isProject && settings.mcpEmulation !== undefined
+          && settings.mcpEmulation !== mcpEmulationValue) {
         const notice = document.createElement('div');
         notice.className = 'settings-notice';
         notice.textContent = 'IDE Emulation setting changed. New sessions will use the updated setting \u2014 running sessions are not affected.';

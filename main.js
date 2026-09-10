@@ -6,8 +6,14 @@ const os = require('os');
 const pty = require('node-pty');
 const log = require('electron-log');
 // getFolderIndexMtimeMs moved to session-cache.js
-const { startMcpServer, shutdownMcpServer, shutdownAll: shutdownAllMcp, resolvePendingDiff, rekeyMcpServer, cleanStaleLockFiles } = require('./mcp-bridge');
-const { fetchAndTransformUsage } = require('./claude-auth');
+const { startMcpServer, shutdownMcpServer, shutdownAll: shutdownAllMcp, resolvePendingDiff, rekeyMcpServer, setMcpWindow, cleanStaleLockFiles } = require('./mcp-bridge');
+const { fetchAndTransformUsage, transformUsageResponse } = require('./claude-auth');
+const usageSource = require('./usage-source');
+const driverStore = require('./driver-store');
+const custody = require('./driver-custody');
+const registry = require('./window-registry');
+const dragProxy = require('./drag-proxy');
+const sessionMove = require('./session-move');
 
 // SWITCHBOARD_DATA_DIR isolates a dev/test instance from the installed app:
 // db.js puts switchboard.db under it, and pointing userData there gives the
@@ -20,14 +26,76 @@ if (process.env.SWITCHBOARD_DATA_DIR) {
 log.transports.file.level = app.isPackaged ? 'info' : 'debug';
 log.transports.console.level = app.isPackaged ? 'info' : 'debug';
 
+// Windows taskbar identity. Without this an unpackaged Electron app is grouped
+// and iconed as "Electron", so a pinned shortcut shows Electron's icon and a
+// separate taskbar button from the running window. electron-builder sets this
+// for packaged builds from build.appId; dev runs need it explicitly.
+if (process.platform === 'win32') {
+  app.setAppUserModelId('ai.doctly.switchboard');
+}
+
+// A dead stdout must never kill the app.
+//
+// electron-log's console transport writes to stdout/stderr on every log call. If
+// whatever launched us handed Electron a pipe and then exited, that write fails
+// with EPIPE — and with no 'error' listener Node re-throws it as an uncaught
+// exception in the main process, so the whole app dies with a modal
+// "A JavaScript error occurred in the main process" dialog, triggered by
+// something as ordinary as clicking a session.
+//
+// The file transport is the log that matters (%APPDATA%/switchboard/logs);
+// console output is a convenience. Losing it must be silent.
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on('error', (err) => {
+    if (err && (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED')) return;
+    // Anything else is worth knowing about, but still must not throw.
+    try { log.transports.file.level && log.error('[stdio]', err && err.message); } catch {}
+  });
+}
+
 try { require('electron-reloader')(module, { watchRenderer: true }); } catch {};
 
+// Environment a running Claude Code session stamps onto everything it spawns.
+//
+// If Switchboard is itself started from inside a Claude Code session — a
+// terminal, a task runner, an agent — these are inherited by the Electron
+// process and then handed straight to every PTY it opens. The CLI sees
+// CLAUDE_CODE_CHILD_SESSION, decides it is a nested child, and prints:
+//
+//   Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker
+//
+// which is self-defeating here: sessions started from Switchboard are never
+// written to ~/.claude/projects, so they never appear in Switchboard.
+//
+// The messaging socket/token and session id are worse than useless downstream —
+// they point the new session at the PARENT session's IPC channel.
+// Note: Switchboard sets CLAUDECODE=1 itself for PLAIN terminals (see the
+// claudeShim below) to explain that sessions start from the + button. Stripping
+// it here is still correct — that assignment happens after this spread, so the
+// deliberate one survives and only an inherited one is removed.
+const CLAUDE_SESSION_VARS = [
+  'AI_AGENT',
+  'CLAUDECODE',
+  'CLAUDE_CODE_CHILD_SESSION',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_CODE_EXECPATH',
+  'CLAUDE_CODE_MESSAGING_SOCKET',
+  'CLAUDE_CODE_MESSAGING_TOKEN',
+  'CLAUDE_CODE_SESSION_ID',
+  'CLAUDE_CODE_SSE_PORT',
+  'CLAUDE_CODE_USE_POWERSHELL_TOOL',
+  'CLAUDE_EFFORT',
+  'CLAUDE_PID',
+];
+
 // Clean env for child processes — strip Electron internals that cause nested
-// Electron apps (or node-pty inside them) to malfunction.
+// Electron apps (or node-pty inside them) to malfunction, plus any inherited
+// Claude Code session markers (see above).
 const cleanPtyEnv = Object.fromEntries(
   Object.entries(process.env).filter(([k]) =>
     !k.startsWith('ELECTRON_') &&
     !k.startsWith('GOOGLE_API_KEY') &&
+    !CLAUDE_SESSION_VARS.includes(k) &&
     k !== 'NODE_OPTIONS' &&
     k !== 'ORIGINAL_XDG_CURRENT_DESKTOP' &&
     k !== 'WT_SESSION'
@@ -51,9 +119,8 @@ if (app.isPackaged || process.env.FORCE_UPDATER) {
 
   function sendUpdaterEvent(type, data) {
     log.info(`[updater] ${type}`, data || '');
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('updater-event', type, data);
-    }
+    // Every window shows the update toast.
+    registry.broadcast('updater-event', type, data);
   }
   autoUpdater.on('checking-for-update', () => sendUpdaterEvent('checking'));
   autoUpdater.on('update-available', (info) => sendUpdaterEvent('update-available', info));
@@ -62,9 +129,7 @@ if (app.isPackaged || process.env.FORCE_UPDATER) {
   autoUpdater.on('update-downloaded', (info) => sendUpdaterEvent('update-downloaded', info));
   autoUpdater.on('error', (err) => {
     log.error('[updater] Error:', err?.message || String(err));
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('updater-event', 'error', { message: err?.message || String(err) });
-    }
+    registry.broadcast('updater-event', 'error', { message: err?.message || String(err) });
   });
 }
 const {
@@ -74,7 +139,7 @@ const {
   getFolderMeta, getAllFolderMeta, setFolderMeta,
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
   searchByType, isSearchIndexPopulated, searchFtsRecreated,
-  getSetting, setSetting, deleteSetting,
+  getSetting, setSetting, mergeSetting, deleteSetting,
   closeDb,
 } = require('./db');
 
@@ -86,34 +151,99 @@ const MAX_BUFFER_SIZE = 256 * 1024;
 
 // Active PTY sessions
 const activeSessions = new Map();
-let mainWindow = null;
 
-function createWindow() {
-  // Restore saved window bounds
-  const savedBounds = getSetting('global')?.windowBounds;
-  let bounds = { width: 1400, height: 900 };
+registry.init({ log });
 
-  let restorePosition = null;
-  if (savedBounds && savedBounds.width && savedBounds.height) {
-    bounds.width = savedBounds.width;
-    bounds.height = savedBounds.height;
-
-    // Only restore position if it's on a visible display
-    if (savedBounds.x != null && savedBounds.y != null) {
-      const displays = screen.getAllDisplays();
-      const onScreen = displays.some(d => {
-        const b = d.bounds;
-        return savedBounds.x >= b.x - 100 && savedBounds.x < b.x + b.width &&
-               savedBounds.y >= b.y - 100 && savedBounds.y < b.y + b.height;
+// Window geometry is persisted as a LIST, written by one debounced snapshotter
+// for all windows at once. Per-window writes to the shared `global` settings row
+// would race: every writer does read → mutate → write-whole-blob, so two windows
+// saving bounds at the same moment lose one of the updates.
+let layoutTimer = null;
+function saveWindowLayout() {
+  if (layoutTimer) clearTimeout(layoutTimer);
+  layoutTimer = setTimeout(() => {
+    layoutTimer = null;
+    const layout = registry.allWindows()
+      .filter(w => !w.isMinimized())
+      .map(w => {
+        const b = w.getBounds();
+        return { x: b.x, y: b.y, width: b.width, height: b.height };
       });
-      if (onScreen) {
-        restorePosition = { x: savedBounds.x, y: savedBounds.y };
-      }
+    if (layout.length) mergeSetting('global', { windowLayout: layout });
+  }, 500);
+}
+
+function flushWindowLayout() {
+  if (layoutTimer) { clearTimeout(layoutTimer); layoutTimer = null; }
+  const layout = registry.allWindows()
+    .filter(w => !w.isMinimized())
+    .map(w => {
+      const b = w.getBounds();
+      return { x: b.x, y: b.y, width: b.width, height: b.height };
+    });
+  if (layout.length) mergeSetting('global', { windowLayout: layout });
+}
+
+function isOnSomeDisplay(x, y) {
+  return screen.getAllDisplays().some(d => {
+    const b = d.bounds;
+    return x >= b.x - 100 && x < b.x + b.width && y >= b.y - 100 && y < b.y + b.height;
+  });
+}
+
+/** Bounds for a window we are creating with no explicit position. */
+function nextWindowBounds() {
+  const global = getSetting('global') || {};
+  const layout = Array.isArray(global.windowLayout) ? global.windowLayout : [];
+  // Legacy single-slot key from before multi-window.
+  const legacy = global.windowBounds ? [global.windowBounds] : [];
+  const saved = (layout.length ? layout : legacy)[registry.windowCount()];
+
+  if (saved && saved.width && saved.height) {
+    const bounds = { width: saved.width, height: saved.height };
+    if (saved.x != null && saved.y != null && isOnSomeDisplay(saved.x, saved.y)) {
+      bounds.x = saved.x;
+      bounds.y = saved.y;
     }
+    return bounds;
   }
 
-  mainWindow = new BrowserWindow({
-    ...bounds,
+  // No saved slot for this index: cascade off the focused window so a new
+  // window never lands exactly on top of an existing one.
+  const anchor = registry.allWindows().find(w => w.isFocused()) || registry.allWindows()[0];
+  if (anchor) {
+    const b = anchor.getBounds();
+    const wa = screen.getDisplayNearestPoint({ x: b.x, y: b.y }).workArea;
+    return {
+      x: Math.min(b.x + 40, wa.x + wa.width - 900),
+      y: Math.min(b.y + 40, wa.y + wa.height - 600),
+      width: b.width,
+      height: b.height,
+    };
+  }
+  return { width: 1400, height: 900 };
+}
+
+/**
+ * Create an app window.
+ *
+ * Every handler below closes over the local `win`, never a module-level
+ * singleton. That was a latent bug even with one window: `will-navigate`,
+ * `did-finish-load` and the bounds handlers all read `mainWindow`, so the moment
+ * a second window existed, window A's handlers operated on window B.
+ *
+ * @param {object} [opts]
+ * @param {object} [opts.bounds] explicit geometry (a tear-off drop point)
+ * @param {object} [opts.adopt]  { sessionId, serialized, projectPath } to take
+ *                               over as soon as the renderer is ready
+ */
+function createWindow(opts = {}) {
+  const bounds = opts.bounds || nextWindowBounds();
+  const hasPosition = bounds.x != null && bounds.y != null;
+
+  const win = new BrowserWindow({
+    width: bounds.width || 1400,
+    height: bounds.height || 900,
     minWidth: 800,
     minHeight: 500,
     title: 'Switchboard',
@@ -124,21 +254,22 @@ function createWindow() {
       contextIsolation: true,
     },
   });
+  registry.register(win);
 
   // Set position after creation to prevent macOS from clamping size
-  if (restorePosition) {
-    mainWindow.setBounds({ ...restorePosition, width: bounds.width, height: bounds.height });
+  if (hasPosition) {
+    win.setBounds({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height });
   }
 
-  mainWindow.loadFile(path.join(__dirname, 'public', 'index.html'));
+  win.loadFile(path.join(__dirname, 'public', 'index.html'));
 
   // Open external links in the system browser instead of a child BrowserWindow
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+  win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch(() => {});
     return { action: 'deny' };
   });
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (url !== mainWindow.webContents.getURL()) {
+  win.webContents.on('will-navigate', (event, url) => {
+    if (url !== win.webContents.getURL()) {
       event.preventDefault();
       if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch(() => {});
     }
@@ -146,8 +277,8 @@ function createWindow() {
   // Override window.open so xterm WebLinksAddon's default handler (which does
   // window.open() then sets location.href) routes through our IPC instead of
   // creating a child BrowserWindow.
-  mainWindow.webContents.on('did-finish-load', () => {
-    mainWindow.webContents.executeJavaScript(`
+  win.webContents.on('did-finish-load', () => {
+    win.webContents.executeJavaScript(`
       window.open = function(url) {
         if (url && /^https?:\\/\\//i.test(url)) { window.api.openExternal(url); return null; }
         const proxy = {};
@@ -161,57 +292,71 @@ function createWindow() {
         return proxy;
       };
       void 0;
-    `);
+    `).catch(() => {});
+
+    // A torn-off window is told what to adopt only once its renderer exists.
+    // Ownership was already flipped to this window by session-move, so the
+    // source window's release cannot detach it from under us.
+    if (opts.adopt && opts.adopt.sessionId) {
+      win.webContents.send('adopt-session', {
+        sessionId: opts.adopt.sessionId,
+        serialized: opts.adopt.serialized || '',
+        projectPath: opts.adopt.projectPath,
+      });
+      opts.adopt = null;
+    }
   });
+
+  // Surface renderer errors in the main log. Renderer console output otherwise
+  // goes nowhere you can see without DevTools, which makes a multi-window bug
+  // (where the interesting window is not the focused one) very hard to chase.
+  if (!app.isPackaged) {
+    win.webContents.on('console-message', (...args) => {
+      // Electron changed this signature: older builds pass
+      // (event, level, message, line, sourceId); newer ones pass one event
+      // object with string levels. Handle both.
+      const first = args[0];
+      let level, message, line, sourceId;
+      if (first && typeof first === 'object' && 'message' in first) {
+        level = first.level; message = first.message;
+        line = first.lineNumber; sourceId = first.sourceId;
+      } else {
+        [, level, message, line, sourceId] = args;
+      }
+      if (level === 'error' || level === 3 || level === 'warning' || level === 2) {
+        log.error(`[renderer:${win.id}] ${message} (${sourceId}:${line})`);
+      }
+    });
+  }
 
   // Prevent Cmd+R / Ctrl+Shift+R from reloading the page (Chromium built-in).
   // Ctrl+R alone on macOS is NOT a reload shortcut and must pass through to xterm
   // for reverse-i-search.
-  mainWindow.webContents.on('before-input-event', (event, input) => {
+  win.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown') return;
     const key = input.key.toLowerCase();
     if (key === 'r' && input.meta) event.preventDefault();
     if (key === 'r' && input.control && input.shift) event.preventDefault();
   });
 
-  // Save window bounds on move/resize (debounced)
-  let boundsTimer = null;
-  const saveBounds = () => {
-    if (boundsTimer) clearTimeout(boundsTimer);
-    boundsTimer = setTimeout(() => {
-      if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized()) return;
-      const b = mainWindow.getBounds();
-      const global = getSetting('global') || {};
-      global.windowBounds = { x: b.x, y: b.y, width: b.width, height: b.height };
-      setSetting('global', global);
-    }, 500);
-  };
-  mainWindow.on('resize', saveBounds);
-  mainWindow.on('move', saveBounds);
+  win.on('resize', saveWindowLayout);
+  win.on('move', saveWindowLayout);
+  win.on('close', flushWindowLayout);
 
-  // Also save immediately before close (debounce may not have flushed)
-  mainWindow.on('close', () => {
-    if (boundsTimer) clearTimeout(boundsTimer);
-    if (!mainWindow.isMinimized()) {
-      const b = mainWindow.getBounds();
-      const global = getSetting('global') || {};
-      global.windowBounds = { x: b.x, y: b.y, width: b.width, height: b.height };
-      setSetting('global', global);
-    }
+  win.on('closed', () => {
+    // Sessions this window was showing keep running with no view; any window can
+    // adopt them by clicking them. PTYs are killed only in 'before-quit' — the
+    // old code killed every session in the app here, which with more than one
+    // window would destroy the other windows' work.
+    registry.releaseWindow(win.id);
+    releaseFileWatchers(win.id);
+    // Tell the survivors, so their sidebars stop showing this window as a
+    // "move to" target and re-render the released sessions as unowned.
+    registry.broadcast('windows-changed', registry.describeWindows());
   });
 
-  mainWindow.on('closed', () => {
-    // On macOS the app stays alive in the dock after the last window closes.
-    // Kill all running PTY processes so orphaned `claude` processes don't
-    // accumulate in the background with no way for the user to interact.
-    for (const [id, session] of activeSessions) {
-      if (!session.exited) {
-        try { session.pty.kill(); } catch {}
-      }
-      activeSessions.delete(id);
-    }
-    mainWindow = null;
-  });
+  registry.broadcast('windows-changed', registry.describeWindows());
+  return win;
 }
 
 function buildMenu() {
@@ -265,7 +410,7 @@ const sessionCache = require('./session-cache');
 sessionCache.init({
   PROJECTS_DIR,
   activeSessions,
-  getMainWindow: () => mainWindow,
+  broadcast: registry.broadcast,
   log,
   db: {
     deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession,
@@ -277,12 +422,34 @@ const { readSessionFile, readFolderFromFilesystem, refreshFolder, reconcileCache
         buildProjectsFromCache, notifyRendererProjectsChanged, sendStatus, populateCacheViaWorker } = sessionCache;
 
 // --- IPC: browse-folder ---
-ipcMain.handle('browse-folder', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
+ipcMain.handle('browse-folder', async (event) => {
+  const global = getSetting('global') || {};
+  // Explicit setting wins; otherwise fall back to wherever a project was last
+  // added from, which makes the picker self-tuning with no configuration.
+  const candidates = [global.projectBaseDir, global.lastProjectBrowseDir, os.homedir()];
+  let defaultPath;
+  for (const c of candidates) {
+    if (c && fs.existsSync(c)) { defaultPath = c; break; }
+  }
+
+  // Parent the dialog to the window that asked, not to whichever window a
+  // singleton happened to point at.
+  const result = await dialog.showOpenDialog(registry.windowOf(event), {
     properties: ['openDirectory', 'createDirectory'],
     title: 'Select Project Folder',
+    ...(defaultPath ? { defaultPath } : {}),
   });
   if (result.canceled || !result.filePaths.length) return null;
+
+  // Remember the PARENT: after adding tools/my-thing, the useful place to land
+  // next time is tools, not my-thing. Only when no explicit base is configured,
+  // so an explicit setting is never quietly overwritten.
+  if (!global.projectBaseDir) {
+    const parent = path.dirname(result.filePaths[0]);
+    if (parent && parent !== result.filePaths[0]) {
+      mergeSetting('global', { lastProjectBrowseDir: parent });
+    }
+  }
   return result.filePaths[0];
 });
 
@@ -307,12 +474,24 @@ ipcMain.handle('add-project', (_event, projectPath) => {
       fs.mkdirSync(folderPath, { recursive: true });
     }
 
-    // Seed a minimal .jsonl so deriveProjectPath can read the cwd
+    // Seed a minimal .jsonl so deriveProjectPath can read the cwd. The folder
+    // name is a lossy slug of the path, so this file is the only durable record
+    // of which directory the folder belongs to - cache_meta holds the same
+    // mapping but is wiped by schema migrations.
+    //
+    // It must NOT contain a user message. read-session-file.js takes the first
+    // user message as the session title, so a seed shaped like one appeared in
+    // the sidebar as a session called "New project"; clicking it resumed that
+    // id, so the real conversation was appended to the seed file and kept the
+    // fabricated title for good. Carrying only `cwd` keeps deriveProjectPath
+    // working while readSessionFile correctly yields no session.
     if (!fs.readdirSync(folderPath).some(f => f.endsWith('.jsonl'))) {
-      const seedId = require('crypto').randomUUID();
-      const seedFile = path.join(folderPath, seedId + '.jsonl');
-      const now = new Date().toISOString();
-      const line = JSON.stringify({ type: 'user', cwd: projectPath, sessionId: seedId, uuid: require('crypto').randomUUID(), timestamp: now, message: { role: 'user', content: 'New project' } });
+      const seedFile = path.join(folderPath, require('crypto').randomUUID() + '.jsonl');
+      const line = JSON.stringify({
+        type: 'project-seed',
+        cwd: projectPath,
+        timestamp: new Date().toISOString(),
+      });
       fs.writeFileSync(seedFile, line + '\n');
     }
 
@@ -389,38 +568,65 @@ ipcMain.handle('save-file-for-panel', async (_event, filePath, content) => {
 });
 
 // ── File Watching (for viewer panels) ────────────────────────────────
-const fileWatchers = new Map(); // filePath → FSWatcher
+// Refcounted per window. Viewer panels are per-window UI, so two windows can
+// watch the same file: the watcher is shared, the subscriber set is not. Without
+// this, the second window's watch-file was a silent no-op and either window's
+// unwatch-file killed the other's notifications.
+const fileWatchers = new Map(); // filePath → { watcher, windows:Set<number> }
 
-ipcMain.handle('watch-file', (_event, filePath) => {
+ipcMain.handle('watch-file', (event, filePath) => {
   const resolved = path.resolve(filePath);
-  if (fileWatchers.has(resolved)) return { ok: true };
+  const windowId = registry.windowIdOf(event);
+  if (windowId == null) return { ok: false, error: 'no window' };
+
+  const existing = fileWatchers.get(resolved);
+  if (existing) {
+    existing.windows.add(windowId);
+    return { ok: true };
+  }
   try {
     let debounce = null;
     const watcher = fs.watch(resolved, (eventType) => {
       if (eventType !== 'change') return;
       if (debounce) clearTimeout(debounce);
       debounce = setTimeout(() => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('file-changed', resolved);
-        }
+        const entry = fileWatchers.get(resolved);
+        if (!entry) return;
+        for (const id of entry.windows) registry.sendTo(id, 'file-changed', resolved);
       }, 300);
     });
-    fileWatchers.set(resolved, watcher);
+    fileWatchers.set(resolved, { watcher, windows: new Set([windowId]) });
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err.message };
   }
 });
 
-ipcMain.handle('unwatch-file', (_event, filePath) => {
+ipcMain.handle('unwatch-file', (event, filePath) => {
   const resolved = path.resolve(filePath);
-  const watcher = fileWatchers.get(resolved);
-  if (watcher) {
-    watcher.close();
-    fileWatchers.delete(resolved);
+  const windowId = registry.windowIdOf(event);
+  const entry = fileWatchers.get(resolved);
+  if (entry) {
+    if (windowId != null) entry.windows.delete(windowId);
+    // Only the last interested window tears the watcher down.
+    if (entry.windows.size === 0) {
+      entry.watcher.close();
+      fileWatchers.delete(resolved);
+    }
   }
   return { ok: true };
 });
+
+/** Drop a closed window's file subscriptions. */
+function releaseFileWatchers(windowId) {
+  for (const [resolved, entry] of [...fileWatchers]) {
+    entry.windows.delete(windowId);
+    if (entry.windows.size === 0) {
+      try { entry.watcher.close(); } catch {}
+      fileWatchers.delete(resolved);
+    }
+  }
+}
 
 ipcMain.handle('get-projects', (_event, showArchived) => {
   try {
@@ -631,10 +837,42 @@ ipcMain.handle('refresh-stats', async () => {
 // --- IPC: get-usage (lightweight, API-only, no PTY) ---
 ipcMain.handle('get-usage', async () => {
   try {
-    return await fetchAndTransformUsage() || {};
+    // One shared, cached read for every window (was: one poll per window every
+    // 5 min). The legacy keys are rebuilt from the same response body so
+    // existing readers — public/app.js's gauge and public/stats-view.js's
+    // error branch — keep working unchanged.
+    const v = await usageSource.read();
+    const legacy = v.raw ? transformUsageResponse(v.raw) : {};
+
+    if (v.kind === 'unknown') {
+      // Deliberately NOT flattened to {}: a caller must be able to tell
+      // "I don't know" from "0% used".
+      return {
+        ...legacy,
+        _error: v.reason !== 'http_429',
+        _rateLimited: v.reason === 'http_429',
+        retryAfterSeconds: v.retryAfterMs ? Math.ceil(v.retryAfterMs / 1000) : undefined,
+        _verdict: 'unknown',
+        _reason: v.reason,
+        tokenExpiresAtMs: v.tokenExpiresAtMs || null,
+      };
+    }
+
+    return {
+      ...legacy,
+      _verdict: v.kind,
+      _reason: v.reason || null,
+      // The billing state claude-auth.js fetched and discarded. On an account
+      // whose member dashboard is unavailable, this is the only place it shows.
+      billing: v.billing,
+      schemaChanged: !!v.schemaChanged,
+      tokenExpiresAtMs: v.tokenExpiresAtMs || null,
+      ageMs: v.ageMs,
+      halted: driverStore.isHalted(),
+    };
   } catch (err) {
     log.error('Error fetching usage:', err);
-    return {};
+    return { _error: true, _verdict: 'unknown', _reason: 'exception' };
   }
 });
 
@@ -828,8 +1066,54 @@ ipcMain.handle('delete-setting', (_event, key) => {
   return { ok: true };
 });
 
+// Atomic read-modify-write of one settings row.
+//
+// `set-setting` replaces the whole row, so the renderer's
+// getSetting -> spread -> setSetting sequence in settings-panel.js loses any
+// key a second window wrote in between — the lost-update race db.js:403-410
+// already warns about. mergeSetting does the same merge inside a transaction.
+ipcMain.handle('merge-setting', (_event, key, patch) => {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+    return { ok: false, error: 'patch must be an object' };
+  }
+  return { ok: true, value: mergeSetting(key, patch) };
+});
+
+// --- IPC: global stop -------------------------------------------------
+// A file-backed kill switch. Reachable when the UI is responsive (these
+// handlers), when it is not (write the HALT file by any means), and it survives
+// a restart because it lives on disk rather than in memory.
+ipcMain.handle('driver-status', () => {
+  const halted = driverStore.isHalted();
+  return {
+    halted,
+    children: custody.list(),
+    dir: driverStore.paths().dir,
+    events: driverStore.readEvents({ limit: 50 }),
+  };
+});
+
+ipcMain.handle('driver-halt', (_event, reason) => {
+  const report = custody.haltAndReap(String(reason || 'stopped from the UI'));
+  log.warn('[halt] global stop engaged:', reason, 'degraded:', report.degraded);
+  registry.broadcast('driver-halted', {
+    halted: driverStore.isHalted(),
+    degraded: report.degraded,
+    survivors: report.survivors,
+  });
+  return { ok: true, degraded: report.degraded, survivors: report.survivors };
+});
+
+ipcMain.handle('driver-clear-halt', () => {
+  driverStore.clearHalt();
+  registry.broadcast('driver-halted', { halted: driverStore.isHalted(), degraded: false, survivors: [] });
+  return { ok: true, halted: driverStore.isHalted() };
+});
+
 // --- Scheduled tasks ---
 const scheduleIpc = require('./schedule-ipc');
+// Hoisted so the quit handler can stop the cron loop before reaping.
+let stopScheduler = null;
 
 const SETTING_DEFAULTS = {
   permissionMode: null,
@@ -842,9 +1126,20 @@ const SETTING_DEFAULTS = {
   visibleSessionCount: 5,
   sidebarWidth: 340,
   terminalTheme: 'switchboard',
+  // Whole-renderer zoom. Reading research puts angular character size among the
+  // few parameters with a large, replicated effect — and the optimum is
+  // per-person, so it belongs in the user's hands rather than in a stylesheet.
+  uiScale: 1,
+  // Where the "Add project" folder picker opens. Empty means "remember the last
+  // place a project was added from".
+  projectBaseDir: '',
   mcpEmulation: false,
   shellProfile: 'auto',
 };
+
+// The settings panel needs the app's real defaults so it never renders — and
+// then stores — a value the app itself would not have used.
+ipcMain.handle('get-setting-defaults', () => ({ ...SETTING_DEFAULTS }));
 
 ipcMain.handle('get-shell-profiles', () => {
   _shellProfiles = null; // refresh on each request
@@ -867,6 +1162,9 @@ ipcMain.handle('get-effective-settings', (_event, projectPath) => {
 });
 
 // --- IPC: get-active-sessions ---
+// Deliberately app-wide, not per-window: every sidebar shows a green dot for
+// anything running anywhere, which is what makes a session in another window
+// discoverable and clickable.
 ipcMain.handle('get-active-sessions', () => {
   const active = [];
   for (const [sessionId, session] of activeSessions) {
@@ -875,12 +1173,27 @@ ipcMain.handle('get-active-sessions', () => {
   return active;
 });
 
+// --- IPC: get-session-owners --- sessionId → windowId (null = displayed nowhere)
+ipcMain.handle('get-session-owners', () => {
+  const out = {};
+  for (const [sessionId, session] of activeSessions) {
+    if (!session.exited) out[sessionId] = registry.ownerId(sessionId);
+  }
+  return out;
+});
+
 // --- IPC: get-active-terminals --- (plain terminal sessions for renderer restore)
+// ownerWindowId lets a window restore only the terminals it is actually
+// displaying, instead of every window claiming all of them on boot.
 ipcMain.handle('get-active-terminals', () => {
   const terminals = [];
   for (const [sessionId, session] of activeSessions) {
     if (!session.exited && session.isPlainTerminal) {
-      terminals.push({ sessionId, projectPath: session.projectPath });
+      terminals.push({
+        sessionId,
+        projectPath: session.projectPath,
+        ownerWindowId: registry.ownerId(sessionId),
+      });
     }
   }
   return terminals;
@@ -935,8 +1248,9 @@ ipcMain.handle('archive-session', (_event, sessionId, archived) => {
 });
 
 // --- IPC: open-terminal ---
-ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, sessionOptions) => {
-  if (!mainWindow) return { ok: false, error: 'no window' };
+ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, sessionOptions) => {
+  const win = registry.windowOf(event);
+  if (!win) return { ok: false, error: 'no window' };
 
   // Reattach to existing session
   if (activeSessions.has(sessionId)) {
@@ -944,23 +1258,44 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     session.rendererAttached = true;
     session.firstResize = !session.isPlainTerminal;
 
-    // If TUI is in alternate screen mode, send escape to switch into it
-    if (session.altScreen && !session.isPlainTerminal) {
-      mainWindow.webContents.send('terminal-data', sessionId, '\x1b[?1049h');
+    // Claim it for the asking window. If another window was showing it, that
+    // window is told to drop its view — this is what makes a session visible in
+    // exactly one place, so two renderers can never fight over the PTY size.
+    const previousOwner = registry.setOwner(sessionId, win.id);
+    if (previousOwner != null) {
+      registry.sendTo(previousOwner, 'release-session', sessionId);
+    }
+    // MCP diffs must follow the session, not the window that spawned it.
+    setMcpWindow(session.realSessionId || sessionId, win);
+
+    // A window that brought its own serialized scrollback (a tear-off) does not
+    // want main's 256KB tail replayed on top of it — that would duplicate the
+    // most recent output. It still needs the alt-screen re-entry below.
+    const skipReplay = !!(sessionOptions && sessionOptions.skipReplay);
+
+    // If TUI is in alternate screen mode, send escape to switch into it.
+    // Skipped when the caller brought its own serialized buffer: that buffer
+    // already contains the mode switch, and doing it twice can leave the TUI
+    // painting over a saved screen.
+    if (session.altScreen && !session.isPlainTerminal && !skipReplay) {
+      win.webContents.send('terminal-data', sessionId, '\x1b[?1049h');
     }
 
-    // Send buffered output for reattach
-    for (const chunk of session.outputBuffer) {
-      mainWindow.webContents.send('terminal-data', sessionId, chunk);
+    if (!skipReplay) {
+      // Send buffered output for reattach
+      for (const chunk of session.outputBuffer) {
+        win.webContents.send('terminal-data', sessionId, chunk);
+      }
     }
 
     if (!session.isPlainTerminal) {
       // Hide cursor after buffer replay — the live PTY stream or resize nudge
       // will re-show it at the correct position, avoiding a stale cursor artifact
-      mainWindow.webContents.send('terminal-data', sessionId, '\x1b[?25l');
+      win.webContents.send('terminal-data', sessionId, '\x1b[?25l');
     }
 
-    return { ok: true, reattached: true, mcpActive: !!session.mcpServer };
+    registry.broadcast('session-owner-changed', { sessionId, windowId: win.id });
+    return { ok: true, reattached: true, mcpActive: !!session.mcpServer, skippedReplay: skipReplay };
   }
 
   // Spawn new PTY
@@ -1115,7 +1450,7 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       // (skip if user disabled IDE emulation in global settings)
       if (sessionOptions?.mcpEmulation !== false) {
         try {
-          mcpServer = await startMcpServer(sessionId, [projectPath], mainWindow, log);
+          mcpServer = await startMcpServer(sessionId, [projectPath], win, log);
           claudeCmd += ' --ide';
         } catch (err) {
           log.error(`[mcp] Failed to start MCP server for ${sessionId}: ${err.message}`);
@@ -1156,6 +1491,11 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     mcpServer, _openedAt: Date.now(),
   };
   activeSessions.set(sessionId, session);
+  // The window that spawned it owns it. Without this a brand-new session has no
+  // owner, and since every push goes through sendToOwner that means its PTY
+  // output is delivered nowhere — the terminal opens and stays blank.
+  registry.setOwner(sessionId, win.id);
+  registry.broadcast('session-owner-changed', { sessionId, windowId: win.id });
 
   ptyProcess.onData(data => {
     const currentId = session.realSessionId || sessionId;
@@ -1176,16 +1516,12 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
             session._cliBusy = true;
             session._oscIdle = false;
             log.debug(`[OSC 0] session=${currentId} → BUSY`);
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('cli-busy-state', currentId, true);
-            }
+            registry.sendToOwner(currentId, 'cli-busy-state', currentId, true);
           } else if (isIdle && session._cliBusy) {
             session._cliBusy = false;
             session._oscIdle = true;
             log.debug(`[OSC 0] session=${currentId} → IDLE`);
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('cli-busy-state', currentId, false);
-            }
+            registry.sendToOwner(currentId, 'cli-busy-state', currentId, false);
           }
         }
       }
@@ -1202,16 +1538,12 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
             session._cliBusy = true;
             session._oscIdle = false;
             log.debug(`[OSC 9;4] session=${currentId} → BUSY`);
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('cli-busy-state', currentId, true);
-            }
+            registry.sendToOwner(currentId, 'cli-busy-state', currentId, true);
           }
         } else {
           // Regular notification (attention, permission, etc.)
           log.info(`[OSC 9] session=${currentId} message="${payload}"`);
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('terminal-notification', currentId, payload);
-          }
+          registry.sendToOwner(currentId, 'terminal-notification', currentId, payload);
         }
       }
     }
@@ -1242,9 +1574,8 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
       }
     }
 
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('terminal-data', currentId, data);
-    }
+    // Only the window displaying this session receives its output.
+    registry.sendToOwner(currentId, 'terminal-data', currentId, data);
   });
 
   ptyProcess.onExit(({ exitCode }) => {
@@ -1255,18 +1586,21 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
     session.mcpServer = null;
 
     const realId = session.realSessionId || sessionId;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('process-exited', realId, exitCode);
-      // If a fork/plan-accept transition re-keyed this session under realId
-      // but the PTY exited before transition detection ran, also notify the
-      // renderer for the original sessionId so it doesn't stay stuck as "Running".
-      if (realId !== sessionId && activeSessions.has(sessionId)) {
-        mainWindow.webContents.send('process-exited', sessionId, exitCode);
-      }
+    // The owning window needs to render the exit banner. Every OTHER window
+    // needs it too, because they all show this session as "running" in their
+    // sidebar (activePtyIds is app-wide by design), so they must stop.
+    registry.broadcast('process-exited', realId, exitCode);
+    // If a fork/plan-accept transition re-keyed this session under realId
+    // but the PTY exited before transition detection ran, also notify the
+    // renderer for the original sessionId so it doesn't stay stuck as "Running".
+    if (realId !== sessionId && activeSessions.has(sessionId)) {
+      registry.broadcast('process-exited', sessionId, exitCode);
     }
     activeSessions.delete(realId);
     // Clean up the original key too in case transition detection hasn't run yet
     activeSessions.delete(sessionId);
+    registry.clearOwner(realId);
+    registry.clearOwner(sessionId);
   });
 
   if (sessionOptions?.forkFrom) {
@@ -1276,17 +1610,88 @@ ipcMain.handle('open-terminal', async (_event, sessionId, projectPath, isNew, se
   return { ok: true, reattached: false, mcpActive: !!mcpServer };
 });
 
-// --- IPC: terminal-input (fire-and-forget) ---
-ipcMain.on('terminal-input', (_event, sessionId, data) => {
+// ── Multi-window + session tear-off ──────────────────────────────────
+
+// Who am I? The renderer needs its own window id to know whether a session is
+// "mine", and to be the source of a drag.
+ipcMain.handle('get-window-info', (event) => {
+  const win = registry.windowOf(event);
+  return {
+    windowId: win ? win.id : null,
+    windowCount: registry.windowCount(),
+    windows: registry.describeWindows(),
+  };
+});
+
+ipcMain.handle('list-windows', () => registry.describeWindows());
+
+ipcMain.handle('new-window', () => {
+  const win = createWindow();
+  return { ok: true, windowId: win.id };
+});
+
+// Metadata a destination window needs to build a view for a session it may
+// never have had in its own sidebar.
+ipcMain.handle('get-session-meta', (_event, sessionId) => {
   const session = activeSessions.get(sessionId);
-  if (session && !session.exited) {
-    session.pty.write(data);
-  }
+  if (!session) return null;
+  return {
+    sessionId,
+    projectPath: session.projectPath,
+    isPlainTerminal: !!session.isPlainTerminal,
+    exited: !!session.exited,
+    ownerWindowId: registry.ownerId(sessionId),
+    mcpActive: !!session.mcpServer,
+  };
+});
+
+// Move without dragging: the context-menu / keyboard path. targetWindowId null
+// means "tear off into a new window".
+ipcMain.handle('move-session', (event, { sessionId, targetWindowId, serialized }) => {
+  const sourceWindowId = registry.windowIdOf(event);
+  if (sourceWindowId == null) return { ok: false, error: 'no window' };
+  return sessionMove.moveSession({
+    sessionId,
+    targetWindowId: targetWindowId == null ? null : targetWindowId,
+    serialized: serialized || '',
+    sourceWindowId,
+  });
+});
+
+// The drag gesture. HTML5 drag-and-drop cannot cross BrowserWindows, so the
+// renderer only reports pointer down/up and the main process owns the rest:
+// cursor tracking, the floating ghost, and hit-testing which window is under it.
+ipcMain.handle('session-drag-start', (event, { sessionId, label, subtitle }) => {
+  const sourceWindowId = registry.windowIdOf(event);
+  if (sourceWindowId == null) return { ok: false, error: 'no window' };
+  if (!activeSessions.has(sessionId)) return { ok: false, error: 'session is not running' };
+  return sessionMove.dragStart({ sessionId, sourceWindowId, label, subtitle });
+});
+
+ipcMain.handle('session-drag-end', (_event, { serialized } = {}) =>
+  sessionMove.dragEnd({ serialized: serialized || '' }));
+
+ipcMain.handle('session-drag-cancel', () => sessionMove.dragCancel());
+
+// --- IPC: terminal-input (fire-and-forget) ---
+ipcMain.on('terminal-input', (event, sessionId, data) => {
+  const session = activeSessions.get(sessionId);
+  if (!session || session.exited) return;
+  // Only the owning window may drive the PTY. A window that has just handed a
+  // session over can still have in-flight keystrokes; accepting them would type
+  // into a session the user is now looking at somewhere else.
+  const windowId = registry.windowIdOf(event);
+  if (registry.ownerId(sessionId) != null && !registry.isOwner(sessionId, windowId)) return;
+  session.pty.write(data);
 });
 
 // --- IPC: terminal-resize (fire-and-forget) ---
-ipcMain.on('terminal-resize', (_event, sessionId, cols, rows) => {
+ipcMain.on('terminal-resize', (event, sessionId, cols, rows) => {
   const session = activeSessions.get(sessionId);
+  // A PTY has exactly one size. Letting a non-owner resize it is how two
+  // windows corrupt each other's rendering, so non-owners are ignored outright.
+  const windowId = registry.windowIdOf(event);
+  if (registry.ownerId(sessionId) != null && !registry.isOwner(sessionId, windowId)) return;
   if (session && !session.exited) {
     // For plain terminals, suppress buffering during resize to avoid
     // accumulating prompt redraws that pollute reattach replay
@@ -1314,19 +1719,30 @@ ipcMain.on('terminal-resize', (_event, sessionId, cols, rows) => {
 });
 
 // --- IPC: close-terminal ---
-ipcMain.on('close-terminal', (_event, sessionId) => {
+ipcMain.on('close-terminal', (event, sessionId) => {
+  const windowId = registry.windowIdOf(event);
+  // Owner-guarded: during a tear-off the source window tears its view down
+  // while the destination already owns the session. An unguarded detach here
+  // would mark the session detached out from under the window displaying it.
+  const wasOwner = registry.clearOwner(sessionId, windowId);
   const session = activeSessions.get(sessionId);
   if (session) {
-    session.rendererAttached = false;
+    if (wasOwner) session.rendererAttached = false;
     if (session.exited) {
       activeSessions.delete(sessionId);
     }
   }
+  if (wasOwner) registry.broadcast('session-owner-changed', { sessionId, windowId: null });
 });
 
 // Session transitions → session-transitions.js
 const sessionTransitions = require('./session-transitions');
-sessionTransitions.init({ PROJECTS_DIR, activeSessions, getMainWindow: () => mainWindow, log, rekeyMcpServer });
+sessionTransitions.init({
+  PROJECTS_DIR, activeSessions, log, rekeyMcpServer,
+  // A fork re-keys the session; ownership and the MCP window must follow it.
+  sendToOwner: registry.sendToOwner,
+  rekeyOwner: registry.rekeyOwner,
+});
 const { detectSessionTransitions } = sessionTransitions;
 
 // --- fs.watch on projects directory ---
@@ -1421,13 +1837,28 @@ if (!gotSingleInstanceLock) {
 } else {
   // Focus the existing window when a second launch is attempted.
   app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
+    const win = registry.allWindows().find(w => w.isFocused()) || registry.allWindows()[0];
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.focus();
+    } else {
+      createWindow();
     }
   });
 
   app.whenReady().then(() => {
+    sessionMove.init({
+      registry,
+      dragProxy,
+      log,
+      createWindow,
+      getSessionMeta: (sessionId) => {
+        const session = activeSessions.get(sessionId);
+        if (!session || session.exited) return null;
+        return { projectPath: session.projectPath, isPlainTerminal: !!session.isPlainTerminal };
+      },
+    });
+    log.info(`[startup] Switchboard ${app.getVersion()} — multi-window build`);
     buildMenu();
     createWindow();
     startProjectsWatcher();
@@ -1443,30 +1874,94 @@ if (!gotSingleInstanceLock) {
       const cmd = 'claude ' + quoteArgvForShell(shell, claudeArgv);
       const args = shellArgs(shell, cmd, profile.args || []);
 
+      // THE single gate. Both spawn paths reach this function — the cron loop
+      // in schedule-runner.js and `run-schedule-now` in schedule-ipc.js — so
+      // checking here means there is no second route to a spawn. Checked
+      // synchronously, immediately before spawning, because an async check
+      // would leave a window open between the check and the spawn.
+      const gate = driverStore.isHalted();
+      if (gate.halted) {
+        log.warn(`[schedule] VETOED ${name} — global stop in force: ${gate.reason}`);
+        driverStore.appendEvent('SPAWN_VETOED', { name, reason: gate.reason });
+        if (onDone) onDone();   // never leave the task marked as running
+        return;
+      }
+
       log.info(`[schedule] Running: ${shell} ${args.join(' ')}`);
+      const startedAtMs = Date.now();
       const child = cpSpawn(shell, args, {
         cwd,
         stdio: ['ignore', 'ignore', 'pipe'],
         env: { ...cleanPtyEnv, FORCE_COLOR: '0' },
       });
 
+      // Take custody BEFORE anything else. Until this write lands there is no
+      // record of the child, so nothing could stop it: the registry is what
+      // makes a halt real rather than cosmetic. A failed write is fatal to the
+      // run by design — if we cannot record it, we must not keep it.
+      try {
+        custody.register({
+          pid: child.pid,
+          startedAtMs,
+          cwd,
+          tag: name,
+          cmdlineNeedle: 'claude',
+        });
+      } catch (err) {
+        log.error(`[schedule] could not take custody of pid ${child.pid}; killing it:`, err.message);
+        try { custody.killTree(child.pid); } catch {}
+        if (onDone) onDone();
+        return;
+      }
+
       let stderr = '';
       child.stderr.on('data', (data) => { stderr += data.toString(); });
 
       child.on('exit', (code) => {
+        custody.unregister(child.pid);
         if (stderr.trim()) log.error(`[schedule] ${name} stderr:\n${stderr.trim()}`);
         log.info(`[schedule] ${name} finished (exit ${code})`);
         if (onDone) onDone();
       });
 
       child.on('error', (err) => {
+        custody.unregister(child.pid);
         log.error(`[schedule] ${name} error:`, err.message);
         if (onDone) onDone();
       });
     }
 
+    // --- Global stop, process custody, shared usage poll -------------
+    // Ordered deliberately: reap BEFORE the scheduler can fire, so a child
+    // orphaned by a crash or by electron-reloader's app.exit(0) (which emits
+    // neither before-quit nor will-quit) is dealt with before new work starts.
+    driverStore.init({ log });
+    custody.init({ log, store: driverStore });
+    usageSource.init({ log });
+
+    const reaped = custody.reap();
+    if (reaped.results.length) {
+      log.warn(`[custody] reaped ${reaped.results.length} orphan record(s) from a previous run`);
+    }
+    if (reaped.degraded) {
+      // A process we could not kill is the one case that must be loud: the app
+      // would otherwise present a clean slate while something still runs.
+      log.error('[custody] SURVIVORS after reap:', JSON.stringify(reaped.survivors));
+      driverStore.halt('orphan survived reap — investigate before scheduling again');
+    }
+
+    const lock = driverStore.acquireLock(custody.isPidAlive);
+    if (!lock.ok) {
+      log.warn(`[custody] another instance holds the driver lock (${lock.reason}); this one will not schedule`);
+    }
+
+    const startupHalt = driverStore.isHalted();
+    if (startupHalt.halted) {
+      log.warn(`[schedule] global stop is in force: ${startupHalt.reason} — scheduled tasks will be vetoed`);
+    }
+
     scheduleIpc.init(log, runScheduleCommand);
-    startScheduler(log, runScheduleCommand);
+    stopScheduler = startScheduler(log, runScheduleCommand);
 
     // Re-index search if FTS table was recreated (e.g. tokenizer config change)
     if (searchFtsRecreated) populateCacheViaWorker();
@@ -1492,6 +1987,11 @@ app.on('before-quit', () => {
   // Shut down all MCP servers
   shutdownAllMcp();
 
+  // The drag ghost is a BrowserWindow with closable:false; it must be destroyed
+  // explicitly or the app will not exit.
+  sessionMove.dragCancel();
+  dragProxy.destroy();
+
   // Close filesystem watcher
   if (projectsWatcher) {
     projectsWatcher.close();
@@ -1504,6 +2004,19 @@ app.on('before-quit', () => {
       try { session.pty.kill(); } catch {}
     }
   }
+
+  // Scheduled runs are separate processes, not PTYs, so the loop above never
+  // touched them. Stop the timer, then kill what we are holding.
+  try { if (stopScheduler) stopScheduler(); } catch {}
+  try {
+    const report = custody.reap();
+    if (report.degraded) {
+      log.error('[custody] survivors at quit:', JSON.stringify(report.survivors));
+    }
+  } catch (err) {
+    log.error('[custody] reap at quit failed:', err.message);
+  }
+  try { driverStore.releaseLock(); } catch {}
 });
 
 // Close SQLite after all windows are closed to avoid "connection is not open" errors
