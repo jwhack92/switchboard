@@ -10,3 +10,8 @@ public/codemirror-bundle.js
 .env
 .cache/
 dev-app-update.yml
+
+# Editing backups left by scripted patches
+*.bak
+# Built by scripts/build-launcher.ps1 — regenerate rather than commit
+scripts/Switchboard.exe
