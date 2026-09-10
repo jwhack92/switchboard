@@ -10,7 +10,7 @@ const { encodeProjectPath } = require('./encode-project-path');
  * Session cache module.
  * Call init(ctx) once with the shared context object.
  */
-let PROJECTS_DIR, activeSessions, getMainWindow, log;
+let PROJECTS_DIR, activeSessions, broadcast, log;
 let deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession;
 let deleteSearchFolder, deleteSearchSession, upsertSearchEntries;
 let setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName;
@@ -18,7 +18,10 @@ let setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMe
 function init(ctx) {
   PROJECTS_DIR = ctx.PROJECTS_DIR;
   activeSessions = ctx.activeSessions;
-  getMainWindow = ctx.getMainWindow;
+  // The project list and status line are rendered by every window, so these are
+  // broadcasts. `getMainWindow` used to make them single-window by construction.
+  // Fall back to a no-op so the unit tests can init without an Electron app.
+  broadcast = ctx.broadcast || (() => {});
   log = ctx.log;
   // DB functions
   deleteCachedFolder = ctx.db.deleteCachedFolder;
@@ -197,6 +200,10 @@ function buildProjectsFromCache(showArchived) {
   // otherwise folders whose sessions are all archived would appear in the sidebar as
   // undismissable phantom entries.
   const projectMap = new Map();
+  // projectPaths that own at least one session the archive filter removed. Used
+  // below to tell "a project with no sessions yet" (show it) apart from "a
+  // project whose sessions you archived" (hide it).
+  const archiveFiltered = new Set();
   for (const row of cachedRows) {
     if (!row.projectPath) continue;
     if (hiddenProjects.has(row.projectPath)) continue;
@@ -215,7 +222,7 @@ function buildProjectsFromCache(showArchived) {
       starred: meta?.starred || 0,
       archived: meta?.archived || 0,
     };
-    if (!showArchived && s.archived) continue;
+    if (!showArchived && s.archived) { archiveFiltered.add(row.projectPath); continue; }
     if (!projectMap.has(row.projectPath)) {
       projectMap.set(row.projectPath, {
         folder: encodeProjectPath(row.projectPath),
@@ -243,6 +250,11 @@ function buildProjectsFromCache(showArchived) {
       }
       if (!projectPath) continue;
       if (hiddenProjects.has(projectPath)) continue;
+      // Archiving the last session in a project must make the project go away.
+      // The directory outlives the archive (the .jsonl is still on disk), so
+      // without this the loop re-adds the very entry the archive filter above
+      // just removed, leaving an empty phantom project in the sidebar.
+      if (!projectMap.has(projectPath) && archiveFiltered.has(projectPath)) continue;
       if (!projectMap.has(projectPath)) {
         projectMap.set(projectPath, {
           folder: encodeProjectPath(projectPath),
@@ -297,18 +309,12 @@ function buildProjectsFromCache(showArchived) {
 
 
 function notifyRendererProjectsChanged() {
-  const mainWindow = getMainWindow();
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('projects-changed');
-  }
+  broadcast('projects-changed');
 }
 
 function sendStatus(text, type) {
   if (text) log.info(`[status] (${type || 'info'}) ${text}`);
-  const mw = getMainWindow();
-  if (mw && !mw.isDestroyed()) {
-    mw.webContents.send('status-update', text, type || 'info');
-  }
+  broadcast('status-update', text, type || 'info');
 }
 
 // --- Worker-based cache population (non-blocking) ---

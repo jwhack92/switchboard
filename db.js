@@ -400,6 +400,34 @@ function setSetting(key, value) {
   stmts.settingsUpsert.run(key, JSON.stringify(value));
 }
 
+/**
+ * Merge a patch into an object-valued setting row, atomically.
+ *
+ * Every caller used to do getSetting → mutate → setSetting, which replaces the
+ * whole JSON blob. With one window that was merely clumsy; with several it is
+ * lost-update data loss, because two windows can interleave read/read/write/write
+ * on the shared `global` row. Doing it inside one better-sqlite3 transaction
+ * makes read-modify-write indivisible.
+ */
+const mergeSettingTxn = db.transaction((key, patch) => {
+  const row = stmts.settingsGet.get(key);
+  let current = {};
+  if (row) {
+    try {
+      const parsed = JSON.parse(row.value);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) current = parsed;
+    } catch {}
+  }
+  const merged = { ...current, ...patch };
+  stmts.settingsUpsert.run(key, JSON.stringify(merged));
+  return merged;
+});
+
+function mergeSetting(key, patch) {
+  if (!patch || typeof patch !== 'object') return getSetting(key);
+  return mergeSettingTxn(key, patch);
+}
+
 function deleteSetting(key) {
   stmts.settingsDelete.run(key);
 }
@@ -415,6 +443,6 @@ module.exports = {
   getFolderMeta, getAllFolderMeta, setFolderMeta,
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
   searchByType, isSearchIndexPopulated, searchFtsRecreated,
-  getSetting, setSetting, deleteSetting,
+  getSetting, setSetting, mergeSetting, deleteSetting,
   closeDb,
 };

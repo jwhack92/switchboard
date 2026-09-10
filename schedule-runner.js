@@ -232,6 +232,23 @@ function buildScheduleCommand(sessionId, schedule) {
 }
 
 /**
+ * Identify the local wall-clock minute an instant falls in.
+ *
+ * cronMatches compares now.getHours()/getMinutes() (:69-70) against the
+ * expression and keeps no memo of what already fired, which double-fires on a
+ * DST fall-back: on 2026-11-01 in America/Los_Angeles, local 01:00-01:59
+ * happens twice, 60 real minutes apart, so `cron: 30 1 * * *` matches both
+ * 08:30Z and 09:30Z. Those are different instants but one wall-clock slot, and
+ * a cron entry means "at this wall time on this date" — once.
+ *
+ * Keying on this also absorbs a tick that lands twice inside the same minute,
+ * which timer drift and a resumed machine can both produce.
+ */
+function localSlotKey(d) {
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}T${d.getHours()}:${d.getMinutes()}`;
+}
+
+/**
  * Start the cron loop. Checks every 60 seconds.
  * @param {object} log - Logger
  * @param {function} runCommand - Function to spawn a shell command: runCommand(cmd, cwd, name)
@@ -240,6 +257,10 @@ function buildScheduleCommand(sessionId, schedule) {
 function startScheduler(log, runCommand) {
   let running = true;
   const runningTasks = new Set();
+  // One entry per task, overwritten, so this cannot grow. In-memory, so a
+  // restart inside the same minute could still double-fire; closing that needs
+  // the durable store and is out of scope here.
+  const lastFiredSlot = new Map();
 
   function tick() {
     if (!running) return;
@@ -253,6 +274,13 @@ function startScheduler(log, runCommand) {
         log.info(`[schedule] Skipping ${schedule.name} — still running from previous trigger`);
         continue;
       }
+
+      const slot = localSlotKey(now);
+      if (lastFiredSlot.get(taskKey) === slot) {
+        log.info(`[schedule] Skipping ${schedule.name} — already fired for local slot ${slot}`);
+        continue;
+      }
+      lastFiredSlot.set(taskKey, slot);
 
       log.info(`[schedule] Triggering: ${schedule.name} (${schedule.cron})`);
       try {
@@ -283,4 +311,5 @@ function startScheduler(log, runCommand) {
   };
 }
 
-module.exports = { parseFrontmatter, cronMatches, scanSchedules, startScheduler, createScheduleSession, buildScheduleCommand };
+module.exports = { parseFrontmatter, cronMatches, scanSchedules, startScheduler,
+  createScheduleSession, buildScheduleCommand, localSlotKey };
