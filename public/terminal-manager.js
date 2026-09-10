@@ -145,14 +145,108 @@ function isAtBottom(terminal) {
   return buf.viewportY >= buf.baseY;
 }
 
-// Fit terminal to container, subtracting 1 row to avoid partial-row clipping.
-function safeFit(entry) {
+// Fit terminal to container, then verify the last row actually fits.
+//
+// FitAddon.proposeDimensions() derives rows from the container's *computed*
+// height and subtracts the padding it finds on the `.xterm` element. Our padding
+// lives on `.terminal-container` instead, and that container is 5px taller than
+// its visible area (`inset: -5px 20px 0 0`) while clipping at its border box
+// (`overflow: hidden`). When those disagree the final row straddles the clip
+// edge and renders as a half-height sliver — which is what cut the Claude Code
+// status line ("bypass permissions on (shift+tab to cycle) …") in half.
+//
+// The old comment here claimed it subtracted a row to avoid exactly this, but
+// the code never did. Rather than assume which way the arithmetic errs, measure
+// what actually rendered and hand a row back only if it overflows: a no-op when
+// the geometry already lines up, and it can never add a clipped row.
+// A pane that just became visible can take a frame to lay out. Look again a
+// few times, then stop — a pane that is still unmeasurable is genuinely hidden
+// and does not need fitting.
+const MAX_FIT_RETRIES = 3;
+
+function safeFit(entry, _isRetry) {
   const dims = entry.fitAddon.proposeDimensions();
-  if (dims && dims.rows > 1) {
-    entry.terminal.resize(dims.cols, dims.rows);
-  } else {
+  if (!dims || !(dims.rows > 1)) {
     entry.fitAddon.fit();
+    return;
   }
+
+  const { rows, measured } = measurePaneRows(entry, dims.rows);
+
+  if (!measured) {
+    // We cannot see the pane, so we do not know what fits — and applying
+    // proposeDimensions() on a guess is exactly what clips the last row, since
+    // that is the overshooting number and nothing afterwards corrects it.
+    // Switching sessions hits this: the incoming pane was display:none an
+    // instant ago. Leave the size alone and look again.
+    if (!_isRetry) entry._fitRetries = 0;   // a fresh attempt gets a fresh budget
+    scheduleFitRetry(entry);
+    return;
+  }
+
+  entry._fitRetries = 0;
+  // xterm no-ops a resize to identical dimensions, so a fit that changes nothing
+  // costs nothing — no PTY resize, no SIGWINCH, no repaint.
+  entry.terminal.resize(dims.cols, rows);
+}
+
+function scheduleFitRetry(entry) {
+  entry._fitRetries = (entry._fitRetries || 0) + 1;
+  if (entry._fitRetries > MAX_FIT_RETRIES || entry._fitRetryQueued) return;
+  entry._fitRetryQueued = true;
+  requestAnimationFrame(() => {
+    entry._fitRetryQueued = false;
+    if (!entry.closed) safeFit(entry, true);
+  });
+}
+
+/**
+ * How many rows fit in the space the user can actually see.
+ *
+ * FitAddon.proposeDimensions() derives rows from the container's computed
+ * height, and for `.terminal-container` that overshoots: the element carries
+ * 8px of vertical padding and is pulled 5px above its parent by a negative top
+ * inset (`inset: -5px 20px 0 0`), while `overflow: hidden` clips at its border
+ * box. The last row then straddles the clip edge and renders as a half-height
+ * sliver — which is what cut the "bypass permissions on …" status line in half.
+ *
+ * This measures the visible band directly instead of trying to model why the
+ * proposal is wrong, so it stays correct regardless of the exact box-model
+ * reasoning. Crucially it is SYNCHRONOUS and idempotent.
+ *
+ * The previous version corrected after the fact inside a requestAnimationFrame,
+ * which looked equivalent but was not: proposeDimensions() kept returning the
+ * uncorrected number, so every fit grew the terminal by a row and then shrank it
+ * back. That is two PTY resizes and two full-screen TUI repaints per fit, on a
+ * pane whose size had not changed — and with the WebGL renderer the repaints
+ * could leave stale cells behind, which shows up as overlays (the slash-command
+ * menu) drawn over remnants of earlier output.
+ */
+function measurePaneRows(entry, proposedRows) {
+  const unmeasured = { rows: proposedRows, measured: false };
+
+  const el = entry.terminal.element;
+  const screen = el && el.querySelector('.xterm-screen');
+  const clip = el && el.closest('.terminal-container');
+  if (!screen || !clip) return unmeasured;
+
+  const currentRows = entry.terminal.rows;
+  const screenRect = screen.getBoundingClientRect();
+  const cellHeight = currentRows > 0 ? screenRect.height / currentRows : 0;
+  if (!(cellHeight > 0)) return unmeasured;        // not rendered yet
+
+  // The screen's top edge does not move with the row count; the clip edge is the
+  // container's border box, where overflow:hidden cuts.
+  const visible = clip.getBoundingClientRect().bottom - screenRect.top;
+  if (!(visible > 0)) return unmeasured;           // pane is hidden
+
+  const maxRows = Math.floor(visible / cellHeight);
+  return { rows: Math.max(2, Math.min(proposedRows, maxRows)), measured: true };
+}
+
+/** The row count alone. Kept as a named helper for tests and readability. */
+function rowsThatActuallyFit(entry, proposedRows) {
+  return measurePaneRows(entry, proposedRows).rows;
 }
 
 // Fit a terminal that just became visible (from display:none or reparent).
@@ -269,6 +363,11 @@ function createTerminalEntry(session) {
   }));
   const searchAddon = new SearchAddon.SearchAddon();
   terminal.loadAddon(searchAddon);
+  // Used to hand a session's full scrollback to another window when it is torn
+  // off. Main's own replay buffer is a 256KB tail, so relying on it would
+  // visibly truncate history on every move.
+  const serializeAddon = new SerializeAddon.SerializeAddon();
+  terminal.loadAddon(serializeAddon);
   terminal.loadAddon(new UnicodeGraphemesAddon.UnicodeGraphemesAddon());
   terminal.unicode.activeVersion = '15';
   terminal.open(container);
@@ -327,7 +426,35 @@ function createTerminalEntry(session) {
   searchBar.querySelector('.terminal-search-prev').addEventListener('click', () => searchAddon.findPrevious(searchInput.value, searchOpts));
   searchBar.querySelector('.terminal-search-close').addEventListener('click', closeSearchBar);
 
-  const entry = { terminal, element: container, fitAddon, searchAddon, openSearchBar, closeSearchBar, session, closed: false };
+  const entry = { terminal, element: container, fitAddon, searchAddon, serializeAddon, openSearchBar, closeSearchBar, session, closed: false };
+
+  // Refit whenever the pane's box actually changes, instead of trying to guess
+  // the right moment to measure.
+  //
+  // The callers that fit on demand — showSession, the file panel, the window
+  // resize handler — all measure at a moment they hope is settled, and around a
+  // session switch it is not. #terminal-header changes height when the PTY-title
+  // span appears (onTitleChange arrives asynchronously), #terminals moves with
+  // it, and a fit that lands while the header is short computes one row too
+  // many. Measured live: the same window produced 46, 47 and 48 rows from
+  // consecutive fits, and the final layout change happened after the last fit,
+  // so the extra row stayed and its text was clipped by overflow:hidden.
+  //
+  // No feedback loop: the container is `position: absolute` with `inset`, so it
+  // is sized by its offset parent, never by the terminal inside it. Resizing the
+  // terminal cannot resize the container and re-trigger this.
+  if (typeof ResizeObserver === 'function') {
+    entry.resizeObserver = new ResizeObserver(() => {
+      if (entry.closed) return;
+      // Coalesce to one fit per frame; a drag emits a burst of these.
+      if (entry._roFrame) cancelAnimationFrame(entry._roFrame);
+      entry._roFrame = requestAnimationFrame(() => {
+        entry._roFrame = null;
+        if (!entry.closed) safeFit(entry);
+      });
+    });
+    entry.resizeObserver.observe(container);
+  }
   openSessions.set(sessionId, entry);
 
   // Wire up IPC (use entry.session.sessionId so fork re-keying works)
@@ -347,16 +474,90 @@ function createTerminalEntry(session) {
   return entry;
 }
 
-// Clean up a closed session entry (dispose terminal, remove DOM, remove from maps).
-function destroySession(sessionId) {
+// The grid card count was written from four places with two different sources
+// and not written at all by destroySession. One helper, one source of truth.
+function updateGridCount() {
+  if (typeof gridViewerCount === 'undefined' || !gridViewerCount) return;
+  const n = gridCards.size;
+  gridViewerCount.textContent = n + ' session' + (n !== 1 ? 's' : '');
+}
+
+// Drop this window's view of a session without touching the session itself.
+//
+// This is NOT destroySession: that sends close-terminal, which detaches the
+// session in the main process. During a tear-off the destination window is
+// already attached, so detaching here would pull the session out from under it.
+// (main's close-terminal is owner-guarded too, but the source window should not
+// be sending it at all.)
+function teardownSessionView(sessionId, { notifyMain }) {
   const entry = openSessions.get(sessionId);
-  if (!entry) return;
-  window.api.closeTerminal(sessionId);
-  entry.terminal.dispose();
+  if (!entry) return false;
+
+  // A queued rAF/timeout flush would write into a disposed terminal, and its
+  // buffered chunks would be lost either way. Drop it deliberately.
+  const buf = terminalWriteBuffers.get(sessionId);
+  if (buf) {
+    clearTimeout(buf.timerId);
+    cancelAnimationFrame(buf.rafId);
+    terminalWriteBuffers.delete(sessionId);
+  }
+
+  if (notifyMain) window.api.closeTerminal(sessionId);
+
+  // Put the container back where it belongs before removing it, so grid teardown
+  // does not leave an orphaned card wrapper behind.
+  const card = gridCards.get(sessionId);
+  if (card) {
+    if (card.parentNode && entry.element.parentNode === card) {
+      card.parentNode.insertBefore(entry.element, card);
+    }
+    card.remove();
+    gridCards.delete(sessionId);
+  }
+
+  // Stop observing before the element goes, or the observer keeps the detached
+  // container (and the whole entry) alive.
+  if (entry.resizeObserver) {
+    try { entry.resizeObserver.disconnect(); } catch {}
+    entry.resizeObserver = null;
+  }
+  if (entry._roFrame) { cancelAnimationFrame(entry._roFrame); entry._roFrame = null; }
+
+  try { entry.terminal.dispose(); } catch {}
   entry.element.remove();
   openSessions.delete(sessionId);
-  const card = gridCards.get(sessionId);
-  if (card) { card.remove(); gridCards.delete(sessionId); }
+  updateGridCount();
+  return true;
+}
+
+// Clean up a closed session entry (dispose terminal, remove DOM, remove from maps).
+function destroySession(sessionId) {
+  return teardownSessionView(sessionId, { notifyMain: true });
+}
+
+// Hand this session's view over: same teardown, but the session stays attached
+// (to whichever window is taking it).
+function releaseSessionView(sessionId) {
+  return teardownSessionView(sessionId, { notifyMain: false });
+}
+
+/**
+ * The session's full xterm buffer as escape sequences, for replay in another
+ * window. Returns '' when there is nothing to hand over, which the destination
+ * treats as "fall back to main's replay buffer".
+ */
+function serializeSession(sessionId) {
+  const entry = openSessions.get(sessionId);
+  if (!entry || !entry.serializeAddon) return '';
+  try {
+    // Flush anything buffered first, or the last chunk of output is missing
+    // from the snapshot.
+    flushTerminalBuffer(sessionId);
+    return entry.serializeAddon.serialize();
+  } catch (e) {
+    console.warn('[tearoff] serialize failed, falling back to main replay', e);
+    return '';
+  }
 }
 
 // Make a session visible in the current view mode (grid or single).
@@ -433,5 +634,6 @@ function setupDragAndDrop(container, getSessionId) {
 // Expose pure key-handling predicates to Node for unit testing. No-op in the
 // browser, where this file is loaded as a plain <script> and `module` is undefined.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload };
+  module.exports = { isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload,
+    safeFit, rowsThatActuallyFit };
 }

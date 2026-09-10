@@ -573,9 +573,25 @@ function refitActiveTerminal() {
   requestAnimationFrame(() => {
     if (typeof openSessions !== 'undefined' && currentPanelSessionId) {
       const entry = openSessions.get(currentPanelSessionId);
-      if (entry && entry.fitAddon) {
-        try { entry.fitAddon.fit(); } catch {}
-      }
+      if (!entry) return;
+      // Must go through safeFit, never fitAddon.fit() directly.
+      //
+      // FitAddon.fit() applies proposeDimensions() verbatim, and that number
+      // overshoots for `.terminal-container`: it is measured from the border
+      // box, which includes 8px of padding and the 5px the element is pulled up
+      // by its negative top inset, while overflow:hidden clips at that border
+      // box. The last row then straddles the clip edge and renders as a
+      // half-height sliver.
+      //
+      // This ran on every session switch — switchPanel() calls showPanel() or
+      // hidePanel(), both of which land here — one frame after showSession()
+      // had already fitted correctly, silently overwriting the good value with
+      // the bad one. Symptom: the bottom line cut in half after switching
+      // sessions, and staying that way until the window was resized (which goes
+      // through safeFit and repairs it).
+      // No fallback to fitAddon.fit() on purpose: if safeFit is somehow not
+      // there, leaving the pane alone is better than sizing it wrongly.
+      try { if (typeof safeFit === 'function') safeFit(entry); } catch {}
     }
   });
 }
