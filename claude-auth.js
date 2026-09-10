@@ -198,4 +198,9 @@ async function fetchAndTransformUsage() {
   }
 }
 
-module.exports = { getOAuthToken, fetchUsage, fetchAndTransformUsage, getConfigDir };
+module.exports = {
+  getOAuthToken, fetchUsage, fetchAndTransformUsage, getConfigDir,
+  // Exported so usage-source.js's richer verdict can be rendered in the
+  // legacy `get-usage` shape without issuing a second request.
+  transformUsageResponse, formatResetTime,
+};
