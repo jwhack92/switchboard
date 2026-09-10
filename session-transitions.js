@@ -5,12 +5,16 @@ const fs = require('fs');
  * Fork / plan-accept detection for active PTY sessions.
  * Call init(ctx) once with shared context.
  */
-let PROJECTS_DIR, activeSessions, getMainWindow, log, rekeyMcpServer;
+let PROJECTS_DIR, activeSessions, sendToOwner, rekeyOwner, log, rekeyMcpServer;
 
 function init(ctx) {
   PROJECTS_DIR = ctx.PROJECTS_DIR;
   activeSessions = ctx.activeSessions;
-  getMainWindow = ctx.getMainWindow;
+  // A fork is only meaningful to the window displaying the session, and the
+  // session's id changes, so ownership has to be re-keyed in the same breath.
+  // Both default to no-ops so the unit tests can init without Electron.
+  sendToOwner = ctx.sendToOwner || (() => false);
+  rekeyOwner = ctx.rekeyOwner || (() => {});
   log = ctx.log;
   rekeyMcpServer = ctx.rekeyMcpServer;
 }
@@ -179,10 +183,10 @@ function detectSessionTransitions(folder) {
         activeSessions.set(newId, session);
         // Re-key MCP server to match new session ID
         rekeyMcpServer(sessionId, newId);
-        const mainWindow = getMainWindow();
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('session-forked', sessionId, newId);
-        }
+        // Ownership must move with the id BEFORE the notification, or the send
+        // below would look up a session id nobody owns any more.
+        rekeyOwner(sessionId, newId);
+        sendToOwner(newId, 'session-forked', sessionId, newId);
         break; // Only one transition per session per flush
       }
     }

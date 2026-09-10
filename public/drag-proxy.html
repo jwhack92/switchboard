@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Switchboard drag</title>
+<style>
+  /* No preload here, so this page gets no window.api. Main drives it by
+     calling __setLabel / __setMode via executeJavaScript. */
+  html, body {
+    margin: 0; padding: 0; background: transparent; overflow: hidden;
+    -webkit-user-select: none; user-select: none; cursor: default;
+  }
+  #ghost {
+    box-sizing: border-box;
+    display: flex; align-items: center; gap: 8px;
+    height: 34px; margin: 6px 8px;
+    padding: 0 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,.14);
+    background: #262626;
+    box-shadow: 0 6px 18px rgba(0,0,0,.45);
+    font: 12px/1 -apple-system, 'Segoe UI', system-ui, sans-serif;
+    color: #e6e6e6;
+    opacity: .97;
+    transition: border-color .1s, background .1s;
+  }
+  #dot { width: 7px; height: 7px; border-radius: 50%; background: #d97757; flex: 0 0 auto; }
+  #label { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #sub { margin-left: auto; color: #8a8a8a; font-size: 11px; white-space: nowrap; flex: 0 0 auto; }
+
+  /* Release here → move into the window under the cursor. */
+  body.move #ghost { border-color: #d97757; background: #2f2724; }
+  /* Release here → tear off into a brand new window. */
+  body.new  #ghost { border-color: #4f9d69; background: #232b25; }
+  body.new  #dot   { background: #4f9d69; }
+  /* Release here → nothing (back where it started). */
+  body.none #ghost { border-color: rgba(255,255,255,.10); background: #222; opacity: .8; }
+  body.none #dot   { background: #6b6b6b; }
+</style>
+</head>
+<body class="none">
+  <div id="ghost">
+    <span id="dot"></span>
+    <span id="label">Session</span>
+    <span id="sub"></span>
+  </div>
+<script>
+  window.__setLabel = function (label, subtitle) {
+    document.getElementById('label').textContent = label || 'Session';
+    document.getElementById('sub').textContent = subtitle || '';
+  };
+  window.__setMode = function (mode) {
+    document.body.className = (mode === 'move' || mode === 'new') ? mode : 'none';
+  };
+</script>
+</body>
+</html>

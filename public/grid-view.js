@@ -1,6 +1,9 @@
 // --- Session Grid Overview ---
-// No reparenting — terminals stay in #terminals. We wrap each terminal container
-// with an in-place card overlay (header/footer) and switch #terminals to grid layout.
+// Cards live in #terminals and each one CONTAINS the session's single
+// .terminal-container node (see wrapInGridCard / unwrapGridCards, which move it
+// in and out). There is exactly one xterm per session per window — the card only
+// borrows it — which is also why a session cannot be "moved" to another window
+// as a DOM node: see session-drag.js.
 //
 // Depends on globals from app.js: openSessions, activeSessionId, sessionMap, activePtyIds,
 // sortedOrder, sidebarContent, terminalsEl, gridViewActive, gridViewer, gridViewerCount,
@@ -96,9 +99,13 @@ function wrapInGridCard(sessionId) {
     }
     // Insert card after the heading and any existing cards in this group
     // (find next heading or end of container)
-    let insertBefore = targetHeading.nextSibling;
+    // nextElementSibling, not nextSibling: a text node here would throw on
+    // .classList. #terminals is built with createElement today, but a drop
+    // indicator or ghost injected by session-drag.js must not be able to break
+    // grid insertion.
+    let insertBefore = targetHeading.nextElementSibling;
     while (insertBefore && !insertBefore.classList.contains('grid-project-heading')) {
-      insertBefore = insertBefore.nextSibling;
+      insertBefore = insertBefore.nextElementSibling;
     }
     terminalsEl.insertBefore(card, insertBefore);
   } else {
@@ -122,12 +129,19 @@ function wrapInGridCard(sessionId) {
     focusGridCard(sessionId);
   });
 
-  // Clicking/focusing the terminal area also selects the card
-  entry.element.addEventListener('focusin', () => {
-    if (gridViewActive && gridFocusedSessionId !== sessionId) {
-      focusGridCard(sessionId);
-    }
-  });
+  // Clicking/focusing the terminal area also selects the card.
+  // entry.element outlives the card (it is moved back out on grid exit), so
+  // registering this every time we wrap would stack one listener per toggle.
+  // Bound once per element, reading sessionId from the live entry.
+  if (!entry._gridFocusinBound) {
+    entry._gridFocusinBound = true;
+    entry.element.addEventListener('focusin', () => {
+      const sid = entry.session.sessionId;
+      if (gridViewActive && gridFocusedSessionId !== sid) {
+        focusGridCard(sid);
+      }
+    });
+  }
 
   gridCards.set(sessionId, card);
   // Set initial status from the single source of truth
@@ -139,8 +153,11 @@ function unwrapGridCards() {
     const entry = openSessions.get(sid);
     if (entry) {
       entry.element.classList.remove('grid-mode', 'visible');
-      // Move terminal container back out of the card, before the card
-      card.parentNode.insertBefore(entry.element, card);
+      // Move terminal container back out of the card, before the card.
+      // teardownSessionView may already have detached the card, so this is
+      // guarded rather than assumed.
+      if (card.parentNode) card.parentNode.insertBefore(entry.element, card);
+      else terminalsEl.appendChild(entry.element);
     }
     card.remove();
   }
@@ -170,7 +187,10 @@ function focusGridCard(sessionId) {
 
 function showGridView() {
   gridViewActive = true;
-  localStorage.setItem('gridViewActive', '1');
+  // sessionStorage, not localStorage: localStorage is shared by every window on
+  // the same origin, so with more than one window they fought over a single
+  // view-mode flag and every new window inherited whichever one wrote last.
+  sessionStorage.setItem('gridViewActive', '1');
   placeholder.style.display = 'none';
   terminalHeader.style.display = 'none';
 
@@ -232,7 +252,7 @@ function showGridView() {
 
   // Show grid header bar with session count
   gridViewer.style.display = 'block';
-  gridViewerCount.textContent = sessionIds.length + ' session' + (sessionIds.length !== 1 ? 's' : '');
+  updateGridCount();
 
   const btn = document.getElementById('grid-toggle-btn');
   if (btn) btn.classList.add('active');
@@ -268,7 +288,11 @@ function initGridObservers() {
 
 function hideGridView() {
   gridViewActive = false;
-  localStorage.setItem('gridViewActive', '0');
+  sessionStorage.setItem('gridViewActive', '0');
+  // Leaving grid mode invalidates the focus target; toggleGridView used to be
+  // the only caller that cleared it, so any other caller leaked a stale id into
+  // navigateGrid and the next toggle's restore.
+  gridFocusedSessionId = null;
   unwrapGridCards();
   terminalsEl.classList.remove('grid-layout');
   terminalsEl.style.gridTemplateColumns = '';
@@ -280,8 +304,7 @@ function hideGridView() {
 function toggleGridView() {
   if (gridViewActive) {
     const restoreId = gridFocusedSessionId || activeSessionId;
-    hideGridView();
-    gridFocusedSessionId = null;
+    hideGridView();   // clears gridFocusedSessionId
     if (restoreId && openSessions.has(restoreId)) {
       showSession(restoreId);
     } else {

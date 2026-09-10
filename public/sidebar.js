@@ -414,6 +414,15 @@ function renderProjects(projects, resort) {
       if (fromEl.classList.contains('slug-group-more') && fromEl.classList.contains('expanded')) {
         toEl.classList.add('expanded');
       }
+      // Transient drag state lives on live rows and is not rebuilt by
+      // renderProjects, so morphdom would erase it. Renders are frequent (a
+      // 300ms-debounced projects watcher, every poll, every filter toggle), so
+      // without this a drag started in the sidebar loses its own highlight.
+      if (fromEl.classList.contains('session-item')) {
+        for (const cls of ['dragging', 'drop-before', 'drop-after']) {
+          if (fromEl.classList.contains(cls)) toEl.classList.add(cls);
+        }
+      }
       return true;
     },
     getNodeKey(node) {
@@ -756,6 +765,33 @@ function buildSessionItem(session) {
     actions.appendChild(launchConfigBtn);
   }
 
+  // Drag handle for tearing the session into another window.
+  //
+  // On the LEFT: .session-actions is absolutely positioned over the right end of
+  // the row on hover, so a right-side handle would sit under it. Width mirrors
+  // the .slug-group-expand gutter so rows stay aligned.
+  //
+  // A handle rather than the whole row: the row's click-to-open is an
+  // on-property (see rebindSidebarEvents), and making the entire row a drag
+  // source makes ordinary clicking feel unreliable.
+  const dragHandle = document.createElement('span');
+  dragHandle.className = 'session-drag-handle';
+  dragHandle.title = 'Drag to another window, or out to tear off';
+  dragHandle.setAttribute('aria-label', 'Move session to another window');
+  dragHandle.innerHTML = '<svg width="8" height="14" viewBox="0 0 8 14" fill="currentColor"><circle cx="2" cy="2" r="1.1"/><circle cx="6" cy="2" r="1.1"/><circle cx="2" cy="7" r="1.1"/><circle cx="6" cy="7" r="1.1"/><circle cx="2" cy="12" r="1.1"/><circle cx="6" cy="12" r="1.1"/></svg>';
+
+  // Marks a session that is running and displayed in a DIFFERENT window, so
+  // clicking it here is understood as "bring it to this window".
+  if (typeof window._isOwnedElsewhere === 'function' && window._isOwnedElsewhere(session.sessionId)) {
+    item.classList.add('owned-elsewhere');
+    const elsewhere = document.createElement('span');
+    elsewhere.className = 'session-elsewhere';
+    elsewhere.title = 'Open in another window — click to bring it here';
+    elsewhere.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="13" height="12" rx="2"></rect><path d="M8 21h11a2 2 0 0 0 2-2V9"></path></svg>';
+    metaEl.appendChild(elsewhere);
+  }
+
+  row.appendChild(dragHandle);
   row.appendChild(pin);
   row.appendChild(dot);
   row.appendChild(info);

@@ -59,7 +59,9 @@ test('reconcileCacheFromFilesystem indexes new and stale folders but skips up-to
     sessionCache.init({
       PROJECTS_DIR: projectsDir,
       activeSessions: new Map(),
-      getMainWindow: () => null,
+      // session-cache pushes to every window now, so it takes a broadcast fn
+      // instead of a single-window getter.
+      broadcast: () => {},
       log: console,
       db: fake.db,
     });

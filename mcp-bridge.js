@@ -196,15 +196,29 @@ async function handleOpenDiff(entry, rpcId, args, log) {
     entry.pendingDiffs.set(diffId, { resolve, rpcId, tabName: tab_name });
   });
 
-  // Send to renderer
-  if (entry.mainWindow && !entry.mainWindow.isDestroyed()) {
-    entry.mainWindow.webContents.send('mcp-open-diff', entry.sessionId, diffId, {
-      oldFilePath: old_file_path,
-      oldContent,
-      newContent: new_file_contents,
-      tabName: tab_name,
+  // Send to renderer.
+  //
+  // If there is no live window to show the diff, we MUST answer the RPC now.
+  // Previously the send was skipped and the `await` below never resolved, so the
+  // Claude CLI blocked on its openDiff tool call forever with nothing on screen
+  // to unblock it — a hang with no visible cause. A session with no window is a
+  // normal state (its window was closed, or it is mid-move), so this is
+  // reachable, not theoretical.
+  const target = entry.mainWindow && !entry.mainWindow.isDestroyed() ? entry.mainWindow : null;
+  if (!target) {
+    entry.pendingDiffs.delete(diffId);
+    log.warn(`[mcp] openDiff for ${entry.sessionId} has no window to display in — rejecting so the CLI does not hang`);
+    sendResult(entry, rpcId, {
+      content: [{ type: 'text', text: 'DIFF_REJECTED' }],
     });
+    return;
   }
+  target.webContents.send('mcp-open-diff', entry.sessionId, diffId, {
+    oldFilePath: old_file_path,
+    oldContent,
+    newContent: new_file_contents,
+    tabName: tab_name,
+  });
 
   // Await user action
   const result = await diffPromise;
@@ -453,6 +467,22 @@ function rekeyMcpServer(oldId, newId) {
 }
 
 /**
+ * Point a session's IDE messages at a different window.
+ *
+ * `entry.mainWindow` was captured once when the PTY spawned and never refreshed,
+ * so after a session moved windows its diffs kept going to the window it came
+ * from — and were silently dropped by the isDestroyed() guards if that window
+ * had closed. Called on every attach, so the diff panel always opens where the
+ * session actually is.
+ */
+function setMcpWindow(sessionId, win) {
+  const entry = servers.get(sessionId);
+  if (!entry) return false;
+  entry.mainWindow = win || null;
+  return true;
+}
+
+/**
  * Clean up stale lock files from previous Switchboard runs.
  */
 function cleanStaleLockFiles(log) {
@@ -484,5 +514,6 @@ module.exports = {
   shutdownAll,
   resolvePendingDiff,
   rekeyMcpServer,
+  setMcpWindow,
   cleanStaleLockFiles,
 };
