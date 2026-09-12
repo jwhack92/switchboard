@@ -2616,6 +2616,21 @@ body { display: flex; flex-direction: column; }
 }
 
 /* Timestamp */
+/* Timestamp on a message. Absolute rather than floated: .jsonl-entry is
+   position:relative, and a float here would narrow the first line of every
+   message. System rows keep the floated .jsonl-ts above. */
+.jsonl-ts-msg {
+  position: absolute;
+  top: 6px;
+  right: 12px;
+  float: none;
+  margin-top: 0;
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+  pointer-events: auto;
+}
+.jsonl-entry:hover .jsonl-ts-msg { opacity: 1; }
+
 .jsonl-ts {
   font-size: 11px;
   color: #b0b0be;

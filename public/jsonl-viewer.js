@@ -411,6 +411,62 @@ function extractResultText(data) {
   return JSON.stringify(data, null, 2);
 }
 
+/**
+ * Format a transcript timestamp for display.
+ *
+ * Every line in a .jsonl carries an ISO `timestamp`, so nothing needs storing —
+ * it only needed rendering. The previous version used toLocaleTimeString(),
+ * which drops the date; in a session spanning weeks (this repo has one running
+ * since 22 Aug) "15:42" is ambiguous across every day it covers.
+ *
+ * Same-day entries stay bare so the common case is uncluttered; anything older
+ * carries the date, and the year only when it is not the current one.
+ */
+function formatEntryTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '';
+
+  const now = new Date();
+  const sameDay = d.getDate() === now.getDate()
+    && d.getMonth() === now.getMonth()
+    && d.getFullYear() === now.getFullYear();
+  if (sameDay) return d.toLocaleTimeString();
+
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const date = d.toLocaleDateString([], d.getFullYear() === now.getFullYear()
+    ? { day: 'numeric', month: 'short' }
+    : { day: 'numeric', month: 'short', year: 'numeric' });
+  return `${date} ${time}`;
+}
+
+/** Full instant plus how long ago, for the hover title. */
+function formatEntryTimeTitle(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '';
+  const mins = Math.round((Date.now() - d.getTime()) / 60000);
+  const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'} ago`;
+  let ago;
+  if (mins < 0) ago = 'in the future';          // clock skew across machines
+  else if (mins < 1) ago = 'just now';
+  else if (mins < 60) ago = plural(mins, 'min');
+  else if (mins < 60 * 24) ago = plural(Math.round(mins / 60), 'hour');
+  else ago = plural(Math.round(mins / (60 * 24)), 'day');
+  return `${d.toLocaleString()} — ${ago}`;
+}
+
+/** The timestamp chip shown on a message. */
+function buildTimeChip(ts) {
+  const text = formatEntryTime(ts);
+  if (!text) return null;
+  const el = document.createElement('span');
+  el.className = 'jsonl-ts jsonl-ts-msg';
+  el.textContent = text;
+  el.title = formatEntryTimeTitle(ts);
+  return el;
+}
+
 function renderJsonlEntry(entry, toolResultMap) {
   // Synthetic local command entry from mergeLocalCommandEntries
   if (entry._localCmd) {
@@ -418,7 +474,7 @@ function renderJsonlEntry(entry, toolResultMap) {
   }
 
   const ts = entry.timestamp;
-  const timeStr = ts ? new Date(ts).toLocaleTimeString() : '';
+  const timeStr = formatEntryTime(ts);
 
   // --- custom-title ---
   if (entry.type === 'custom-title') {
@@ -496,6 +552,12 @@ function renderJsonlEntry(entry, toolResultMap) {
 
   const div = document.createElement('div');
   div.className = 'jsonl-entry ' + (visualRole === 'user' ? 'jsonl-user' : 'jsonl-assistant');
+
+  // Messages carried no timestamp at all before this — only turn-duration and
+  // local-command rows did. "When did this reply come in" was the one question
+  // the transcript could not answer, despite every line carrying the instant.
+  const timeChip = buildTimeChip(ts);
+  if (timeChip) div.appendChild(timeChip);
 
 
   for (const block of contentBlocks) {
@@ -614,4 +676,10 @@ async function showJsonlViewer(session) {
 
   // Scroll to the bottom so the most recent messages are visible
   jsonlViewerBody.scrollTop = jsonlViewerBody.scrollHeight;
+}
+
+// Pure date helpers, exported for tests. The file touches no DOM at load time,
+// so it can be required directly.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { formatEntryTime, formatEntryTimeTitle };
 }
