@@ -292,6 +292,87 @@ function flushTerminalBuffer(sessionId) {
   });
 }
 
+// --- Raw output recorder (diagnostic; off unless switched on) --------------
+//
+// Text has been arriving on screen with individual characters replaced by other
+// characters — spaces turning into letters, mostly — while layout stays intact.
+// Four plausible causes have already been ruled out by measurement, and the
+// remaining ones differ in WHERE the text first goes wrong. This tells them
+// apart by keeping the raw bytes as they arrive from the PTY, so a garbled
+// fragment can be looked for at each stage:
+//
+//   in the raw bytes   -> it arrived broken; xterm and the renderer are innocent
+//   not raw, in buffer -> xterm's parser/buffer mangled it
+//   not buffer, on screen only -> the renderer is drawing the wrong glyphs
+//
+// Costs one boolean test per chunk while off.
+const RAW_LOG_CAP = 262144;          // keep the last 256 KB per session
+const rawLogs = new Map();           // sessionId -> { text }
+let rawRecording = false;
+
+function recordRaw(sessionId, data) {
+  if (!rawRecording) return;
+  let log = rawLogs.get(sessionId);
+  if (!log) { log = { text: '' }; rawLogs.set(sessionId, log); }
+  log.text += data;
+  if (log.text.length > RAW_LOG_CAP) log.text = log.text.slice(-RAW_LOG_CAP);
+}
+
+function startRawRecording() {
+  rawRecording = true;
+  rawLogs.clear();
+  return 'recording raw terminal output (last 256KB per session)';
+}
+
+function stopRawRecording() {
+  rawRecording = false;
+  return 'stopped; recorded ' + rawLogs.size + ' session(s)';
+}
+
+/** Escape codes and control bytes made visible, so shifts are readable. */
+function visibleEscapes(s) {
+  return s
+    .replace(/\x1b/g, '\\e')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n\n')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, c => '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0'));
+}
+
+/**
+ * Locate a fragment at each stage of the pipeline.
+ * @param {string} needle a distinctive run of GARBLED text seen on screen
+ */
+function findGarbled(needle, { context = 300 } = {}) {
+  const report = [];
+
+  for (const [sessionId, log] of rawLogs) {
+    const idx = log.text.indexOf(needle);
+    report.push(`raw[${sessionId.slice(0, 8)}]: ${idx >= 0 ? 'FOUND at ' + idx : 'not present'}`);
+    if (idx >= 0) {
+      const from = Math.max(0, idx - context), to = Math.min(log.text.length, idx + needle.length + context);
+      report.push('  ' + visibleEscapes(log.text.slice(from, to)));
+    }
+  }
+  if (!rawLogs.size) report.push('raw: nothing recorded — run __rawStart() first, then reproduce');
+
+  for (const [sessionId, entry] of openSessions) {
+    const b = entry.terminal.buffer.active;
+    for (let i = 0; i < b.length; i++) {
+      const line = b.getLine(i);
+      if (!line) continue;
+      const s = line.translateToString(true);
+      if (s.includes(needle)) {
+        report.push(`buffer[${sessionId.slice(0, 8)}] line ${i}: ${s.trim()}`);
+        break;
+      }
+    }
+  }
+
+  const out = report.join('\n');
+  try { if (typeof copy === 'function') copy(out); } catch {}
+  return out;
+}
+
 function scheduleFlush(sessionId, buf) {
   cancelAnimationFrame(buf.rafId);
   buf.rafId = requestAnimationFrame(() => flushTerminalBuffer(sessionId));
@@ -314,6 +395,33 @@ function createTerminalEntry(session) {
     cursorBlink: false,
     scrollback: 10000,
     convertEol: true,
+    // Disable xterm's buffer reflow.
+    //
+    // On a column change xterm re-wraps existing scrollback in place. Claude
+    // Code hard-wraps its own output and emits real newlines, but any line that
+    // lands exactly on the column limit gets flagged as soft-wrapped, and reflow
+    // then merges it with the next one. The result is text rewritten in the
+    // buffer: characters substituted, and each line's first columns duplicated
+    // ahead of itself. Because the renderer only repaints dirty rows, the damage
+    // stays invisible until something forces a repaint — selecting text, or
+    // scrolling — so it appears to happen later and all at once.
+    //
+    // Opening DevTools narrows the pane, which is why investigating it made it
+    // worse.
+    //
+    // xterm only offers this as a side effect of the Windows pty hint:
+    //   _isReflowEnabled = windowsPty.buildNumber
+    //     ? hasScrollback && backend === 'conpty' && buildNumber >= 21376
+    //     : hasScrollback && !windowsMode
+    // Declaring 'winpty' fails the backend test and turns reflow off, without
+    // enabling the legacy < 21376 wrapping heuristics that a low buildNumber
+    // would. The backend is really conpty; this value is chosen for its effect,
+    // not its accuracy, and there is no honest option that does the same thing.
+    //
+    // Cost: on resize, old scrollback keeps the wrapping it was written with
+    // instead of re-wrapping to the new width. That is what Windows Terminal
+    // does, and it is a far better failure than corrupting the text.
+    windowsPty: { backend: 'winpty', buildNumber: 26200 },
     allowProposedApi: true,
     // A TUI that turns on full mouse tracking (CSI ?1003h) makes xterm forward every
     // drag to the application, so normal text selection is dead. Terminal.app and
@@ -635,5 +743,13 @@ function setupDragAndDrop(container, getSessionId) {
 // browser, where this file is loaded as a plain <script> and `module` is undefined.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload,
-    safeFit, rowsThatActuallyFit };
+    safeFit, rowsThatActuallyFit, visibleEscapes };
+}
+
+// Console handles for the raw recorder. Deliberately short — they get typed by
+// hand at the moment something has just gone wrong on screen.
+if (typeof window !== 'undefined') {
+  window.__rawStart = startRawRecording;
+  window.__rawStop = stopRawRecording;
+  window.__find = findGarbled;
 }

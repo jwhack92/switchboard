@@ -207,6 +207,7 @@ window.api.onTerminalData((sessionId, data) => {
       terminalWriteBuffers.set(sessionId, buf);
     }
     buf.chunks.push(data);
+    recordRaw(sessionId, data);   // no-op unless __rawStart() was called
 
     // Track sync start/end nesting
     if (data.includes(ESC_SYNC_START)) buf.syncDepth++;
