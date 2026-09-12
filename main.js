@@ -388,6 +388,16 @@ function buildMenu() {
     {
       label: 'View',
       submenu: [
+        // Reload the renderer without restarting the app. PTYs live in the main
+        // process, so sessions survive this and re-attach with their scrollback
+        // — which is what makes it safe to offer as a normal menu item.
+        //
+        // Worth having explicitly: electron-reloader hot-reloads renderer files
+        // in dev, but there was no way to reload by hand, and Ctrl+R is not
+        // bound on its own once a custom application menu replaces the default.
+        { role: 'reload' },
+        { role: 'forceReload' },
+        { type: 'separator' },
         { role: 'toggleDevTools' },
         { type: 'separator' },
         { role: 'resetZoom' },
@@ -904,7 +914,16 @@ function scanMdFiles(dir) {
   return results;
 }
 
-ipcMain.handle('get-memories', () => {
+/**
+ * Scan every memory/notes file and rebuild the FTS index from it.
+ *
+ * Called from three places, which is the point: the Memory tab (so it is
+ * fresh when read), app startup (so files written while the app was closed
+ * are findable), and the projects watcher (so files written while it is open
+ * are too). It used to be called from the tab alone, which made the index a
+ * snapshot of the last time someone happened to look at it.
+ */
+function collectAndIndexMemories() {
   const global = getSetting('global') || {};
   const hiddenProjects = new Set(global.hiddenProjects || []);
 
@@ -1016,7 +1035,9 @@ ipcMain.handle('get-memories', () => {
   } catch {}
 
   return result;
-});
+}
+
+ipcMain.handle('get-memories', () => collectAndIndexMemories());
 
 // --- IPC: read-memory ---
 ipcMain.handle('read-memory', (_event, filePath) => {
@@ -1752,6 +1773,9 @@ function startProjectsWatcher() {
   if (!fs.existsSync(PROJECTS_DIR)) return;
 
   const pendingFolders = new Set();
+  // Memory files do not affect the session cache, so they are tracked
+  // separately from the folders queued for re-indexing.
+  let memoryDirty = false;
   let debounceTimer = null;
 
   function flushChanges() {
@@ -1774,6 +1798,18 @@ function startProjectsWatcher() {
     if (changed) {
       notifyRendererProjectsChanged();
     }
+
+    if (memoryDirty) {
+      memoryDirty = false;
+      // Rebuilt whole rather than per-file: there are ~130 small files, and a
+      // partial update would have to track deletions across five scan roots.
+      // The debounce above already collapses a burst into one rebuild.
+      try {
+        collectAndIndexMemories();
+      } catch (err) {
+        log.error('[memory] reindex failed:', err.message);
+      }
+    }
   }
 
   try {
@@ -1791,6 +1827,10 @@ function startProjectsWatcher() {
         pendingFolders.add(folder);
       } else if (basename.endsWith('.jsonl')) {
         pendingFolders.add(folder);
+      } else if (basename.endsWith('.md')) {
+        // A memory or notes file. No folder is queued — the session cache is
+        // unaffected — but the memory index now needs rebuilding.
+        memoryDirty = true;
       } else {
         return;
       }
@@ -1862,6 +1902,14 @@ if (!gotSingleInstanceLock) {
     buildMenu();
     createWindow();
     startProjectsWatcher();
+
+    // Memory written while the app was closed would otherwise stay out of
+    // search until someone opened the Memory tab.
+    try {
+      collectAndIndexMemories();
+    } catch (err) {
+      log.error('[memory] startup index failed:', err.message);
+    }
     scheduleIpc.ensureScheduleCreatorCommand();
 
     // Shared runCommand for cron scheduler and "run now" — takes argv, not a shell string
