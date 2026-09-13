@@ -12,23 +12,35 @@ async function loadStats() {
   spinner.innerHTML = `<div class="stats-spinner-icon"></div><span>Updating stats\u2026</span>`;
   statsViewerBody.appendChild(spinner);
 
-  // Refresh stats cache via PTY (/stats + /usage)
-  let stats, usage;
+  // Refresh the stats cache via PTY and fetch rate limits via API.
+  let stats, usage, statsError;
   try {
     const result = await window.api.refreshStats();
     stats = result?.stats;
     usage = result?.usage || {};
+    statsError = result?.statsError;
     cachedUsage = usage;
   } catch {
     // Fallback to cached stats
-    stats = await window.api.getStats();
+    stats = await window.api.getStats().catch(() => null);
     usage = cachedUsage || {};
+    statsError = 'Could not refresh stats.';
   }
 
   statsViewerBody.innerHTML = '';
 
+  // A refresh that fails must say so. Falling back to the cache and rendering it
+  // without comment is how this page showed April data for five months.
+  if (statsError) {
+    const notice = document.createElement('div');
+    notice.className = 'stats-refresh-error';
+    notice.setAttribute('role', 'status');
+    notice.textContent = `Stats refresh failed. ${statsError}${stats ? ' Showing cached data.' : ''}`;
+    statsViewerBody.appendChild(notice);
+  }
+
   if (!stats && !Object.keys(usage).length) {
-    statsViewerBody.innerHTML = '<div class="plans-empty">No stats data found. Run some Claude sessions first.</div>';
+    if (!statsError) statsViewerBody.innerHTML = '<div class="plans-empty">No stats data found. Run some Claude sessions first.</div>';
     return;
   }
 
