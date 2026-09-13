@@ -1529,10 +1529,19 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         const payload = m[2].slice(0, 120);
         // Detect Claude CLI busy state from OSC 0 title (spinner chars = busy, ✳ = idle)
         if (code === '0') {
+          // Claude marks a working session by prefixing its terminal title with a
+          // spinner frame. Versions through 2.1.227 used braille; 2.1.228+ emit the
+          // four rotating half-circles U+25D0-U+25D3. Testing only the braille range
+          // meant this stopped matching at that release, silently: measured across
+          // this machine's logs, busy=true appeared 0 times in 10,730 title events,
+          // every one of them U+25D0 or U+25D1. Both ranges are accepted so an older
+          // CLI keeps working. (Upstream doctly/switchboard a8fe1e3 does the same.)
           const firstChar = payload.charAt(0);
-          const isBusy = firstChar.charCodeAt(0) >= 0x2800 && firstChar.charCodeAt(0) <= 0x28FF;
+          const charCode = firstChar ? firstChar.charCodeAt(0) : -1;  // empty title: no state
+          const isBusy = (charCode >= 0x2800 && charCode <= 0x28FF)   // braille, <= 2.1.227
+            || (charCode >= 0x25D0 && charCode <= 0x25D3);            // half-circles, 2.1.228+
           const isIdle = firstChar === '\u2733'; // ✳
-          log.debug(`[OSC 0] session=${currentId} char=U+${firstChar.charCodeAt(0).toString(16).toUpperCase()} busy=${isBusy} idle=${isIdle} wasBusy=${!!session._cliBusy}`);
+          log.debug(`[OSC 0] session=${currentId} char=U+${charCode >= 0 ? charCode.toString(16).toUpperCase() : 'NONE'} busy=${isBusy} idle=${isIdle} wasBusy=${!!session._cliBusy}`);
           if (isBusy && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;

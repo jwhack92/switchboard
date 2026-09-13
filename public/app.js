@@ -137,6 +137,20 @@ const sessionBusyState = new Map(); // sessionId → boolean (currently active)
 
 // Central activity dispatcher
 function setActivity(sessionId, active) {
+  // response-ready normally stays latched until the user looks at the session.
+  // A fresh busy signal is stronger evidence, though: the session is plainly
+  // working again, so it must be able to go straight back to running.
+  //
+  // This mattered only once the OSC 0 spinner range was fixed (main.js). While
+  // busy never fired, nothing could reach the latch; now that it does, without
+  // this a session that finished a turn, latched response-ready, and then
+  // started working again would sit showing "response ready" the whole time.
+  if (active && responseReadySessions.has(sessionId)) {
+    responseReadySessions.delete(sessionId);
+    const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
+    if (item) item.classList.remove('response-ready');
+  }
+
   if (responseReadySessions.has(sessionId)) {
     return;
   }
