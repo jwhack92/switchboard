@@ -24,6 +24,7 @@ function makeFakeDb(metaMap) {
     db: {
       deleteCachedFolder() {},
       getCachedByFolder() { return []; },
+      getCachedSession() { return null; },
       upsertCachedSessions(sessions) { for (const s of sessions) indexedFolders.add(s.folder); },
       deleteCachedSession() {},
       deleteSearchFolder() {},

@@ -31,6 +31,7 @@ function setup({ sessions, dirs }) {
     log: console,
     db: {
       deleteCachedFolder() {}, getCachedByFolder() { return []; },
+      getCachedSession() { return null; },
       upsertCachedSessions() {}, deleteCachedSession() {},
       deleteSearchFolder() {}, deleteSearchSession() {}, upsertSearchEntries() {},
       setFolderMeta() {}, getAllFolderMeta() { return folderMeta; },

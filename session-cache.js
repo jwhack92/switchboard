@@ -11,7 +11,7 @@ const { encodeProjectPath } = require('./encode-project-path');
  * Call init(ctx) once with the shared context object.
  */
 let PROJECTS_DIR, activeSessions, broadcast, log;
-let deleteCachedFolder, getCachedByFolder, upsertCachedSessions, deleteCachedSession;
+let deleteCachedFolder, getCachedByFolder, getCachedSession, upsertCachedSessions, deleteCachedSession;
 let deleteSearchFolder, deleteSearchSession, upsertSearchEntries;
 let setFolderMeta, getAllFolderMeta, getAllMeta, getAllCached, getSetting, getMeta, setName;
 
@@ -26,6 +26,9 @@ function init(ctx) {
   // DB functions
   deleteCachedFolder = ctx.db.deleteCachedFolder;
   getCachedByFolder = ctx.db.getCachedByFolder;
+  // Degrade to a full read rather than throwing if a caller has not wired this
+  // up. Losing the resume state costs speed; losing indexing costs correctness.
+  getCachedSession = ctx.db.getCachedSession || (() => null);
   upsertCachedSessions = ctx.db.upsertCachedSessions;
   deleteCachedSession = ctx.db.deleteCachedSession;
   deleteSearchFolder = ctx.db.deleteSearchFolder;
@@ -68,9 +71,14 @@ function refreshFolder(folder) {
     return;
   }
 
+  // Read before parsing, never after. The parser deliberately stops at the file
+  // size it saw on entry, so a write that lands during this pass is NOT indexed
+  // — recording a post-scan mtime would mark it as already done and reconcile
+  // would never revisit it.
+  const indexMtimeMs = getFolderIndexMtimeMs(folderPath);
   const projectPath = deriveProjectPath(folderPath, folder);
   if (!projectPath) {
-    setFolderMeta(folder, null, getFolderIndexMtimeMs(folderPath));
+    setFolderMeta(folder, null, indexMtimeMs);
     return;
   }
 
@@ -109,8 +117,11 @@ function refreshFolder(folder) {
       continue; // unchanged, skip
     }
 
-    // File is new or modified — re-read it
-    const s = readSessionFile(filePath, folder, projectPath);
+    // File is new or modified — re-read it. The cached row carries the resume
+    // state, so an append costs the size of the append rather than the size of
+    // the whole file. Fetched per changed session on purpose: a folder holds
+    // many sessions and only a couple change per flush.
+    const s = readSessionFile(filePath, folder, projectPath, getCachedSession(sessionId));
     if (s) {
       sessionsToUpsert.push(s);
       // Title precedence: user rename (session_meta.name) > JSONL custom-title > JSONL ai-title.
@@ -153,7 +164,7 @@ function refreshFolder(folder) {
   }
 
   // Update folder mtime
-  setFolderMeta(folder, projectPath, getFolderIndexMtimeMs(folderPath));
+  setFolderMeta(folder, projectPath, indexMtimeMs);
 }
 
 /**

@@ -56,7 +56,13 @@ db.exec(`
     messageCount INTEGER DEFAULT 0,
     slug TEXT,
     aiTitle TEXT,
-    fileMtime TEXT
+    fileMtime TEXT,
+    customTitle TEXT,
+    textContent TEXT,
+    headHash TEXT,
+    indexedBytes INTEGER DEFAULT 0,
+    firstTimestamp TEXT,
+    lastTimestamp TEXT
   )
 `);
 
@@ -147,6 +153,19 @@ if (migrations.length > currentDbVersion) {
     db.exec('DELETE FROM session_cache');
     db.exec('DELETE FROM cache_meta');
   }
+  // Resume state for the incremental transcript parser. Added by column
+  // presence for the same reason as the above: a DB advanced by a parallel
+  // branch must still gain them. Purely additive — no cache is cleared. Rows
+  // that predate these columns simply have indexedBytes 0, which fails the
+  // resume gate and gives them one full read on their next modification.
+  // firstTimestamp/lastTimestamp are kept separate from created/modified,
+  // whose fallback to file times must never become an accumulator value.
+  for (const col of [
+    'customTitle TEXT', 'textContent TEXT', 'headHash TEXT',
+    'indexedBytes INTEGER DEFAULT 0', 'firstTimestamp TEXT', 'lastTimestamp TEXT',
+  ]) {
+    if (!cols.has(col.split(' ')[0])) db.exec(`ALTER TABLE session_cache ADD COLUMN ${col}`);
+  }
 }
 
 // --- FTS5 full-text search ---
@@ -184,16 +203,25 @@ const stmts = {
   `),
   // Session cache statements
   cacheCount: db.prepare('SELECT COUNT(*) as cnt FROM session_cache'),
-  cacheGetAll: db.prepare('SELECT * FROM session_cache'),
+  // Frequent sidebar/title refreshes do not need the potentially large search
+  // text or the parser's resume state.
+  cacheGetAll: db.prepare(`
+    SELECT sessionId, folder, projectPath, summary, firstPrompt, created, modified,
+           messageCount, slug, aiTitle, fileMtime
+    FROM session_cache
+  `),
   cacheUpsert: db.prepare(`
-    INSERT INTO session_cache (sessionId, folder, projectPath, summary, firstPrompt, created, modified, messageCount, slug, aiTitle, fileMtime)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO session_cache (sessionId, folder, projectPath, summary, firstPrompt, created, modified, messageCount, slug, aiTitle, fileMtime, customTitle, textContent, headHash, indexedBytes, firstTimestamp, lastTimestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(sessionId) DO UPDATE SET
       folder = excluded.folder, projectPath = excluded.projectPath,
       summary = excluded.summary, firstPrompt = excluded.firstPrompt,
       created = excluded.created, modified = excluded.modified,
       messageCount = excluded.messageCount, slug = excluded.slug,
-      aiTitle = excluded.aiTitle, fileMtime = excluded.fileMtime
+      aiTitle = excluded.aiTitle, fileMtime = excluded.fileMtime,
+      customTitle = excluded.customTitle, textContent = excluded.textContent,
+      headHash = excluded.headHash, indexedBytes = excluded.indexedBytes,
+      firstTimestamp = excluded.firstTimestamp, lastTimestamp = excluded.lastTimestamp
   `),
   cacheGetByFolder: db.prepare('SELECT sessionId, fileMtime FROM session_cache WHERE folder = ?'),
   cacheGetFolder: db.prepare('SELECT folder FROM session_cache WHERE sessionId = ?'),
@@ -280,7 +308,9 @@ const upsertCachedSessionsBatch = db.transaction((sessions) => {
     stmts.cacheUpsert.run(
       s.sessionId, s.folder, s.projectPath, s.summary,
       s.firstPrompt, s.created, s.modified, s.messageCount || 0,
-      s.slug || null, s.aiTitle || null, s.fileMtime || null
+      s.slug || null, s.aiTitle || null, s.fileMtime || null,
+      s.customTitle || null, s.textContent || null, s.headHash || null,
+      s.indexedBytes || 0, s.firstTimestamp || null, s.lastTimestamp || null
     );
   }
 });
