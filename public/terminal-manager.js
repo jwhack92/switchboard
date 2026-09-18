@@ -258,7 +258,42 @@ function fitAndScroll(entry) {
     if (wasAtBottom) {
       entry.terminal.scrollToBottom();
     }
+    // A pane that was display:none has no painted rows to damage-track against,
+    // so whatever the renderer last drew can survive into the new view.
+    forceRepaint(entry);
   });
+}
+
+// --- Stale-row repaint -----------------------------------------------------
+//
+// The WebGL renderer can leave a row showing stale content after a burst of
+// output: the line is drawn twice, or an old line persists under a new one.
+// The buffer itself is correct — resizing the window fixes the display, and a
+// resize's only effect here is to force every row to be repainted, which is
+// what identifies this as a renderer-damage problem rather than a parser or
+// PTY one.
+//
+// Claude Code redraws its entire UI inside synchronized-update wrappers
+// (DECSET 2026, buffered above), so one flush can dirty far more rows at once
+// than an ordinary append, which is when the misses show up.
+//
+// The fix is to repaint every row once, shortly after output stops. While
+// output is still streaming each flush pushes the timer out, so a busy session
+// pays nothing; a settled one pays a single full repaint.
+const SETTLE_REPAINT_MS = 120;
+
+function forceRepaint(entry) {
+  if (!entry || entry.closed || !entry.terminal) return;
+  try { entry.terminal.refresh(0, entry.terminal.rows - 1); } catch {}
+}
+
+function scheduleSettledRepaint(entry) {
+  if (!entry || entry.closed) return;
+  clearTimeout(entry._repaintTimer);
+  entry._repaintTimer = setTimeout(() => {
+    entry._repaintTimer = 0;
+    forceRepaint(entry);
+  }, SETTLE_REPAINT_MS);
 }
 
 // --- Terminal write buffering ---
@@ -283,6 +318,7 @@ function flushTerminalBuffer(sessionId) {
   const savedViewportY = entry.terminal.buffer.active.viewportY;
   entry.terminal.write(data, () => {
     if (sessionId !== activeSessionId) return;
+    scheduleSettledRepaint(entry);
     if (wasAtBottom) {
       entry.terminal.scrollToBottom();
     } else {
@@ -601,6 +637,10 @@ function teardownSessionView(sessionId, { notifyMain }) {
   const entry = openSessions.get(sessionId);
   if (!entry) return false;
 
+  // A queued repaint would refresh a disposed terminal.
+  clearTimeout(entry._repaintTimer);
+  entry._repaintTimer = 0;
+
   // A queued rAF/timeout flush would write into a disposed terminal, and its
   // buffered chunks would be lost either way. Drop it deliberately.
   const buf = terminalWriteBuffers.get(sessionId);
@@ -743,7 +783,8 @@ function setupDragAndDrop(container, getSessionId) {
 // browser, where this file is loaded as a plain <script> and `module` is undefined.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload,
-    safeFit, rowsThatActuallyFit, visibleEscapes };
+    safeFit, rowsThatActuallyFit, visibleEscapes,
+    forceRepaint, scheduleSettledRepaint, SETTLE_REPAINT_MS };
 }
 
 // Console handles for the raw recorder. Deliberately short — they get typed by
