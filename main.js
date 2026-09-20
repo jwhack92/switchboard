@@ -56,52 +56,13 @@ for (const stream of [process.stdout, process.stderr]) {
 
 try { require('electron-reloader')(module, { watchRenderer: true }); } catch {};
 
-// Environment a running Claude Code session stamps onto everything it spawns.
-//
-// If Switchboard is itself started from inside a Claude Code session — a
-// terminal, a task runner, an agent — these are inherited by the Electron
-// process and then handed straight to every PTY it opens. The CLI sees
-// CLAUDE_CODE_CHILD_SESSION, decides it is a nested child, and prints:
-//
-//   Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker
-//
-// which is self-defeating here: sessions started from Switchboard are never
-// written to ~/.claude/projects, so they never appear in Switchboard.
-//
-// The messaging socket/token and session id are worse than useless downstream —
-// they point the new session at the PARENT session's IPC channel.
-// Note: Switchboard sets CLAUDECODE=1 itself for PLAIN terminals (see the
-// claudeShim below) to explain that sessions start from the + button. Stripping
-// it here is still correct — that assignment happens after this spread, so the
-// deliberate one survives and only an inherited one is removed.
-const CLAUDE_SESSION_VARS = [
-  'AI_AGENT',
-  'CLAUDECODE',
-  'CLAUDE_CODE_CHILD_SESSION',
-  'CLAUDE_CODE_ENTRYPOINT',
-  'CLAUDE_CODE_EXECPATH',
-  'CLAUDE_CODE_MESSAGING_SOCKET',
-  'CLAUDE_CODE_MESSAGING_TOKEN',
-  'CLAUDE_CODE_SESSION_ID',
-  'CLAUDE_CODE_SSE_PORT',
-  'CLAUDE_CODE_USE_POWERSHELL_TOOL',
-  'CLAUDE_EFFORT',
-  'CLAUDE_PID',
-];
+// Environment for PTY children — Electron internals stripped, inherited Claude
+// Code session markers stripped, and a UTF-8 LC_CTYPE guaranteed when the
+// parent handed us no locale. See pty-env.js for why each of those matters;
+// the Claude-marker strip in particular is ours and has no upstream equivalent.
+const { buildPtyEnv } = require('./pty-env');
 
-// Clean env for child processes — strip Electron internals that cause nested
-// Electron apps (or node-pty inside them) to malfunction, plus any inherited
-// Claude Code session markers (see above).
-const cleanPtyEnv = Object.fromEntries(
-  Object.entries(process.env).filter(([k]) =>
-    !k.startsWith('ELECTRON_') &&
-    !k.startsWith('GOOGLE_API_KEY') &&
-    !CLAUDE_SESSION_VARS.includes(k) &&
-    k !== 'NODE_OPTIONS' &&
-    k !== 'ORIGINAL_XDG_CURRENT_DESKTOP' &&
-    k !== 'WT_SESSION'
-  )
-);
+const cleanPtyEnv = buildPtyEnv(process.env);
 
 // Shell profiles → shell-profiles.js
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgvForShell } = require('./shell-profiles');
