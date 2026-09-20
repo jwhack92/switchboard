@@ -65,6 +65,7 @@ const { buildPtyEnv } = require('./pty-env');
 const cleanPtyEnv = buildPtyEnv(process.env);
 
 // Shell profiles → shell-profiles.js
+const { resolveEffectiveSettings } = require('./resolve-effective-settings');
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgvForShell } = require('./shell-profiles');
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
@@ -1091,16 +1092,7 @@ ipcMain.handle('get-shell-profiles', () => {
 ipcMain.handle('get-effective-settings', (_event, projectPath) => {
   const global = getSetting('global') || {};
   const project = projectPath ? (getSetting('project:' + projectPath) || {}) : {};
-  const effective = { ...SETTING_DEFAULTS };
-  for (const key of Object.keys(SETTING_DEFAULTS)) {
-    if (global[key] !== undefined && global[key] !== null) {
-      effective[key] = global[key];
-    }
-    if (project[key] !== undefined && project[key] !== null) {
-      effective[key] = project[key];
-    }
-  }
-  return effective;
+  return resolveEffectiveSettings(SETTING_DEFAULTS, global, project);
 });
 
 // --- IPC: get-active-sessions ---
