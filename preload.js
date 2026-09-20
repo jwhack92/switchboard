@@ -37,6 +37,8 @@ contextBridge.exposeInMainWorld('api', {
   // Spoken output
   speechNewText: (sessionId, sinceBytes) => ipcRenderer.invoke('speech-new-text', sessionId, sinceBytes),
   speechSummarize: (text, maxWords) => ipcRenderer.invoke('speech-summarize', text, maxWords),
+  speechWarmUp: () => ipcRenderer.invoke('speech-warmup'),
+  speechShutdown: () => ipcRenderer.invoke('speech-shutdown'),
   getSettingDefaults: () => ipcRenderer.invoke('get-setting-defaults'),
   getEffectiveSettings: (projectPath) => ipcRenderer.invoke('get-effective-settings', projectPath),
   getScheduleCreatorCommand: () => ipcRenderer.invoke('get-schedule-creator-command'),

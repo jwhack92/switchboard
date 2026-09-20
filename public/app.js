@@ -158,6 +158,12 @@ function setActivity(sessionId, active) {
   const wasActive = sessionBusyState.get(sessionId) || false;
   sessionBusyState.set(sessionId, active);
 
+  // Idle → busy on the focused session: start the summarizer now so its ~4s
+  // startup overlaps the work rather than delaying the spoken reply.
+  if (!wasActive && active && sessionId === activeSessionId && window.speech) {
+    window.speech.warmUp();
+  }
+
   if (wasActive && !active) {
     // Activity ended → response-ready if user isn't looking at this session
     if (sessionId !== activeSessionId) {
@@ -1723,6 +1729,10 @@ if (typeof window.api.onDriverHalted === 'function') {
       };
     }
     renderStopControl();
+    // A process you deliberately stopped should not still be running.
+    if (stopState.halted && stopState.halted.halted && window.api.speechShutdown) {
+      window.api.speechShutdown().catch(() => {});
+    }
   });
 }
 

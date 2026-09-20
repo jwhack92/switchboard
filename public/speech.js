@@ -181,6 +181,22 @@
     window.tts.speak(spokenText, speakOpts(settings));
   }
 
+  /**
+   * Start the summarizer ahead of need, when the focused session begins working.
+   *
+   * Gated on speech actually being on and replies actually being enabled, so a
+   * user who only wants background alerts never spawns a summarizer at all.
+   * Uses the cached settings rather than awaiting, because this fires on a hot
+   * path and being a turn late here costs nothing.
+   */
+  function warmUp() {
+    if (!enabled) return;
+    if (cachedSettings.speakReplies !== 'focused') return;
+    if (!window.tts || !window.tts.isAvailable()) return;
+    if (!window.api || !window.api.speechWarmUp) return;
+    window.api.speechWarmUp().catch(() => {});
+  }
+
   /** Forget a session's offset, so a re-opened session re-baselines. */
   function forget(sessionId) {
     spokenBytes.delete(sessionId);
@@ -194,6 +210,7 @@
 
   window.speech = {
     speakReply,
+    warmUp,
     forget,
     isEnabled,
     setEnabled,
