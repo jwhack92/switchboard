@@ -98,8 +98,8 @@
     const projectBaseValue = fieldValue('projectBaseDir', '');
     const mcpEmulationValue = fieldValue('mcpEmulation', true);
     const shellProfileValue = fieldValue('shellProfile', 'auto');
-    const speakRepliesValue = fieldValue('speakReplies', 'off');
-    const speakAlertsValue = fieldValue('speakAlerts', false);
+    const speakRepliesValue = fieldValue('speakReplies', 'focused');
+    const speakAlertsValue = fieldValue('speakAlerts', true);
     const speechVoiceValue = fieldValue('speechVoice', '');
     const speechRateValue = fieldValue('speechRate', 1);
     const speechWindowValue = fieldValue('speechWindowSec', 30);

@@ -1541,11 +1541,53 @@ async function refreshQuotaGauge() {
         ? [{ kind: 'session', label: 'Current session', percent: usage.session, reset: usage.sessionReset }]
         : []);
     const chips = billingChips(usage);
+
+    // get-usage deliberately reports "I don't know" rather than "0% used", and
+    // the renderer used to throw that away and hide the whole bar. A rate limit
+    // then looked exactly like a broken feature — which is how it was reported.
+    if (usage && usage._verdict === 'unknown') {
+      showQuotaUnavailable(usage);
+      return;
+    }
+
     if (!rows.length && !chips.length) { quotaGaugeEl.style.display = 'none'; return; }
 
     quotaGaugeEl.replaceChildren(...rows.map(buildQuotaBar), ...chips);
     quotaGaugeEl.style.display = '';
-  } catch {}
+  } catch (err) {
+    // Never fail silently here. A status bar that simply vanishes is
+    // indistinguishable from one that broke.
+    showQuotaUnavailable({ _reason: 'exception', _detail: err && err.message });
+  }
+}
+
+// Why the numbers are missing, in the few words a status bar has room for.
+function quotaUnavailableText(usage) {
+  switch (usage && usage._reason) {
+    case 'http_429': return 'usage rate limited';
+    case 'http_401': return 'usage sign-in expired';
+    case 'no_token': return 'usage no credentials';
+    case 'network':  return 'usage offline';
+    default:         return 'usage unavailable';
+  }
+}
+
+function showQuotaUnavailable(usage) {
+  if (!quotaGaugeEl) return;
+  const retry = usage && usage.retryAfterSeconds;
+  const title = [
+    'Usage could not be read, so no number is shown rather than a stale one.',
+    usage && usage._reason ? 'Reason: ' + usage._reason + '.' : '',
+    usage && usage._detail ? usage._detail + '.' : '',
+    retry ? 'Retrying in about ' + retry + 's.' : 'Retries every 5 minutes.',
+  ].filter(Boolean).join(' ');
+
+  quotaGaugeEl.replaceChildren(buildStateChip({
+    text: quotaUnavailableText(usage),
+    title,
+    tone: 'warn',
+  }));
+  quotaGaugeEl.style.display = '';
 }
 refreshQuotaGauge();
 setInterval(refreshQuotaGauge, 5 * 60 * 1000);

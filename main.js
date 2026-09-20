@@ -1090,8 +1090,10 @@ let stopScheduler = null;
 const SETTING_DEFAULTS = {
   // Spoken output. speakReplies: 'off' | 'focused' — whether the focused
   // session's reply is read aloud. speakAlerts covers background sessions.
-  speakReplies: 'off',
-  speakAlerts: false,
+  // Both default ON: the status-bar toggle is the master switch, and a toggle
+  // you turn on that then does nothing is indistinguishable from a broken one.
+  speakReplies: 'focused',
+  speakAlerts: true,
   speechVoice: '',
   speechRate: 1,
   speechWindowSec: 30,
