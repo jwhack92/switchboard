@@ -4090,3 +4090,9 @@ body.session-drop-target #session-drop-overlay { display: flex; }
 .grid-card-name {
   line-height: 1.45;
 }
+
+/* A session that never started shows a dismiss cross where the stop square
+   would be — there is no process to stop, only a row to clear. */
+.session-dismiss-btn:hover {
+  color: #e5714d;
+}

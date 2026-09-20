@@ -1239,6 +1239,17 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
 
   const isPlainTerminal = sessionOptions?.type === 'terminal';
 
+  // A session that never wrote a transcript cannot be resumed — the CLI has no
+  // record of the id, and asking it to resume one produces an error the user
+  // can do nothing about ("No saved session found with ID ..."). Start it
+  // fresh instead, which is what re-opening a session that never got going
+  // means in practice.
+  let startFresh = isNew;
+  if (!isNew && !isPlainTerminal && !getCachedSession(sessionId)) {
+    log.info(`[open-terminal] ${sessionId} has no transcript; starting a new session instead of resuming`);
+    startFresh = true;
+  }
+
   // Resolve shell profile from effective settings
   const effectiveProfileId = (() => {
     const global = getSetting('global') || {};
@@ -1283,7 +1294,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
     }
 
     // Read slug from the session's jsonl file (for plan-accept detection)
-    if (!isNew) {
+    if (!startFresh) {
       try {
         const jsonlPath = path.join(claudeProjectDir, sessionId + '.jsonl');
         const head = fs.readFileSync(jsonlPath, 'utf8').slice(0, 8000);
@@ -1330,7 +1341,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
       const claudeArgs = [];
       if (sessionOptions?.forkFrom) {
         claudeArgs.push('--resume', String(sessionOptions.forkFrom), '--fork-session');
-      } else if (isNew) {
+      } else if (startFresh) {
         claudeArgs.push('--session-id', String(sessionId));
       } else {
         claudeArgs.push('--resume', String(sessionId));
