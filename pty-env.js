@@ -57,7 +57,7 @@ const CLAUDE_SESSION_VARS = [
 
 const LOCALE_VARS = ['LC_ALL', 'LC_CTYPE', 'LANG'];
 
-function buildPtyEnv(sourceEnv) {
+function buildPtyEnv(sourceEnv, platform = process.platform) {
   const env = Object.fromEntries(
     Object.entries(sourceEnv).filter(([k]) =>
       !k.startsWith('ELECTRON_') &&
@@ -69,10 +69,30 @@ function buildPtyEnv(sourceEnv) {
     )
   );
 
+  // macOS ONLY, and the narrowness is the point.
+  //
+  // The problem is launchd-specific: a Finder or Dock launch inherits no shell
+  // environment at all. macOS is also the only platform where the bare value
+  // "UTF-8" names a real locale, so it is the only one where this is even a
+  // valid thing to set.
+  //
+  // On Windows it is actively harmful, and in exactly the direction this fix
+  // exists to prevent. Git Bash is the default shell here (shell-profiles.js)
+  // and is spawned as a login shell, so it runs /etc/profile.d/lang.sh, whose
+  // autodetect is guarded on this very variable:
+  //     test -z "${LC_ALL:-${LC_CTYPE:-$LANG}}" && export LANG=$(locale -uU)
+  // A non-empty LC_CTYPE makes that guard false, so LANG is never set — and
+  // MSYS's setlocale rejects bare "UTF-8", leaving LC_CTYPE as "C". Measured:
+  // without it, LANG=en_US.UTF-8 and `printf '…→' | wc -m` gives 3; with it,
+  // LANG empty, LC_CTYPE="C", and wc -m gives 7 — bytes counted as characters.
+  // So the injection REMOVES UTF-8 handling on the platform this fork runs on.
+  //
+  // Do not "generalise" this to C.UTF-8: macOS does not ship that locale.
+  //
   // Only when the parent handed us nothing usable — an inherited locale is the
   // user's own setting and must win. An empty value counts as absent, which is
   // what a GUI launch actually produces.
-  if (!LOCALE_VARS.some((k) => env[k])) env.LC_CTYPE = 'UTF-8';
+  if (platform === 'darwin' && !LOCALE_VARS.some((k) => env[k])) env.LC_CTYPE = 'UTF-8';
 
   return env;
 }
