@@ -286,6 +286,17 @@ async function fetchOnce() {
     ];
     const waitMs = Math.max(Number.isFinite(retryAfterS) ? retryAfterS * 1000 : 0, ladder);
     _blockedUntilMs = _now() + waitMs;
+    // The only record that this happened. Without it a rate limit presents as
+    // an empty quota bar and the only way to learn why is to call the API by
+    // hand — which spends another request against the limit you are already
+    // over. Both numbers are here because they differ: the server's hint is
+    // honoured when it is longer, the ladder when it is not.
+    _log?.warn?.(
+      `[usage] rate limited (429) — waiting ${Math.round(waitMs / 1000)}s `
+      + `(server retry-after: ${retryAfterS || 'none'}, ladder: ${Math.round(ladder / 1000)}s, `
+      + `consecutive: ${_consecutive429})`
+      + (requestId ? ` request-id=${requestId}` : '')
+    );
     return unknown('http_429', { retryAfterMs: waitMs, requestId, tokenExpiresAtMs });
   }
 
@@ -293,6 +304,10 @@ async function fetchOnce() {
     // The token in the credentials file is re-read on every call, so if the CLI
     // refreshes it in the background this clears on its own. Until then: blind,
     // and blind means stop.
+    _log?.warn?.(
+      `[usage] credentials rejected (${res.status}) — usage is unreadable until the CLI `
+      + `refreshes its token` + (requestId ? ` request-id=${requestId}` : '')
+    );
     return unknown('http_401', { status: res.status, requestId, tokenExpiresAtMs });
   }
 
@@ -300,6 +315,11 @@ async function fetchOnce() {
     return unknown('http_error', { status: res.status, requestId, tokenExpiresAtMs });
   }
 
+  // Say when it clears, not only when it breaks. A warning with no matching
+  // recovery line reads as an unresolved fault long after it resolved.
+  if (_consecutive429 > 0) {
+    _log?.info?.(`[usage] readable again after ${_consecutive429} rate-limited attempt(s)`);
+  }
   _consecutive429 = 0;
   _blockedUntilMs = 0;
 
@@ -338,6 +358,11 @@ async function read(opts = {}) {
   // Rate limited: do NOT fall through to the cached value. A refusal to refresh
   // must not silently become permission to act on an old number.
   if (now < _blockedUntilMs) {
+    // Debug, not warn: this fires on every poll for the whole backoff and the
+    // 429 that caused it was already reported once, at warn.
+    _log?.debug?.(
+      `[usage] still rate limited — ${Math.round((_blockedUntilMs - now) / 1000)}s left, no request made`
+    );
     return unknown('http_429', { retryAfterMs: _blockedUntilMs - now, ageMs: cachedAge });
   }
 
