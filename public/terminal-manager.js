@@ -260,6 +260,9 @@ function rowsThatActuallyFit(entry, proposedRows) {
 // Fit a terminal that just became visible (from display:none or reparent).
 // Defers to requestAnimationFrame so the container has dimensions.
 function fitAndScroll(entry) {
+  // This pane is becoming visible, so anything held while it was off screen
+  // has to land before we measure or scroll against its buffer.
+  flushHeldWrites(entry?.session?.sessionId);
   const wasAtBottom = isAtBottom(entry.terminal);
   requestAnimationFrame(() => {
     safeFit(entry);
@@ -311,9 +314,107 @@ const ESC_SYNC_END = '\x1b[?2026l';
 const SYNC_BUFFER_TIMEOUT = 500; // max ms to hold data waiting for sync end
 const terminalWriteBuffers = new Map(); // sessionId → { chunks, syncDepth, rafId, timerId }
 
-function flushTerminalBuffer(sessionId) {
+// --- Off-screen write gating ----------------------------------------------
+//
+// Every open session used to pay a full xterm parse and a renderer draw for
+// every chunk of PTY output, on screen or not, and nothing bounds how many
+// sessions stay open — openSessions is pruned only on an explicit close, and
+// each entry carries its own WebGL context and a 10,000-line scrollback. Drive
+// several busy sessions at once and most of that work is spent on output
+// nobody is looking at.
+//
+// Output for a hidden pane is instead held in the batch buffer it was already
+// being accumulated in, and written in one pass when the pane is next shown.
+// The parse is deferred, not skipped: what you see on switching back is the
+// scrollback you would have had anyway — up to the cap below, past which the
+// oldest chunks are dropped, which is what xterm's own scrollback limit would
+// have done to them in any case.
+const HIDDEN_BUFFER_MAX_CHARS = 2_000_000;
+
+// Whether a session's output has to be parsed and drawn now. Pure — the caller
+// supplies the view state — so it can be tested without a renderer.
+function sessionIsOnScreen(sessionId, view) {
+  if (!view) return true;              // unknown view state: never withhold output
+  if (view.gridViewActive) return !!(view.gridCards && view.gridCards.has(sessionId));
+  return sessionId === view.activeSessionId;
+}
+
+// Read the live view state off the renderer globals.
+function currentView() {
+  return {
+    activeSessionId: typeof activeSessionId !== 'undefined' ? activeSessionId : undefined,
+    gridViewActive: typeof gridViewActive !== 'undefined' ? gridViewActive : false,
+    gridCards: typeof gridCards !== 'undefined' ? gridCards : null,
+  };
+}
+
+function isSessionVisible(sessionId) {
+  return sessionIsOnScreen(sessionId, currentView());
+}
+
+// Bound a held buffer. Drops whole chunks from the front, oldest first, and
+// always keeps the last one so a session never flushes empty.
+//
+// Two things make this more than a byte count. Chunks are arbitrary PTY read
+// boundaries, so cutting at one can leave a truncated escape sequence at the
+// new front edge; and `syncDepth` is counted as chunks ARRIVE (app.js:237-239,
+// one level per chunk containing a marker), so dropping a chunk that carried
+// ESC[?2026h would strand the counter above zero. The session would then
+// believe it sat inside a synchronized frame that had already closed and go on
+// holding output for one that never ends — rescued only by the 500ms safety
+// timeout, and only on the busy sessions that trim in the first place, which
+// are exactly the ones the batching exists for.
+//
+// So after trimming we drop forward to a chunk that OPENS a frame, giving
+// xterm a clean parse point to enter on, and then restate `syncDepth` from
+// what actually survived rather than assuming it.
+function trimHeldBuffer(buf, max = HIDDEN_BUFFER_MAX_CHARS) {
+  let total = 0;
+  for (const c of buf.chunks) total += c.length;
+  if (total <= max) return total;
+
+  while (buf.chunks.length > 1 && total > max) {
+    total -= buf.chunks.shift().length;
+    buf.trimmed = true;
+  }
+
+  // Prefer a frame boundary as the new front edge. Costs a little more than the
+  // cap demanded, which beats starting mid-sequence.
+  const opensFrame = buf.chunks.findIndex(c => c.includes(ESC_SYNC_START));
+  for (let i = 0; i < opensFrame; i++) total -= buf.chunks.shift().length;
+
+  // Restate the counter from the surviving chunks, mirroring app.js exactly:
+  // one level per chunk that contains a marker, never below zero.
+  buf.syncDepth = 0;
+  for (const c of buf.chunks) {
+    if (c.includes(ESC_SYNC_START)) buf.syncDepth++;
+    if (c.includes(ESC_SYNC_END)) buf.syncDepth = Math.max(0, buf.syncDepth - 1);
+  }
+  return total;
+}
+
+// Write out whatever was held while this session was off screen.
+function flushHeldWrites(sessionId) {
+  if (sessionId && terminalWriteBuffers.has(sessionId)) {
+    flushTerminalBuffer(sessionId, { force: true });
+  }
+}
+
+function flushTerminalBuffer(sessionId, { force = false } = {}) {
   const buf = terminalWriteBuffers.get(sessionId);
   if (!buf) return;
+
+  // Off screen: hold the output instead of parsing and drawing it. Reached from
+  // the sync-block safety timeout, which fires regardless of visibility.
+  if (!force && !isSessionVisible(sessionId)) {
+    clearTimeout(buf.timerId);
+    cancelAnimationFrame(buf.rafId);
+    buf.timerId = 0;
+    buf.rafId = 0;
+    trimHeldBuffer(buf);
+    return;
+  }
+
   clearTimeout(buf.timerId);
   cancelAnimationFrame(buf.rafId);
   terminalWriteBuffers.delete(sessionId);
@@ -325,7 +426,9 @@ function flushTerminalBuffer(sessionId) {
   const wasAtBottom = isAtBottom(entry.terminal);
   const savedViewportY = entry.terminal.buffer.active.viewportY;
   entry.terminal.write(data, () => {
-    if (sessionId !== activeSessionId) return;
+    // `force` covers the show path, where this runs before activeSessionId has
+    // caught up with the pane that is now on screen.
+    if (!force && !isSessionVisible(sessionId)) return;
     scheduleSettledRepaint(entry);
     if (wasAtBottom) {
       entry.terminal.scrollToBottom();
@@ -419,6 +522,13 @@ function findGarbled(needle, { context = 300 } = {}) {
 
 function scheduleFlush(sessionId, buf) {
   cancelAnimationFrame(buf.rafId);
+  buf.rafId = 0;
+  // Off screen: hold the output rather than schedule a parse and draw nobody
+  // will see. The pane's next fitAndScroll flushes it.
+  if (!isSessionVisible(sessionId)) {
+    trimHeldBuffer(buf);
+    return;
+  }
   buf.rafId = requestAnimationFrame(() => flushTerminalBuffer(sessionId));
 }
 
@@ -794,7 +904,9 @@ function setupDragAndDrop(container, getSessionId) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload,
     safeFit, rowsThatActuallyFit, visibleEscapes,
-    forceRepaint, scheduleSettledRepaint, SETTLE_REPAINT_MS };
+    forceRepaint, scheduleSettledRepaint, SETTLE_REPAINT_MS,
+    sessionIsOnScreen, trimHeldBuffer, HIDDEN_BUFFER_MAX_CHARS,
+    ESC_SYNC_START, ESC_SYNC_END };
 }
 
 // Console handles for the raw recorder. Deliberately short — they get typed by
