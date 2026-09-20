@@ -817,11 +817,8 @@ function serializeSession(sessionId) {
   if (!entry || !entry.serializeAddon) return '';
   try {
     // Flush anything buffered first, or the last chunk of output is missing
-    // from the snapshot. force: the session being handed over is very often
-    // NOT the visible one — sidebar drag serializes whatever row was dragged —
-    // and without it the off-screen gate would hold that output back and
-    // serialize a buffer missing everything since the pane was last shown.
-    flushTerminalBuffer(sessionId, { force: true });
+    // from the snapshot.
+    flushTerminalBuffer(sessionId);
     return entry.serializeAddon.serialize();
   } catch (e) {
     console.warn('[tearoff] serialize failed, falling back to main replay', e);
