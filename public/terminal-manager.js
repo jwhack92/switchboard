@@ -121,9 +121,17 @@ function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } 
     if (shouldSendSpaceDirectly(e)) {
       if (e.type === 'keydown') {
         e.preventDefault();
+        // Hold-Space is the CLI's push-to-talk. You are about to talk, so stop
+        // talking at you — otherwise the mic hears the synthesised voice.
+        if (window.speech) window.speech.cancel();
         window.api.sendInput(getSessionId(), ' ');
       }
       return false;
+    }
+
+    // Escape interrupts the CLI; it should interrupt the voice too.
+    if (e.key === 'Escape' && e.type === 'keydown' && window.speech) {
+      window.speech.cancel();
     }
 
     return true;
@@ -711,6 +719,8 @@ function serializeSession(sessionId) {
 // Make a session visible in the current view mode (grid or single).
 // Handles sidebar highlight, notifications, header, fit, and focus.
 function showSession(sessionId) {
+  // Whatever is being said belongs to the session you are leaving.
+  if (window.speech) window.speech.cancel();
   const entry = openSessions.get(sessionId);
   const session = sessionMap.get(sessionId) || (entry && entry.session);
 

@@ -577,6 +577,16 @@ function rebindSidebarEvents(projects) {
       };
     }
 
+    const mute = item.querySelector('.session-mute');
+    if (mute) {
+      mute.onclick = (e) => {
+        e.stopPropagation();
+        if (!window.speech) return;
+        window.speech.toggleMuted(session.sessionId);
+        refreshSidebar();
+      };
+    }
+
     const summaryEl = item.querySelector('.session-summary');
     if (summaryEl) {
       summaryEl.ondblclick = (e) => { e.stopPropagation(); startRename(summaryEl, session); };
@@ -686,6 +696,15 @@ function buildSessionItem(session) {
     ? '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M9.828.722a.5.5 0 0 1 .354.146l4.95 4.95a.5.5 0 0 1-.707.707c-.28-.28-.576-.49-.888-.656L10.073 9.333l-.07 3.181a.5.5 0 0 1-.853.354l-3.535-3.536-4.243 4.243a.5.5 0 1 1-.707-.707l4.243-4.243L1.372 5.11a.5.5 0 0 1 .354-.854l3.18-.07L8.37 .722A3.37 3.37 0 0 1 9.12.074a.5.5 0 0 1 .708.002l-.707.707z"/></svg>'
     : '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M9.828.722a.5.5 0 0 1 .354.146l4.95 4.95a.5.5 0 0 1-.707.707c-.28-.28-.576-.49-.888-.656L10.073 9.333l-.07 3.181a.5.5 0 0 1-.853.354l-3.535-3.536-4.243 4.243a.5.5 0 1 1-.707-.707l4.243-4.243L1.372 5.11a.5.5 0 0 1 .354-.854l3.18-.07L8.37 .722A3.37 3.37 0 0 1 9.12.074a.5.5 0 0 1 .708.002l-.707.707z"/></svg>';
 
+  // Speech mute. Rendered only when muted so the row is unchanged in the normal
+  // case, and re-derived here rather than toggled imperatively because morphdom
+  // rebuilds this element on every sidebar render.
+  const speechMuted = !!(window.speech && window.speech.isMuted(session.sessionId));
+  const mute = document.createElement('span');
+  mute.className = 'session-mute' + (speechMuted ? ' muted' : '');
+  mute.title = speechMuted ? 'Muted — click to let this session speak' : 'Mute this session';
+  mute.innerHTML = speechMuted ? ICONS.speakerMuted(12) : ICONS.speakerOn(12);
+
   // Running status dot
   const dot = document.createElement('span');
   dot.className = 'session-status-dot' + (activePtyIds.has(session.sessionId) ? ' running' : '');
@@ -793,6 +812,7 @@ function buildSessionItem(session) {
 
   row.appendChild(dragHandle);
   row.appendChild(pin);
+  row.appendChild(mute);
   row.appendChild(dot);
   row.appendChild(info);
   row.appendChild(actions);

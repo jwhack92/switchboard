@@ -886,6 +886,50 @@ body { display: flex; flex-direction: column; }
   color: #f8d174;
 }
 
+/* ---- Speech mute (per session) ---- */
+/* Invisible at rest and revealed on hover, like .session-actions — except when
+   the session IS muted, where it stays visible, because the whole reason for
+   putting it in the left gutter rather than the hover actions is being able to
+   see which sessions are silent without hovering each one. */
+.session-mute {
+  flex-shrink: 0;
+  cursor: pointer;
+  color: #7d8494;
+  transition: color 0.15s, transform 0.15s, opacity 0.15s;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  margin-top: 5px;
+  opacity: 0;
+}
+
+.session-item:hover .session-mute { opacity: 1; }
+
+.session-mute:hover {
+  color: #8ccbff;
+  transform: scale(1.15);
+}
+
+.session-mute.muted {
+  opacity: 1;
+  color: #6f7686;
+}
+
+.session-mute.muted:hover { color: #a9b0bd; }
+
+/* A muted session's title reads as switched-off, matching the icon. */
+.session-item .session-mute.muted ~ .session-info .session-summary { opacity: 0.72; }
+
+/* ---- Speech toggle (status bar) ---- */
+.stop-btn.speech-on {
+  color: #8ccbff;
+  border-color: rgba(140,203,255,0.45);
+}
+.stop-btn.speech-on:hover:not(:disabled) {
+  color: #b6dcff;
+  border-color: rgba(182,220,255,0.7);
+}
+
 /* ---- Running dot ---- */
 .session-status-dot {
   width: 6px;

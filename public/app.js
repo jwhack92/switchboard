@@ -167,6 +167,10 @@ function setActivity(sessionId, active) {
         item.classList.remove('cli-busy');
         item.classList.add('response-ready');
       }
+      // Say so, for a session you are not looking at. The focused session is
+      // deliberately silent here: you can see it finish, and what would be worth
+      // hearing is the reply itself, which needs the transcript (phase 2).
+      if (window.speech) window.speech.announceFinished(sessionId, speechNameFor(sessionId));
     }
   }
 
@@ -483,6 +487,57 @@ window.api.onSessionDragHover(({ hoverWindowId, sourceWindowId, mode }) => {
   }
 });
 
+// --- Speech: naming and the status-bar toggle ---
+
+// What a session is called out loud. The sidebar title identifies a session best
+// ("Review Pass"), the slug identifies its project ("pr-review"); prefer the
+// title and fall back to the slug. Capped because a session that was never
+// renamed is titled with its whole first prompt, and reading that aloud is not
+// an announcement.
+const SPOKEN_NAME_MAX = 48;
+function speechNameFor(sessionId) {
+  const session = sessionMap.get(sessionId);
+  if (!session) return 'a session';
+  const raw = cleanDisplayName(session.name || session.aiTitle || session.summary) || session.slug;
+  if (!raw) return 'a session';
+  const name = String(raw).trim();
+  if (name.length <= SPOKEN_NAME_MAX) return name;
+  const cut = name.slice(0, SPOKEN_NAME_MAX);
+  const lastSpace = cut.lastIndexOf(' ');
+  return (lastSpace > 16 ? cut.slice(0, lastSpace) : cut).trim();
+}
+
+const speechEl = document.getElementById('status-bar-speech');
+
+function renderSpeechControl() {
+  if (!speechEl) return;
+  const available = !!(window.tts && window.tts.isAvailable());
+  const on = available && window.speech && window.speech.isEnabled();
+
+  const btn = document.createElement('button');
+  btn.className = 'stop-btn' + (on ? ' speech-on' : '');
+  btn.textContent = on ? 'Voice on' : 'Voice off';
+  btn.title = available
+    ? (on ? 'Speaking alerts for background sessions. Click to silence.'
+          : 'Click to speak alerts for background sessions.')
+    : 'Speech synthesis is unavailable in this build';
+  btn.disabled = !available;
+  btn.addEventListener('click', () => {
+    if (!window.speech) return;
+    window.speech.setEnabled(!window.speech.isEnabled());
+    renderSpeechControl();
+    if (typeof refreshSidebar === 'function') refreshSidebar();
+  });
+  speechEl.replaceChildren(btn);
+}
+
+// Voices arrive about a second after load and the button's enabled state depends
+// on them, so render once now and again once the list settles.
+if (window.tts) {
+  renderSpeechControl();
+  window.tts.loadVoices().then(renderSpeechControl).catch(() => {});
+}
+
 // --- Terminal notifications (iTerm2 OSC 9 — "needs attention") ---
 window.api.onTerminalNotification((sessionId, message) => {
   // Only mark as needing attention for "attention" messages, not "waiting for input"
@@ -495,6 +550,7 @@ window.api.onTerminalNotification((sessionId, message) => {
     attentionSessions.add(sessionId);
     const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
     if (item) item.classList.add('needs-attention');
+    if (window.speech) window.speech.announceAttention(sessionId, speechNameFor(sessionId), message);
   } else if (/waiting for your input/i.test(message)) {
     // "Claude is waiting for your input" — delayed idle notification, mark response-ready
     setActivity(sessionId, false);
