@@ -34,6 +34,9 @@ contextBridge.exposeInMainWorld('api', {
   haltDriver: (reason) => ipcRenderer.invoke('driver-halt', reason),
   clearDriverHalt: () => ipcRenderer.invoke('driver-clear-halt'),
   onDriverHalted: (cb) => ipcRenderer.on('driver-halted', (_e, payload) => cb(payload)),
+  // Spoken output
+  speechNewText: (sessionId, sinceBytes) => ipcRenderer.invoke('speech-new-text', sessionId, sinceBytes),
+  speechSummarize: (text, maxWords) => ipcRenderer.invoke('speech-summarize', text, maxWords),
   getSettingDefaults: () => ipcRenderer.invoke('get-setting-defaults'),
   getEffectiveSettings: (projectPath) => ipcRenderer.invoke('get-effective-settings', projectPath),
   getScheduleCreatorCommand: () => ipcRenderer.invoke('get-schedule-creator-command'),

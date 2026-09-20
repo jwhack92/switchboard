@@ -1075,10 +1075,26 @@ ipcMain.handle('driver-clear-halt', () => {
 
 // --- Scheduled tasks ---
 const scheduleIpc = require('./schedule-ipc');
+const speechIpc = require('./speech-ipc');
+speechIpc.init({
+  log,
+  cleanEnv: cleanPtyEnv,
+  PROJECTS_DIR,
+  getCachedFolder,
+  driverStore,
+  custody,
+});
 // Hoisted so the quit handler can stop the cron loop before reaping.
 let stopScheduler = null;
 
 const SETTING_DEFAULTS = {
+  // Spoken output. speakReplies: 'off' | 'focused' — whether the focused
+  // session's reply is read aloud. speakAlerts covers background sessions.
+  speakReplies: 'off',
+  speakAlerts: false,
+  speechVoice: '',
+  speechRate: 1,
+  speechWindowSec: 30,
   permissionMode: null,
   dangerouslySkipPermissions: false,
   worktree: false,

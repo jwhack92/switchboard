@@ -167,10 +167,11 @@ function setActivity(sessionId, active) {
         item.classList.remove('cli-busy');
         item.classList.add('response-ready');
       }
-      // Say so, for a session you are not looking at. The focused session is
-      // deliberately silent here: you can see it finish, and what would be worth
-      // hearing is the reply itself, which needs the transcript (phase 2).
+      // A session you are not looking at gets a short alert.
       if (window.speech) window.speech.announceFinished(sessionId, speechNameFor(sessionId));
+    } else if (window.speech) {
+      // The focused session gets the reply itself, read from the transcript.
+      window.speech.speakReply(sessionId);
     }
   }
 

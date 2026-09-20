@@ -98,6 +98,11 @@
     const projectBaseValue = fieldValue('projectBaseDir', '');
     const mcpEmulationValue = fieldValue('mcpEmulation', true);
     const shellProfileValue = fieldValue('shellProfile', 'auto');
+    const speakRepliesValue = fieldValue('speakReplies', 'off');
+    const speakAlertsValue = fieldValue('speakAlerts', false);
+    const speechVoiceValue = fieldValue('speechVoice', '');
+    const speechRateValue = fieldValue('speechRate', 1);
+    const speechWindowValue = fieldValue('speechWindowSec', 30);
 
     // What the form is about to be rendered with. Compared against the form's
     // contents on save so an untouched field is not written out as an explicit
@@ -118,13 +123,26 @@
       projectBaseDir: projectBaseValue,
       mcpEmulation: mcpEmulationValue,
       shellProfile: shellProfileValue,
+      speakReplies: speakRepliesValue,
+      speakAlerts: speakAlertsValue,
+      speechVoice: speechVoiceValue,
+      speechRate: speechRateValue,
+      speechWindowSec: speechWindowValue,
     };
+    // min/max on a number input is advisory only, and the other read-backs in
+    // this file do no clamping, so an out-of-range value would be stored.
+    const clampNum = (n, lo, hi, fallback) =>
+      (Number.isFinite(n) ? Math.min(Math.max(n, lo), hi) : fallback);
     const unchanged = (a, b) =>
       a === b || (a == null && b == null) || String(a) === String(b);
 
     // Discover available shell profiles
     let shellProfiles = [];
     try { shellProfiles = await window.api.getShellProfiles(); } catch {};
+    // Chromium fills the voice list about a second after load, so ask the engine
+    // rather than reading getVoices() directly here.
+    let speechVoices = [];
+    try { if (window.tts) speechVoices = await window.tts.loadVoices(); } catch {};
 
     settingsViewerBody.innerHTML = `
     <div class="settings-form">
@@ -285,6 +303,62 @@
 
         <div class="settings-field">
           <div class="settings-field-info">
+            <span class="settings-label">Speak Replies</span>
+            <div class="settings-description">Read the focused session's reply aloud when it finishes a turn. Long replies are summarised to fit the window below.</div>
+          </div>
+          <div class="settings-field-control">
+            <select class="settings-select" id="sv-speak-replies">
+              <option value="off"${speakRepliesValue === 'off' ? ' selected' : ''}>Off</option>
+              <option value="focused"${speakRepliesValue === 'focused' ? ' selected' : ''}>Focused session</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">Speak Alerts</span>
+            <div class="settings-description">Announce background sessions that finish or need your input</div>
+          </div>
+          <div class="settings-field-control">
+            <label class="settings-toggle"><input type="checkbox" id="sv-speak-alerts"${speakAlertsValue ? ' checked' : ''}><span class="settings-toggle-slider"></span></label>
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">Voice</span>
+            <div class="settings-description">${speechVoices.length ? 'Windows voices available to this build' : 'No voices detected — speech will be unavailable'}</div>
+          </div>
+          <div class="settings-field-control">
+            <select class="settings-select" id="sv-speech-voice">
+              <option value=""${!speechVoiceValue ? ' selected' : ''}>System default</option>
+              ${speechVoices.map(v => `<option value="${escapeHtml(v.name)}"${speechVoiceValue === v.name ? ' selected' : ''}>${escapeHtml(v.name)}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">Speech Rate</span>
+            <div class="settings-description">1 is normal. Higher is faster; 0.5 to 3 allowed.</div>
+          </div>
+          <div class="settings-field-control">
+            <input type="number" class="settings-input settings-input-compact" id="sv-speech-rate" min="0.5" max="3" step="0.1" value="${speechRateValue}">
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">Spoken Window (seconds)</span>
+            <div class="settings-description">How long a spoken reply may run before it is summarised instead. A typical reply is about 90 seconds read in full.</div>
+          </div>
+          <div class="settings-field-control">
+            <input type="number" class="settings-input settings-input-compact" id="sv-speech-window" min="5" max="300" value="${speechWindowValue}">
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
             <span class="settings-label">Max Visible Sessions</span>
             <div class="settings-description">Show up to this many sessions before collapsing the rest behind "+N older"</div>
           </div>
@@ -396,6 +470,11 @@
         settings.projectBaseDir = settingsViewerBody.querySelector('#sv-project-base').value.trim();
         settings.mcpEmulation = settingsViewerBody.querySelector('#sv-mcp-emulation').checked;
         settings.shellProfile = settingsViewerBody.querySelector('#sv-shell-profile').value || 'auto';
+        settings.speakReplies = settingsViewerBody.querySelector('#sv-speak-replies').value || 'off';
+        settings.speakAlerts = settingsViewerBody.querySelector('#sv-speak-alerts').checked;
+        settings.speechVoice = settingsViewerBody.querySelector('#sv-speech-voice').value || '';
+        settings.speechRate = clampNum(parseFloat(settingsViewerBody.querySelector('#sv-speech-rate').value), 0.5, 3, 1);
+        settings.speechWindowSec = clampNum(parseInt(settingsViewerBody.querySelector('#sv-speech-window').value), 5, 300, 30);
       }
 
       // An absent setting means "use the app default". Writing every field on

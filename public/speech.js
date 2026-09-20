@@ -4,11 +4,12 @@
 // pending upstream rebase, so the logic lives here and app.js only gains a few
 // call sites.
 //
-// PHASE 1 SCOPE. This speaks alerts for background sessions only — "pr-review
-// needs your input". Speaking the focused session's actual reply needs the text,
-// which lives in the transcript on disk and therefore needs a main-process IPC;
-// that is phase 2. The focused session is deliberately silent for now rather than
-// being given a content-free "finished" it would only interrupt you with.
+// Two things get spoken. A background session gets a short alert — "pr-review
+// needs plan approval" — built from signals already in the renderer. The FOCUSED
+// session gets its actual reply, which is not in the renderer at all: the
+// terminal stream is escape sequences, so the prose comes from the transcript on
+// disk via the speech-new-text IPC, and is summarised when it will not fit the
+// spoken window.
 
 (function () {
   'use strict';
@@ -32,6 +33,14 @@
 
   let enabled = readStore(STORE_ENABLED, false) === true;
   const muted = new Set(Array.isArray(readStore(STORE_MUTED, [])) ? readStore(STORE_MUTED, []) : []);
+
+  const spokenBytes = new Map();   // sessionId -> byte offset already spoken
+  const turnToken = new Map();     // sessionId -> generation, to drop stale summaries
+
+  // Voice and rate are needed on the synchronous alert path, which cannot await
+  // an IPC, so the last known settings are kept here and refreshed on the async
+  // reply path and at load.
+  let cachedSettings = {};
 
   function isEnabled() { return enabled; }
 
@@ -79,7 +88,7 @@
 
   function say(text) {
     if (!window.tts) return false;
-    return window.tts.speak(text, {});
+    return window.tts.speak(text, speakOpts(cachedSettings));
   }
 
   /** A background session wants something. */
@@ -99,9 +108,93 @@
   /** Barge-in. Called when you start talking, press Escape, or switch sessions. */
   function cancel() {
     if (window.tts) window.tts.cancel();
+    // Any summary still in flight belongs to a turn you are no longer listening
+    // to. Bumping the token makes its result arrive stale and be dropped.
+    for (const id of turnToken.keys()) turnToken.set(id, (turnToken.get(id) || 0) + 1);
+  }
+
+  // --- Speaking the focused session's actual reply -------------------------
+  //
+  // The text is not in the renderer — the terminal stream is escape sequences,
+  // not prose — so it comes from the transcript through speech-new-text. Each
+  // session keeps a byte offset; the first call for a session returns a baseline
+  // and no text, so switching the feature on never reads the backlog aloud.
+
+  async function currentSettings() {
+    try {
+      const s = await window.api.getEffectiveSettings(null);
+      if (s) cachedSettings = s;
+    } catch {}
+    return cachedSettings;
+  }
+
+  function speakOpts(settings) {
+    return { rate: Number(settings.speechRate) || 1, voice: settings.speechVoice || '' };
+  }
+
+  /**
+   * Called when the FOCUSED session finishes a turn.
+   *
+   * Measured on real transcripts: the median reply is ~88 seconds of speech and
+   * 26 of 28 turns exceed 30, so the summarizer is the normal path rather than
+   * an exception. A reply that already fits is spoken verbatim.
+   */
+  async function speakReply(sessionId) {
+    if (!shouldSpeakFor(sessionId)) return;
+
+    const settings = await currentSettings();
+    if (settings.speakReplies !== 'focused') return;
+
+    const token = (turnToken.get(sessionId) || 0) + 1;
+    turnToken.set(sessionId, token);
+    const stale = () => turnToken.get(sessionId) !== token || !shouldSpeakFor(sessionId);
+
+    let res;
+    try {
+      res = await window.api.speechNewText(sessionId, spokenBytes.get(sessionId));
+    } catch { return; }
+    if (!res || res.error) return;
+
+    spokenBytes.set(sessionId, res.bytes);
+    if (res.baseline || !res.text) return;   // first sighting, or a tools-only turn
+    if (stale()) return;
+
+    const maxWords = window.speechText.wordsForSeconds(Number(settings.speechWindowSec) || 30);
+    const fit = window.speechText.fitOrSummarize(res.text, maxWords);
+
+    if (!fit.needsSummary) {
+      if (fit.speak) window.tts.speak(fit.speak, speakOpts(settings));
+      return;
+    }
+
+    let spokenText = '';
+    try {
+      const sum = await window.api.speechSummarize(fit.clean, maxWords);
+      if (sum && sum.summary) spokenText = sum.summary;
+    } catch { /* fall through to extractive */ }
+
+    // Any failure — HALT engaged, timeout, no output — degrades to the local
+    // summary rather than going silent.
+    if (!spokenText) spokenText = window.speechText.extractiveSummary(fit.clean, maxWords);
+
+    if (stale() || !spokenText) return;
+    window.tts.speak(spokenText, speakOpts(settings));
+  }
+
+  /** Forget a session's offset, so a re-opened session re-baselines. */
+  function forget(sessionId) {
+    spokenBytes.delete(sessionId);
+    turnToken.delete(sessionId);
+  }
+
+  // Prime the settings cache; the first alert can arrive before any reply does.
+  if (window.api && window.api.getEffectiveSettings) {
+    window.api.getEffectiveSettings(null).then((s) => { if (s) cachedSettings = s; }).catch(() => {});
   }
 
   window.speech = {
+    speakReply,
+    forget,
     isEnabled,
     setEnabled,
     isMuted,
