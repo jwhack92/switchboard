@@ -47,8 +47,27 @@
   function setEnabled(value) {
     enabled = !!value;
     writeStore(STORE_ENABLED, enabled);
-    if (!enabled) cancel();
+    if (!enabled) { cancel(); return enabled; }
+
+    // Say something immediately on enable. Without this the toggle is silent in
+    // every case that matters: replies default to off, and alerts only fire for
+    // a BACKGROUND session on a finish or attention edge — so a user who turns
+    // it on and waits hears nothing and reasonably concludes it is broken.
+    // This also doubles as proof the audio path works at all.
+    confirmEnabled();
     return enabled;
+  }
+
+  /** Spoken confirmation, naming anything that would still keep it quiet.
+   *  Reads settings fresh: the cache may predate a change made in Settings, and
+   *  saying "replies are off" when they are on would be worse than silence. */
+  async function confirmEnabled() {
+    if (!window.tts || !window.tts.isAvailable()) return;
+    const settings = await currentSettings();
+    if (!enabled) return;   // toggled off again while we were asking
+    say(settings.speakReplies === 'focused'
+      ? 'Voice on.'
+      : 'Voice on. Replies are off, so only background sessions will speak. Turn on Speak Replies in settings to hear this one.');
   }
 
   function isMuted(sessionId) { return muted.has(sessionId); }

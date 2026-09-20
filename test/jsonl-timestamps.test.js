@@ -11,8 +11,18 @@ const { formatEntryTime, formatEntryTimeTitle } = require('../public/jsonl-viewe
 const iso = d => d.toISOString();
 const minutesAgo = n => new Date(Date.now() - n * 60_000);
 
+// A fixed offset like "30 minutes ago" is not reliably today: run the suite at
+// 00:15 and it lands on yesterday, which is exactly how this test failed. The
+// midpoint between midnight and now is always both today and in the past.
+const earlierToday = () => {
+  const now = new Date();
+  const midnight = new Date(now);
+  midnight.setHours(0, 0, 0, 0);
+  return new Date((midnight.getTime() + now.getTime()) / 2);
+};
+
 test('a message from today shows time only', () => {
-  const out = formatEntryTime(iso(minutesAgo(30)));
+  const out = formatEntryTime(iso(earlierToday()));
   assert.doesNotMatch(out, /[A-Za-z]{3}/, `expected no month name, got ${out}`);
   assert.match(out, /\d/);
 });
@@ -31,7 +41,7 @@ test('a message from another year carries the year', () => {
 
 test('same-day output is shorter than cross-day output', () => {
   // The whole point: today stays uncluttered, older entries pay for the date.
-  assert.ok(formatEntryTime(iso(minutesAgo(30))).length
+  assert.ok(formatEntryTime(iso(earlierToday())).length
     < formatEntryTime(iso(minutesAgo(60 * 24 * 6))).length);
 });
 
