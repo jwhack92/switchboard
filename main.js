@@ -1,4 +1,4 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, screen, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, protocol, screen, shell } = require('electron');
 const { Worker } = require('worker_threads');
 const path = require('path');
 const fs = require('fs');
@@ -84,6 +84,53 @@ const { encodeProjectPath } = require('./encode-project-path');
 // makes for every other module of its kind.
 const { getHarness, DEFAULT_HARNESS } = require('./harnesses');
 const claudeHarness = getHarness(DEFAULT_HARNESS);
+
+// Ported-feature modules, all deliberately on THIS side of the reloader line
+// for the same reason harnesses/ is (see the comment above). task-manager owns
+// live task PTYs and preview-assets owns the token→folder map behind every open
+// preview: an auto-relaunch triggered by editing one of them would kill running
+// tasks and dead-link every preview URL already handed to the renderer. The
+// cost is the usual one — editing any of these needs a manual restart before it
+// is in effect.
+const { resolveTerminalFiles } = require('./terminal-file-links');
+const { readProjectFile, readPreviewFile, isViewableFile, resolveProjectEntry } = require('./project-files');
+const { PREVIEW_SCHEME, PREVIEW_SCHEMES, handlePreviewAssetRequest } = require('./preview-assets');
+const { createTaskManager } = require('./task-manager');
+const { createPanelPathGuard } = require('./save-containment');
+
+// MUST run at module scope, before the app is ready: registering the scheme
+// inside whenReady is too late and it silently loses standard/secure/fetch/CORS
+// privileges, which is the difference between an HTML preview that renders and
+// one that is blank. protocol.handle() for the same scheme is in whenReady.
+protocol.registerSchemesAsPrivileged(PREVIEW_SCHEMES);
+
+// The file panel writes back only what main itself surfaced. See
+// save-containment.js — `panelPaths.watchWindow` is why the MCP bridge's own
+// pushes count as surfaced.
+const panelPaths = createPanelPathGuard({ log });
+
+// The same containment for the memory editor, which has the same hole:
+// `save-memory` used to write ANY .md that existed anywhere on disk, and a .md
+// is exactly the kind of file an agent reads as instructions -- a CLAUDE.md, an
+// agents.md, a slash command. S3 closed this for `save-file-for-panel` and left
+// its sibling open.
+//
+// A SEPARATE set, deliberately: previewing a .md in the file browser must not
+// make it a memory file, and a memory file must not become panel-savable. The
+// only seeder is collectAndIndexMemories -- main's own scan of the memory
+// locations -- so "savable" means "the Memory tab listed this", which is
+// precisely the set of files the editor can open.
+//
+// NOT seeded from `read-memory`: that handler reads any .md that exists, so
+// recording what it read would let the renderer launder a path of its choosing
+// into this set with a read of its choosing. That is the hole, not the fix.
+//
+// The limit is far above any plausible memory-file count and deliberately not
+// the default 4096: one scan seeds the whole set in one go, and a scan that
+// overflowed the cache would evict its own earliest entries -- the global
+// ~/.claude files, which are surfaced first -- leaving the user unable to save
+// a file the list had just offered them.
+const memoryPaths = createPanelPathGuard({ log, limit: 50000 });
 
 
 // --- Auto-updater (only in packaged builds) ---
@@ -535,18 +582,161 @@ ipcMain.on('mcp-diff-response', (_event, sessionId, diffId, action, editedConten
   resolvePendingDiff(sessionId, diffId, action, editedContent);
 });
 
-ipcMain.handle('read-file-for-panel', async (_event, filePath) => {
+// --- IPC: terminal file links ---
+// fs.stat only. The reference is a path to check, never a string handed to a
+// shell — see terminal-file-links.js.
+ipcMain.handle('resolve-terminal-files', (_event, references) => resolveTerminalFiles(references));
+
+// --- IPC: project file browser + panel previews ---
+
+// A folder listing is per-file work, and project-files.js did all of it
+// synchronously inside one IPC call: a reviewer measured ~10 seconds on a
+// 5,000-entry folder, and for those 10 seconds every window, every PTY write
+// and every other IPC in the app was stopped dead. The main process has one
+// thread and readdirSync/lstatSync/readSync own it while they run.
+//
+// So the enumeration happens here instead, and it has two properties the sync
+// one did not:
+//
+//   It yields. Every entry's lstat is awaited, so the event loop runs between
+//   entries: a big folder now takes a while to list instead of freezing the
+//   app while it does.
+//
+//   It is bounded. MAX_BROWSER_ENTRIES caps how many entries are statted and
+//   returned, and the response carries `total` and `truncated` so the panel
+//   can say the folder is bigger than the list rather than quietly showing a
+//   prefix of it as if it were the whole thing.
+//
+// WHAT it may read is unchanged and still project-files.js's call:
+// resolveProjectEntry does the same realpath + containment check, and
+// isViewableFile makes the same viewability decision, so a file that lists as
+// viewable is exactly one readProjectFile will open. Only the reading moved.
+//
+// One field is gone: the per-entry `previewType`. project-files.js computed it
+// with a helper it does not export, and nothing read it -- the panel takes
+// previewType off readPreviewFile's result instead (public/file-panel.js:313,
+// :648). Wanting it back means exporting previewType from project-files.js.
+const MAX_BROWSER_ENTRIES = 2000;
+const BROWSER_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+async function listProjectDirectoryAsync(projectPath, relativePath) {
+  const fsp = fs.promises;
+  // Containment first, and unchanged: throws for a non-absolute project root,
+  // for an absolute or escaping relative path, and for a symlink that lands
+  // outside the project.
+  const { root, resolved } = resolveProjectEntry(projectPath, relativePath);
+  const directoryStat = await fsp.lstat(resolved);
+  if (!directoryStat.isDirectory()) throw new Error('Path is not a directory');
+
+  const dirents = await fsp.readdir(resolved, { withFileTypes: true });
+
+  // Sorted BEFORE the cap so a truncated listing is the first N of the list the
+  // user would have seen, not an arbitrary N of them re-sorted. readdir's own
+  // types are lstat's (a symlink is neither file nor directory here, same as
+  // the old per-entry lstatSync), so this is the same order for the same tree.
+  // A REUSED collator, not String.localeCompare. localeCompare builds a fresh
+  // ICU collator on every call, which dominates the sort and reintroduces the
+  // main-process freeze this function was made async to remove: measured on
+  // this machine, 2,000 entries 105ms, 20,000 entries 1.5s, 100,000 entries
+  // 11.0s — as bad as the synchronous lstat loop it replaced. One shared
+  // collator gives byte-identical ordering at 6ms / 84ms / 530ms.
+  const byName = (a, b) => BROWSER_COLLATOR.compare(a, b);
+  dirents.sort((a, b) => {
+    const aDir = a.isDirectory(), bDir = b.isDirectory();
+    if (aDir !== bDir) return aDir ? -1 : 1;
+    return byName(a.name, b.name);
+  });
+  const kept = dirents.slice(0, MAX_BROWSER_ENTRIES);
+
+  const entries = [];
+  for (const dirent of kept) {
+    const absolutePath = path.join(resolved, dirent.name);
+    let stat;
+    try {
+      stat = await fsp.lstat(absolutePath);
+    } catch {
+      // Gone between readdir and lstat. The sync version failed the entire
+      // listing on that; dropping the one entry that no longer exists is
+      // closer to what the folder actually holds.
+      continue;
+    }
+    const type = stat.isDirectory() ? 'directory' : stat.isFile() ? 'file' : 'other';
+    let viewable = false;
+    // project-files.js's own check, so `viewable` keeps meaning exactly what
+    // the preview read will accept. It samples the head of a text file
+    // synchronously; that is one small read between two awaits, not a whole
+    // folder's worth of them back to back.
+    if (type === 'file') {
+      try { viewable = isViewableFile(absolutePath, stat); } catch {}
+    }
+    entries.push({
+      name: dirent.name,
+      relativePath: path.relative(root, absolutePath),
+      type,
+      size: stat.size,
+      viewable,
+    });
+  }
+
+  // Re-sorted on the type lstat actually reported. The dirent sort above chose
+  // WHICH entries survive the cap; this one fixes the order on a filesystem
+  // that hands readdir an unknown d_type (some network mounts), where the
+  // dirent said 'not a directory' about everything.
+  entries.sort((a, b) => {
+    if (a.type === 'directory' && b.type !== 'directory') return -1;
+    if (a.type !== 'directory' && b.type === 'directory') return 1;
+    return byName(a.name, b.name);
+  });
+
+  return { entries, total: dirents.length, truncated: dirents.length > kept.length };
+}
+
+ipcMain.handle('list-project-directory', async (_event, projectPath, relativePath) => {
   try {
-    const content = fs.readFileSync(filePath, 'utf8');
-    return { ok: true, content };
+    return { ok: true, ...await listProjectDirectoryAsync(projectPath, relativePath) };
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, error: err.message, code: err.code };
   }
 });
 
+ipcMain.handle('read-project-file', async (_event, projectPath, relativePath) => {
+  try {
+    const result = readProjectFile(projectPath, relativePath);
+    // Main read it and is about to show it, so the panel may write it back.
+    panelPaths.surface(result.filePath);
+    return { ok: true, ...result };
+  } catch (err) {
+    // err.code carries PREVIEW_UNAVAILABLE, which means "a real file, just not
+    // previewable" — the UI shows a placeholder for that, not a failure.
+    return { ok: false, error: err.message, code: err.code };
+  }
+});
+
+// Was a bare readFileSync(utf8): no size cap, no binary sniff, and no way to
+// preview an image, a PDF or sandboxed HTML. readPreviewFile still returns
+// `content` for text, which is all the existing callers read.
+ipcMain.handle('read-file-for-panel', async (_event, filePath) => {
+  try {
+    const result = readPreviewFile(filePath);
+    panelPaths.surface(result.filePath);
+    return { ok: true, ...result };
+  } catch (err) {
+    return { ok: false, error: err.message, code: err.code };
+  }
+});
+
+// Containment (audit prerequisite S3). The renderer may only save back a file
+// the main process itself put in the panel: an MCP diff/file push, a preview
+// read, or a browser read. Everything else — any path a renderer bug or a
+// rendered preview could name — is refused here rather than written.
 ipcMain.handle('save-file-for-panel', async (_event, filePath, content) => {
   try {
+    if (typeof content !== 'string') return { ok: false, error: 'Nothing to save' };
     const resolved = path.resolve(filePath);
+    if (!panelPaths.allows(resolved)) {
+      log.warn(`[panel] refused a save to a path Switchboard never opened: ${resolved}`);
+      return { ok: false, error: 'Switchboard did not open this file, so it will not save it.' };
+    }
     if (!fs.existsSync(resolved)) return { ok: false, error: 'File does not exist' };
     fs.writeFileSync(resolved, content, 'utf8');
     return { ok: true };
@@ -939,6 +1129,20 @@ function collectAndIndexMemories() {
 
   const result = { global: { files: globalFiles }, projects };
 
+  // Every file this scan found is one main is about to offer the user in the
+  // Memory tab, so it is one the memory editor may write back. Nothing else is:
+  // see memoryPaths above, and `save-memory`.
+  //
+  // Recording must never cost the scan (save-containment.js makes the same
+  // call for its own recording): a throw here would reject `get-memories` and
+  // leave the tab empty, where not recording only degrades to a refused save.
+  try {
+    for (const f of globalFiles) memoryPaths.surface(f.filePath);
+    for (const p of projects) for (const f of p.files) memoryPaths.surface(f.filePath);
+  } catch (err) {
+    log.warn('[memory] could not record the scanned files as savable: ' + err.message);
+  }
+
   // Index all files for FTS
   try {
     deleteSearchType('memory');
@@ -973,10 +1177,20 @@ ipcMain.handle('read-memory', (_event, filePath) => {
 });
 
 // --- IPC: save-memory ---
+// Contained to the files the Memory tab itself listed (memoryPaths, seeded by
+// collectAndIndexMemories). The extension check stays, but it was never the
+// protection it looked like: "ends in .md and exists" is true of every CLAUDE.md
+// on the machine, which is the one kind of file worth overwriting if you can get
+// script into the renderer.
 ipcMain.handle('save-memory', (_event, filePath, content) => {
   try {
+    if (typeof content !== 'string') return { ok: false, error: 'nothing to save' };
     const resolved = path.resolve(filePath);
     if (!resolved.endsWith('.md')) return { ok: false, error: 'not a .md file' };
+    if (!memoryPaths.allows(resolved)) {
+      log.warn(`[memory] refused a save to a file the memory list does not hold: ${resolved}`);
+      return { ok: false, error: 'Switchboard did not list this as a memory file, so it will not save it.' };
+    }
     if (!fs.existsSync(resolved)) return { ok: false, error: 'file does not exist' };
     fs.writeFileSync(resolved, content, 'utf8');
     return { ok: true };
@@ -1110,6 +1324,62 @@ ipcMain.handle('get-effective-settings', (_event, projectPath) => {
   return resolveEffectiveSettings(SETTING_DEFAULTS, global, project);
 });
 
+/**
+ * Which shell profile a process launched for `projectPath` should use.
+ *
+ * Extracted verbatim from the session-launch path (open-terminal below, which
+ * now calls this) so task PTYs and session PTYs cannot drift apart. It is NOT
+ * resolveEffectiveSettings: this one treats an explicit `null` at a scope as
+ * "not set" and keeps looking outward, which for shellProfile is the existing
+ * behaviour and the one the settings panel's project rows depend on.
+ */
+function effectiveShellProfileId(projectPath) {
+  const global = getSetting('global') || {};
+  const project = projectPath ? (getSetting('project:' + projectPath) || {}) : {};
+  let profileId = SETTING_DEFAULTS.shellProfile;
+  if (global.shellProfile !== undefined && global.shellProfile !== null) profileId = global.shellProfile;
+  if (project.shellProfile !== undefined && project.shellProfile !== null) profileId = project.shellProfile;
+  return profileId;
+}
+
+// --- Project tasks (.vscode/tasks.json) ---
+//
+// Task PTYs live outside `activeSessions` on purpose: a dev server is not an AI
+// session, and stopping or restarting it must not touch one. Everything the
+// manager emits goes to EVERY window (registry.broadcast), because tasks belong
+// to a project rather than to a session — upstream could push at its single
+// mainWindow, this fork cannot.
+const taskManager = createTaskManager({
+  // NOT process.env: pty-env.js strips the inherited CLAUDE_CODE_* session
+  // markers, and a task that runs `claude` with them set writes its transcript
+  // into the parent session's channel instead of its own.
+  baseEnv: cleanPtyEnv,
+  getShellProfile: (projectPath) => resolveShell(effectiveShellProfileId(projectPath)),
+  // Upstream passes projects.worktreeParentFor here; this fork has no such
+  // registry, so a worktree falls back to task-config's own
+  // `.claude/worktrees/<name>` inference (task-config.js:573).
+  log,
+  send: (channel, ...args) => registry.broadcast(channel, ...args),
+  // (c) The confirmation survives a restart, per (project, label, fingerprint).
+  readTrust: () => getSetting('taskTrust') || {},
+  writeTrust: (store) => setSetting('taskTrust', store),
+});
+
+ipcMain.handle('list-project-tasks', (_event, projectPath) => taskManager.listTasks(projectPath));
+ipcMain.handle('list-tasks-for-projects', (_event, projectPaths) => taskManager.listTasksForProjects(projectPaths));
+ipcMain.handle('get-task-run', (_event, projectPath, label) => taskManager.getRun(projectPath, label));
+// `options` carries { confirmed, fingerprint } from the (c) dialog. Dropping it
+// would make every run re-prompt forever, since the grant could never arrive.
+ipcMain.handle('start-task', (_event, projectPath, label, options) => taskManager.startTask(projectPath, label, options));
+ipcMain.handle('restart-task', (_event, projectPath, label, options) => taskManager.restartTask(projectPath, label, options));
+ipcMain.handle('stop-task', (_event, projectPath, label) => taskManager.stopTask(projectPath, label));
+ipcMain.handle('stop-all-tasks', (_event, projectPath) => taskManager.stopAllTasks(projectPath));
+// Exported for a renderer that wants to show the command before the first run.
+ipcMain.handle('get-task-confirmation', (_event, projectPath, label) => taskManager.getTaskConfirmation(projectPath, label));
+ipcMain.handle('trust-task', (_event, projectPath, label, fingerprint) => taskManager.trustTask(projectPath, label, fingerprint));
+ipcMain.on('task-input', (_event, projectPath, label, data) => taskManager.sendInput(projectPath, label, data));
+ipcMain.on('task-resize', (_event, projectPath, label, cols, rows) => taskManager.resize(projectPath, label, cols, rows));
+
 // --- IPC: get-active-sessions ---
 // Deliberately app-wide, not per-window: every sidebar shows a green dot for
 // anything running anywhere, which is what makes a session in another window
@@ -1216,7 +1486,11 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
       registry.sendTo(previousOwner, 'release-session', sessionId);
     }
     // MCP diffs must follow the session, not the window that spawned it.
-    setMcpWindow(session.realSessionId || sessionId, win);
+    // watchWindow: the bridge sends its diff/file pushes through this object
+    // itself, so wrapping it is the only way main learns which files it has put
+    // in the panel — which is what makes saving them back legal. Everything
+    // else about the window is forwarded untouched (save-containment.js).
+    setMcpWindow(session.realSessionId || sessionId, panelPaths.watchWindow(win));
 
     // A window that brought its own serialized scrollback (a tear-off) does not
     // want main's 256KB tail replayed on top of it — that would duplicate the
@@ -1278,14 +1552,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
   }
 
   // Resolve shell profile from effective settings
-  const effectiveProfileId = (() => {
-    const global = getSetting('global') || {};
-    const project = projectPath ? (getSetting('project:' + projectPath) || {}) : {};
-    let profileId = SETTING_DEFAULTS.shellProfile;
-    if (global.shellProfile !== undefined && global.shellProfile !== null) profileId = global.shellProfile;
-    if (project.shellProfile !== undefined && project.shellProfile !== null) profileId = project.shellProfile;
-    return profileId;
-  })();
+  const effectiveProfileId = effectiveShellProfileId(projectPath);
   // WSL profiles only work for plain terminals — Claude CLI sessions need the
   // Windows shell because session data lives on the Windows filesystem.
   const requestedProfile = resolveShell(effectiveProfileId);
@@ -1393,7 +1660,9 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
       // (skip if user disabled IDE emulation in global settings)
       if (sessionOptions?.mcpEmulation !== false) {
         try {
-          mcpServer = await startMcpServer(sessionId, [projectPath], win, log);
+          // panelPaths.watchWindow for the same reason as the reattach path
+          // above: the bridge's own pushes are what make an MCP diff savable.
+          mcpServer = await startMcpServer(sessionId, [projectPath], panelPaths.watchWindow(win), log);
           claudeCmd += ' --ide';
         } catch (err) {
           log.error(`[mcp] Failed to start MCP server for ${sessionId}: ${err.message}`);
@@ -1845,6 +2114,11 @@ if (!gotSingleInstanceLock) {
   });
 
   app.whenReady().then(() => {
+    // First: a window created below can ask for a preview asset immediately,
+    // and without a handler every switchboard-preview:// URL fails and an HTML
+    // preview renders blank. The scheme itself was registered at module scope.
+    protocol.handle(PREVIEW_SCHEME, handlePreviewAssetRequest);
+
     sessionMove.init({
       registry,
       dragProxy,
@@ -1992,6 +2266,12 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   // Shut down all MCP servers
   shutdownAllMcp();
+
+  // Task PTYs are not in activeSessions, so the loop below never reaches them.
+  // This also closes the tasks.json watchers.
+  try { taskManager.shutdown(); } catch (err) {
+    log.error('[task] shutdown failed:', err.message);
+  }
 
   // The drag ghost is a BrowserWindow with closable:false; it must be destroyed
   // explicitly or the app will not exit.

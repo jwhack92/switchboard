@@ -160,10 +160,55 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.send('mcp-diff-response', sessionId, diffId, action, editedContent);
   },
   readFileForPanel: (filePath) => ipcRenderer.invoke('read-file-for-panel', filePath),
+  // Main refuses a save to a file it never surfaced (save-containment.js), so
+  // this fails with an explanatory error rather than writing an arbitrary path.
   saveFileForPanel: (filePath, content) => ipcRenderer.invoke('save-file-for-panel', filePath, content),
   watchFile: (filePath) => ipcRenderer.invoke('watch-file', filePath),
   unwatchFile: (filePath) => ipcRenderer.invoke('unwatch-file', filePath),
   onFileChanged: (callback) => {
     ipcRenderer.on('file-changed', (_event, filePath) => callback(filePath));
+  },
+
+  // ── Project file browser + previews ──────────────────────────────────
+  // Reads are confined to the project root in main (project-files.js); an HTML
+  // preview must be rendered from the returned `previewUrl`, never `fileUrl`.
+  //
+  // The listing is async and CAPPED in main: the reply is
+  // { ok, entries, total, truncated }, and `truncated` means `entries` holds
+  // only the first slice of `total` -- say so in the UI rather than letting a
+  // partial list read as the whole folder.
+  listProjectDirectory: (projectPath, relativePath) =>
+    ipcRenderer.invoke('list-project-directory', projectPath, relativePath),
+  readProjectFile: (projectPath, relativePath) =>
+    ipcRenderer.invoke('read-project-file', projectPath, relativePath),
+
+  // ── Terminal file links ──────────────────────────────────────────────
+  // Batch-validates references scraped from terminal output. Main stats them;
+  // nothing here reaches a shell.
+  resolveTerminalFiles: (references) => ipcRenderer.invoke('resolve-terminal-files', references),
+
+  // ── Project tasks (.vscode/tasks.json) ───────────────────────────────
+  listTasksForProjects: (projectPaths) => ipcRenderer.invoke('list-tasks-for-projects', projectPaths),
+  listProjectTasks: (projectPath) => ipcRenderer.invoke('list-project-tasks', projectPath),
+  getTaskRun: (projectPath, label) => ipcRenderer.invoke('get-task-run', projectPath, label),
+  // `options` is { confirmed, fingerprint } from the confirmation dialog and
+  // MUST be forwarded: without it main can never see the grant, so every run
+  // asks again forever.
+  startTask: (projectPath, label, options) => ipcRenderer.invoke('start-task', projectPath, label, options),
+  restartTask: (projectPath, label, options) => ipcRenderer.invoke('restart-task', projectPath, label, options),
+  stopTask: (projectPath, label) => ipcRenderer.invoke('stop-task', projectPath, label),
+  stopAllTasks: (projectPath) => ipcRenderer.invoke('stop-all-tasks', projectPath),
+  getTaskConfirmation: (projectPath, label) => ipcRenderer.invoke('get-task-confirmation', projectPath, label),
+  trustTask: (projectPath, label, fingerprint) => ipcRenderer.invoke('trust-task', projectPath, label, fingerprint),
+  sendTaskInput: (projectPath, label, data) => ipcRenderer.send('task-input', projectPath, label, data),
+  resizeTask: (projectPath, label, cols, rows) => ipcRenderer.send('task-resize', projectPath, label, cols, rows),
+  onTaskOutput: (callback) => {
+    ipcRenderer.on('task-output', (_event, projectPath, label, data) => callback(projectPath, label, data));
+  },
+  onTaskStateChanged: (callback) => {
+    ipcRenderer.on('task-state-changed', (_event, run) => callback(run));
+  },
+  onProjectTasksChanged: (callback) => {
+    ipcRenderer.on('project-tasks-changed', (_event, projectPath) => callback(projectPath));
   },
 });

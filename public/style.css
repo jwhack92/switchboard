@@ -2301,6 +2301,38 @@ body { display: flex; flex-direction: column; }
 
 .markdown-preview img { max-width: 100%; border-radius: 6px; }
 
+/* Remote images. The CSP in index.html deliberately leaves http: and https:
+   out of img-src, so an <img> pointing at a remote host never loads - see the
+   policy comment there for why that is the intended behaviour and not a gap.
+   The markdown sanitiser still emits the element (href and src share one
+   scheme allowlist, viewer-toolbar.js:78), so without this rule the reader
+   gets an unexplained hole where a badge or diagram should be and blames the
+   document. Frame it and name the reason instead.
+
+   ::after generates a box here precisely because the fetch is refused: a
+   failed <img> stops being a replaced element, so its generated content
+   renders. Measured, not assumed - under this Electron the same broken image
+   lays out 179px wide with these rules and 52px without them. If img-src is
+   ever widened to allow remote images, delete this whole rule: a loading
+   image would keep the border and lose the label. */
+.markdown-preview img[src^="http:" i],
+.markdown-preview img[src^="https:" i],
+#jsonl-viewer img[src^="http:" i],
+#jsonl-viewer img[src^="https:" i] {
+  border: 1px dashed rgba(255,255,255,0.16);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+  font-style: italic;
+  color: #8a8a99;
+}
+.markdown-preview img[src^="http:" i]::after,
+.markdown-preview img[src^="https:" i]::after,
+#jsonl-viewer img[src^="http:" i]::after,
+#jsonl-viewer img[src^="https:" i]::after {
+  content: " (remote image blocked)";
+}
+
 .markdown-preview input[type="checkbox"] { margin-right: 6px; }
 
 /* ========== JSONL VIEWER ========== */
@@ -4095,4 +4127,734 @@ body.session-drop-target #session-drop-overlay { display: flex; }
    would be — there is no process to stop, only a row to clear. */
 .session-dismiss-btn:hover {
   color: #e5714d;
+}
+
+
+/* ==========================================================================
+   PORTED FEATURES (phase-2 harvest from upstream d4a51aa)
+
+   Four upstream features are adopted here. Their CSS is appended rather than
+   interleaved so the diff is a pure addition, and colours are not taken
+   verbatim: the dark-theme readability pass (61583ee) lifted 67 text colours
+   in this file above a legibility floor, and every ported TEXT colour below is
+   mapped onto that lifted palette (#7a7a90 -> #bdbdc8, #6a6a80 -> #b9b9c5,
+   #8a8aa0 -> #c2c2cd, #e36a78 -> #f1afbd, #59d46d -> #8ce39d, the violet
+   accent -> #8ccbff, and so on). Borders, backgrounds and rgba tints are
+   non-text and are kept as upstream, exactly as the readability pass left the
+   fork's own.
+   ========================================================================== */
+
+
+/* ========== TERMINAL FILE LINKS ==========
+   The hover tooltip that shows a link's real destination.
+   public/terminal-links.js createTooltip() sets only left/top and appends the
+   node inside the terminal's .xterm element, so everything that makes it float
+   has to come from here -- without `position: fixed` it lays itself out in the
+   terminal and shoves the rows sideways. Ported from d4a51aa:style.css:6999.
+   `position: fixed` resolves against the viewport here because no ancestor of
+   .xterm sets transform/filter/contain (checked: #app-container, #main,
+   #terminal-area, #terminals, .terminal-container, .xterm). */
+.terminal-link-tooltip {
+  position: fixed;
+  z-index: 10000;
+  max-width: min(640px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  overflow: hidden;
+  padding: 7px 10px;
+  border: 1px solid #494957;
+  border-radius: 5px;
+  background: #252530;
+  color: #e4e4ed;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  font: 12px/1.45 'SF Mono', 'Cascadia Code', Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+
+/* ========== SESSION CONFIG FORM ==========
+   public/session-config-form.js reuses the settings- and permission-
+   prefixed components that already exist above (style.css:3175-3369, 3543-3599); these rules only
+   adapt them to a dialog column and add the progressive-disclosure row.
+   Ported from d4a51aa:style.css:3795-3810, minus .session-config-note, which
+   exists upstream only to explain a Codex model/effort reset and has no
+   counterpart in this Claude-only fork. */
+.session-config-fields[hidden] { display: none !important; }
+.session-config-fields .settings-field-control { min-width: 0; }
+.session-config-fields .settings-field-wide .settings-field-control { width: 100%; }
+.session-config-fields .permission-grid { width: 100%; }
+.session-config-fields .settings-input { max-width: 100%; }
+
+.session-config-inheritance { margin-top: 4px; color: #c2c2cd; font-size: 11px; }
+.session-config-reset { padding: 0; border: 0; background: none; color: #8ccbff; font: inherit; cursor: pointer; }
+.session-config-reset:hover { text-decoration: underline; }
+
+/* "More options": a row in the form's own style that reveals the optional
+   settings. Revealing is one-way, so the toggle removes itself. */
+.session-config-more[hidden] { display: none !important; }
+.session-config-more-toggle {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 13px 18px;
+  border: 0;
+  border-bottom: 1px solid rgba(255,255,255,0.035);
+  background: rgba(255,255,255,0.02);
+  color: #8ccbff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.session-config-more-toggle:hover { background: rgba(255,255,255,0.045); }
+.session-config-more-label { flex-shrink: 0; white-space: nowrap; }
+.session-config-more-names {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #bdbdc8;
+  font-size: 11.5px;
+  font-weight: 400;
+}
+
+/* The caller renders SessionConfigForm.getOptions()'s throw message here.
+   dialogs.js has no such failure mode today, so nothing shows this yet. */
+.session-config-error { color: #f1afbd; font-size: 12px; margin-top: 12px; line-height: 1.45; }
+
+
+/* ========== PROJECT TASKS ==========
+   The .vscode/tasks.json launcher: a play button per project, a popover menu
+   of that project's tasks, a first-run confirmation dialog, and a retained log
+   pane that reuses the terminal chrome.
+
+   Ported from d4a51aa:style.css:3147-3394 and :4501-4522, with the text
+   colours lifted onto this fork's palette, plus rules upstream has no
+   counterpart for: the per-row resolved facts (.task-row-command and the
+   .task-row-meta chips) that public/task-runner.js change (a) adds, the
+   "needs confirmation" badge from change (c), and the confirmation dialog
+   itself. Upstream's row is a single line of free text out of tasks.json;
+   this fork's row also shows what will actually run, so the row is taller and
+   aligns to the top rather than the middle. */
+
+.project-task-btn {
+  position: relative;
+  flex: 0 0 auto;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: #bdbdc8;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  cursor: pointer;
+  opacity: 0.7;
+  transition: all 0.15s;
+}
+
+.project-task-btn:hover {
+  opacity: 1;
+  color: #8ccbff;
+  border-color: rgba(120,130,255,0.5);
+  background: rgba(120,130,255,0.13);
+}
+
+.project-task-btn.running {
+  color: #8ce39d;
+  border-color: rgba(62,207,90,0.34);
+  background: rgba(62,207,90,0.09);
+}
+
+.project-task-btn.error {
+  color: #f1afbd;
+  border-color: rgba(224,80,112,0.35);
+  background: rgba(224,80,112,0.08);
+}
+
+.project-task-count {
+  min-width: 10px;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+/* A worktree row is denser and its button only appears on hover -- unless a
+   task is running there, which must be visible without hunting for it. */
+.worktree-task-btn {
+  height: 18px;
+  min-width: 20px;
+  padding: 0 4px;
+  opacity: 0;
+}
+
+.worktree-header:hover .worktree-task-btn {
+  opacity: 0.7;
+}
+
+.worktree-header .worktree-task-btn.running {
+  opacity: 1;
+}
+
+/* ---- Task menu (popover) ---- */
+.task-popover {
+  position: fixed;
+  z-index: 10020;
+  max-height: min(440px, calc(100vh - 16px));
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 9px;
+  background: #1e1e2a;
+  box-shadow: 0 14px 40px rgba(0,0,0,0.48);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.1) transparent;
+}
+
+.task-popover-header {
+  padding: 6px 8px 7px;
+  color: #c2c2cd;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.task-popover-stop-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 5px;
+  color: #dba9b6;
+  background: transparent;
+  font: inherit;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+}
+
+.task-popover-stop-all:hover {
+  color: #f1afbd;
+  background: rgba(224,80,112,0.1);
+}
+
+.task-popover-stop-all:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.task-popover-error {
+  padding: 8px;
+  color: #f1afbd;
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.task-popover-empty {
+  padding: 10px 8px 11px;
+  color: #c2c2cd;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+/* Folder headings divide a combined task list into distinct sections. */
+.task-popover-group {
+  margin: 12px 0 4px;
+  padding: 8px;
+  border-top: 1px solid rgba(160,166,255,0.3);
+  background: rgba(120,130,255,0.08);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+  color: #cdd0e0;
+}
+
+.task-popover-header + .task-popover-group { margin-top: 2px; }
+
+.task-popover-inherited {
+  margin-top: 3px;
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+  color: #c4c4d0;
+}
+
+/* ---- One task ----
+   task-runner.js builds the row as a div[role=button][tabindex], not a
+   button element, because it contains a code block and its own buttons. That
+   costs the native focus ring, so one is declared here. */
+.task-popover-row {
+  width: 100%;
+  min-height: 43px;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 6px;
+  color: #ceceda;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.task-popover-row:hover {
+  background: rgba(120,130,255,0.1);
+}
+
+.task-popover-row:focus-visible {
+  outline: 2px solid #8ccbff;
+  outline-offset: -2px;
+}
+
+.task-popover-row.unsupported {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* Never yet allowed from Switchboard, or allowed and then changed. Marked,
+   not hidden: clicking it is what opens the confirmation. */
+.task-popover-row.unconfirmed {
+  box-shadow: inset 2px 0 0 rgba(255,190,60,0.55);
+}
+
+.task-row-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.task-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* With the badge present the label must shrink instead of clipping it away:
+   the badge is the reason the row is marked. Scoped with :has() so a plain
+   label keeps text-overflow: ellipsis, which an anonymous flex item loses.
+   Chromium 140 here (electron 41), so :has() is available. */
+.task-row-name:has(.task-row-unconfirmed) {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.task-row-unconfirmed {
+  flex: 0 0 auto;
+  margin-left: 7px;
+  padding: 1px 6px;
+  border: 1px solid rgba(255,190,60,0.3);
+  border-radius: 999px;
+  background: rgba(255,190,60,0.1);
+  color: #eccb82;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+
+.task-row-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #bdbdc8;
+  font-size: 10px;
+}
+
+.task-row-detail.task-row-error {
+  color: #f1afbd;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+
+/* The resolved command line. Deliberately NOT ellipsis-truncated: the tail of
+   a command is the dangerous part, and a row the user cannot read in full is
+   a row that cannot be reviewed. It wraps and the popover grows instead. */
+.task-row-command {
+  display: block;
+  max-width: 100%;
+  padding: 4px 7px;
+  border-radius: 5px;
+  background: rgba(0,0,0,0.3);
+  color: #e4e4ed;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* cwd, env-file, inline env and dependsOn chips under the command. */
+.task-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.task-row-cwd,
+.task-row-env,
+.task-row-dependson {
+  color: #b9b9c5;
+  overflow-wrap: anywhere;
+}
+
+/* A working directory outside the project root is the single most important
+   fact on the row, so it is coloured rather than left as grey metadata. */
+.task-row-cwd.outside {
+  color: #eccb82;
+  font-weight: 600;
+}
+
+.task-row-envfile {
+  overflow-wrap: anywhere;
+}
+
+.task-row-envfile.loaded { color: #b9b9c5; }
+.task-row-envfile.rejected { color: #f1afbd; font-weight: 600; }
+
+.task-row-log {
+  align-self: flex-start;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: #8ccbff;
+  font: inherit;
+  font-size: 11px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.task-row-log:hover { color: #91dafa; }
+.task-row-log:focus-visible { outline: 2px solid #8ccbff; outline-offset: 2px; border-radius: 2px; }
+
+.task-row-state {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: #bdbdc8;
+  font-size: 10px;
+}
+
+.task-row-state.running { color: #8ce39d; }
+.task-row-state.failed { color: #f1afbd; }
+
+.task-row-action {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  color: #8ccbff;
+  background: transparent;
+  cursor: pointer;
+}
+
+.task-row-action:hover {
+  background: rgba(120,130,255,0.16);
+}
+
+.task-row-action.stop {
+  color: #dba9b6;
+}
+
+.task-row-action.stop:hover {
+  color: #f1afbd;
+  background: rgba(224,80,112,0.14);
+}
+
+.task-row-action.restart {
+  color: #bdbdc8;
+}
+
+.task-row-action.restart:hover {
+  color: #ceceda;
+  background: rgba(255,255,255,0.08);
+}
+
+.task-row-action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ---- Task log pane ----
+   A .terminal-container like any other; createTaskLogView also sets
+   backgroundColor inline from TERMINAL_THEME, so this only covers the frame
+   before the terminal paints. */
+.task-log-container {
+  background: #111118;
+}
+
+/* ---- Terminal header, task mode ----
+   updateTaskHeader() puts the status chip into a third state the session
+   header never uses. Vivid dot, lifted text, matching .running above. */
+#terminal-header-status.failed {
+  color: #f1afbd;
+}
+
+#terminal-header-status.failed::before {
+  background: #e05070;
+  box-shadow: 0 0 6px rgba(224,80,112,0.5);
+}
+
+#terminal-restart-task-btn {
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 4px;
+  line-height: 1;
+  color: #bdbdc8;
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+
+#terminal-restart-task-btn:hover {
+  color: #8ccbff;
+  background: rgba(120,130,255,0.1);
+}
+
+/* ---- First-run confirmation (task-runner.js change (c)) ----
+   No upstream counterpart. Above .task-popover deliberately: the popover
+   stays open behind the dialog, and the dialog must not be what gets
+   scrolled away from. */
+.task-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10030;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.task-confirm-dialog {
+  display: flex;
+  flex-direction: column;
+  width: 620px;
+  max-width: 100%;
+  max-height: 100%;
+  padding: 22px 24px;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 12px;
+  background: #1e1e2a;
+  box-shadow: 0 16px 48px rgba(0,0,0,0.5);
+}
+
+.task-confirm-dialog h3 {
+  margin: 0 0 10px;
+  color: #d0d0e8;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.task-confirm-hint {
+  margin-bottom: 10px;
+  color: #ceceda;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.task-confirm-where {
+  margin-bottom: 14px;
+  color: #b9b9c5;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+/* The command list is the one part that scrolls: a compound task can spawn
+   several, and all of them have to be reachable before the buttons are. */
+.task-confirm-steps {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin-bottom: 16px;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 10px;
+  background: rgba(255,255,255,0.02);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.1) transparent;
+}
+
+.task-confirm-step {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  color: #ceceda;
+  font-size: 12px;
+}
+
+.task-confirm-step:last-child {
+  border-bottom: 0;
+}
+
+.task-confirm-step-label {
+  color: #bdbdc8;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.task-confirm-error {
+  margin-bottom: 14px;
+  padding: 8px 12px;
+  border: 1px solid rgba(224,80,112,0.3);
+  border-radius: 8px;
+  background: rgba(224,80,112,0.1);
+  color: #f1afbd;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.task-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.task-confirm-cancel-btn {
+  padding: 8px 24px;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 8px;
+  background: transparent;
+  color: #c4c4d0;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.task-confirm-cancel-btn:hover {
+  border-color: rgba(255,255,255,0.2);
+  background: rgba(255,255,255,0.06);
+  color: #d3d3de;
+}
+
+/* Amber, not the usual blue primary: this button authorizes a command line
+   the user has just been shown, and it should not read as a plain "OK".
+   task-runner.js focuses Cancel, so Enter never lands here by accident. */
+.task-confirm-allow-btn {
+  padding: 8px 24px;
+  border: 1px solid rgba(255,190,60,0.3);
+  border-radius: 8px;
+  background: rgba(255,190,60,0.12);
+  color: #eccb82;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.task-confirm-allow-btn:hover {
+  border-color: rgba(255,190,60,0.5);
+  background: rgba(255,190,60,0.2);
+  color: #f8d174;
+}
+
+.task-confirm-remember {
+  margin-top: 12px;
+  color: #bdbdc8;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+
+/* ========== JSON READER ==========
+   public/json-reader.js renders a collapsible tree beside the editor. Colours
+   follow the Dracula palette the CodeMirror editor and .markdown-preview
+   already use in this file (style.css:2239-2259), with the two the
+   readability pass lifted taken in their lifted form: Dracula's #bd93f9 is
+   #d9c0fc here and its grey punctuation is #b9b9c5, not #6a6a80.
+   Ported from d4a51aa:style.css:6220-6251.
+
+   .json-reader-value is emitted alongside .json-reader-<type> as a hook and
+   needs no rule of its own -- the type class carries the colour. */
+.json-reader {
+  flex: 1;
+  overflow: auto;
+  padding: 14px 18px;
+  color: #f8f8f2;
+  font-family: 'SF Mono', 'Fira Code', Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.08) transparent;
+}
+.json-reader-row { padding: 0 4px; border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.json-reader-row:hover { background: rgba(255,255,255,0.04); }
+.json-reader-leaf { padding-left: 18px; }
+.json-reader-node > summary { list-style: none; cursor: pointer; }
+.json-reader-node > summary::-webkit-details-marker { display: none; }
+.json-reader-node > summary::before { content: '\25B8'; display: inline-block; width: 14px; color: #b9b9c5; transition: transform 0.1s; }
+.json-reader-node[open] > summary::before { transform: rotate(90deg); }
+.json-reader-children { margin-left: 11px; padding-left: 6px; border-left: 1px solid rgba(255,255,255,0.06); }
+.json-reader-key { color: #8be9fd; }
+.json-reader-index { color: #b9b9c5; }
+/* A duplicate key is legal JSON and silently loses data, so it is marked
+   rather than merged away. */
+.json-reader-dup { text-decoration: underline wavy #f8d174; }
+.json-reader-colon, .json-reader-brace { color: #b9b9c5; }
+.json-reader-string { color: #f1fa8c; }
+.json-reader-number { color: #d9c0fc; }
+.json-reader-boolean { color: #ff79c6; }
+.json-reader-null { color: #ff79c6; font-style: italic; }
+.json-reader-count { margin-left: 8px; color: #b9b9c5; font-size: 11px; }
+/* The parse-error placeholder and its jump-to-offset button belong to the
+   viewer that mounts the reader (upstream's public/viewer-panel.js). This
+   fork has not ported that panel yet, so nothing emits these two today. */
+.json-reader-error { padding: 24px; color: #ceceda; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; line-height: 1.5; }
+.json-reader-jump { margin-top: 12px; padding: 5px 12px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; background: rgba(255,255,255,0.05); color: #d0d0e8; font: inherit; cursor: pointer; }
+.json-reader-jump:hover { background: rgba(255,255,255,0.1); }
+
+/* Shown when main caps a directory listing — see listProjectDirectoryAsync.
+   Deliberately quiet but not invisible: the point is that the list is
+   incomplete, which silence would hide. */
+.file-browser-truncated {
+  padding: 6px 10px;
+  font-size: 11px;
+  font-style: italic;
+  opacity: 0.65;
+  border-top: 1px solid var(--border, #2a2a2a);
 }

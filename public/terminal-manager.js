@@ -432,6 +432,33 @@ function createTerminalEntry(session) {
   container.className = 'terminal-container';
   terminalsEl.appendChild(container);
 
+  // --- Clickable file paths and OSC 8 hyperlinks ---
+  //
+  // Nothing is opened on the strength of what the terminal printed. `resolve`
+  // goes to the main process (terminal-file-links.js), which parses the
+  // candidate and stats it; a path that does not exist is never underlined and
+  // never opened. See public/terminal-links.js.
+  const linkTooltip = TerminalFileLinks.createTooltip(container);
+  const linkActions = {
+    resolve: references => window.api.resolveTerminalFiles(references),
+    showTooltip: linkTooltip.show,
+    hideTooltip: linkTooltip.hide,
+    // Guarded the way the handler it replaces was: file-panel.js is loaded
+    // before this file (index.html:117 then :121), but a load failure there
+    // should leave the terminal working rather than throw on every click.
+    openFile: (...args) => (typeof openFileInPanel === 'function' ? openFileInPanel(...args) : undefined),
+    openExternal: uri => window.api.openExternal(uri),
+  };
+  // `() => entry.session`, never the `sessionId` destructured above: the id is
+  // replaced once the real one is detected and again on a fork (app.js
+  // re-keying), and `entry` is read at click time, long after it is assigned
+  // below.
+  const linkHandler = TerminalFileLinks.createLinkHandler({ getSession: () => entry.session, ...linkActions });
+  // xterm does not await activate(), so an async rejection here would be an
+  // unhandled promise rejection rather than anything the user could see.
+  const activateLink = (event, uri) => linkHandler.activate(event, uri)
+    .catch(err => console.warn('[terminal] Could not open link:', err));
+
   const terminal = new Terminal({
     fontSize: 12,
     fontFamily: "'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",
@@ -475,13 +502,9 @@ function createTerminalEntry(session) {
     // in place. Windows/Linux get the same escape hatch via Shift, which needs no flag.
     macOptionClickForcesSelection: true,
     linkHandler: {
-      activate: (_event, uri) => {
-        if (uri.startsWith('file://') && typeof openFileInPanel === 'function') {
-          try { openFileInPanel(sessionId, decodeURIComponent(new URL(uri).pathname)); } catch {}
-        } else {
-          window.api.openExternal(uri);
-        }
-      },
+      activate: activateLink,
+      hover: linkHandler.hover,
+      leave: linkHandler.leave,
       allowNonHttpProtocols: true,
     },
   });
@@ -506,12 +529,12 @@ function createTerminalEntry(session) {
 
   const fitAddon = new FitAddon.FitAddon();
   terminal.loadAddon(fitAddon);
-  terminal.loadAddon(new WebLinksAddon.WebLinksAddon((_event, url) => {
-    if (url.startsWith('file://') && typeof openFileInPanel === 'function') {
-      try { openFileInPanel(sessionId, decodeURIComponent(new URL(url).pathname)); } catch {}
-    } else {
-      window.api.openExternal(url);
-    }
+  // Same handler as the OSC 8 path above, so a web link and a hyperlink the
+  // program marked up itself are validated and opened identically, and both
+  // get the destination tooltip.
+  terminal.loadAddon(new WebLinksAddon.WebLinksAddon(activateLink, {
+    hover: linkHandler.hover,
+    leave: linkHandler.leave,
   }));
   const searchAddon = new SearchAddon.SearchAddon();
   terminal.loadAddon(searchAddon);
@@ -579,6 +602,36 @@ function createTerminalEntry(session) {
   searchBar.querySelector('.terminal-search-close').addEventListener('click', closeSearchBar);
 
   const entry = { terminal, element: container, fitAddon, searchAddon, serializeAddon, openSearchBar, closeSearchBar, session, closed: false };
+
+  // Registered only now, because the provider reads `entry.session` when a
+  // link is clicked. OSC 8 and web links keep precedence over paths detected
+  // in the buffer text.
+  const fileLinks = TerminalFileLinks.createFileLinkProvider(terminal, {
+    getSession: () => entry.session, ...linkActions,
+  });
+  const fileLinkRegistration = terminal.registerLinkProvider(fileLinks);
+  // A tooltip is positioned in viewport coordinates, so anything that moves
+  // the text out from under the pointer without a mouseout has to dismiss it.
+  const linkScroll = terminal.onScroll(linkHandler.leave);
+  const linkResize = terminal.onResize(linkHandler.leave);
+  container.addEventListener('mouseleave', linkHandler.leave);
+  container.addEventListener('wheel', linkHandler.leave, { passive: true });
+  window.addEventListener('blur', linkHandler.leave);
+  // Tear-down rides on the terminal: teardownSessionView() calls
+  // terminal.dispose() (see below), which disposes every loaded addon. That is
+  // the only teardown path, and it is shared by destroySession and the
+  // tear-off release, so nothing here needs a second call site.
+  terminal.loadAddon({
+    activate() {},
+    dispose() {
+      fileLinks.dispose(); fileLinkRegistration.dispose();
+      linkScroll.dispose(); linkResize.dispose();
+      container.removeEventListener('mouseleave', linkHandler.leave);
+      container.removeEventListener('wheel', linkHandler.leave);
+      window.removeEventListener('blur', linkHandler.leave);
+      linkHandler.dispose(); linkTooltip.dispose();
+    },
+  });
 
   // Refit whenever the pane's box actually changes, instead of trying to guess
   // the right moment to measure.
@@ -735,6 +788,20 @@ function serializeSession(sessionId) {
 function showSession(sessionId) {
   // Whatever is being said belongs to the session you are leaving.
   if (window.speech) window.speech.cancel();
+  // And a task log, if one is open, is a view you are leaving too.
+  // showTaskLog() is the inverse of this function -- it calls
+  // setActiveSession(null) and drops the sidebar highlight -- but nothing
+  // performed the inverse on the way back, so activeTaskView survived into
+  // session mode. It must not: #terminal-stop-btn carries both app.js:802's
+  // session handler and task-runner.js's task handler, each guarded only by its
+  // own mode flag, so with both flags set one click stops the task AND prompts
+  // to stop the session. (task-runner.js also documents the rest.)
+  //
+  // Guarded by typeof because this file is require()d by the unit tests, where
+  // task-runner.js is not loaded. In the renderer it is always defined:
+  // task-runner.js is a classic script loaded at index.html:154, before any
+  // call can reach here.
+  if (typeof leaveTaskLogView === 'function') leaveTaskLogView();
   const entry = openSessions.get(sessionId);
   const session = sessionMap.get(sessionId) || (entry && entry.session);
 

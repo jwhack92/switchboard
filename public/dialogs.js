@@ -174,6 +174,49 @@ async function launchTerminalSession(project) {
   pollActiveSessions();
 }
 
+/**
+ * Mount the shared session-config form, or fall back to reporting why it
+ * could not be mounted.
+ *
+ * SessionConfigForm.mount() can THROW, which the hand-rolled markup it
+ * replaces could not: it runs the folder defaults through
+ * SessionConfig.resolveOptions, and a stored value the registry does not
+ * recognise — an old permissionMode left behind by a previous version, say —
+ * raises "Invalid Permission Mode" before a single field is rendered. Letting
+ * that escape would leave an empty dialog with a dead Start button, so the
+ * message is shown and the dialog still opens.
+ */
+function mountSessionConfig(dialog, defaults) {
+  const host = dialog.querySelector('.session-config-fields');
+  const errorEl = dialog.querySelector('.session-config-error');
+  try {
+    return SessionConfigForm.mount(host, { runtime: 'claude', defaults });
+  } catch (err) {
+    errorEl.textContent = `Could not read these settings: ${err.message}`;
+    return null;
+  }
+}
+
+/**
+ * Read the form, or show why it will not launch and return null.
+ *
+ * getOptions() validates, so this is a real failure path — a control
+ * character pasted into Allowed Tools throws here. The old code could not
+ * throw at all, so without the catch a bad value would kill the click handler
+ * and the button would simply stop responding.
+ */
+function readSessionConfig(form, dialog) {
+  const errorEl = dialog.querySelector('.session-config-error');
+  errorEl.textContent = '';
+  if (!form) return null;
+  try {
+    return form.getOptions();
+  } catch (err) {
+    errorEl.textContent = err.message;
+    return null;
+  }
+}
+
 async function showNewSessionDialog(project) {
   const effective = await window.api.getEffectiveSettings(project.projectPath);
 
@@ -183,62 +226,10 @@ async function showNewSessionDialog(project) {
   const dialog = document.createElement('div');
   dialog.className = 'new-session-dialog';
 
-  let selectedMode = effective.permissionMode || null;
-  let dangerousSkip = effective.dangerouslySkipPermissions || false;
-
-  const modes = PERMISSION_MODES;
-
-  function renderModeGrid() {
-    return modes.map(m => {
-      const isSelected = !dangerousSkip && selectedMode === m.value;
-      return `<button class="permission-option${isSelected ? ' selected' : ''}" data-mode="${m.value}"><span class="perm-name">${m.label}</span><span class="perm-desc">${m.desc}</span></button>`;
-    }).join('') +
-    `<button class="permission-option dangerous${dangerousSkip ? ' selected' : ''}" data-mode="dangerous-skip"><span class="perm-name">Dangerous Skip</span><span class="perm-desc">Skip all safety prompts (use with caution)</span></button>`;
-  }
-
   dialog.innerHTML = `
     <h3>New Session — ${escapeHtml(shortProjectPath(project.projectPath))}</h3>
-    <div class="settings-field">
-      <div class="settings-label">Permission Mode</div>
-      <div class="permission-grid" id="nsd-mode-grid">${renderModeGrid()}</div>
-    </div>
-    <div class="settings-field">
-      <div class="settings-field-info">
-        <span class="settings-label">Worktree</span>
-        <div class="settings-description">Run session in an isolated git worktree</div>
-      </div>
-      <div class="settings-field-control">
-        <input type="text" class="settings-input" id="nsd-worktree-name" placeholder="name (optional)" value="${escapeHtml(effective.worktreeName || '')}" style="width:140px">
-        <label class="settings-toggle"><input type="checkbox" id="nsd-worktree" ${effective.worktree ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
-      </div>
-    </div>
-    <div class="settings-field">
-      <div class="settings-field-info">
-        <span class="settings-label">Chrome</span>
-        <div class="settings-description">Enable Chrome browser automation</div>
-      </div>
-      <div class="settings-field-control">
-        <label class="settings-toggle"><input type="checkbox" id="nsd-chrome" ${effective.chrome ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
-      </div>
-    </div>
-    <div class="settings-field settings-field-wide">
-      <div class="settings-field-info">
-        <span class="settings-label">Pre-launch Command</span>
-        <div class="settings-description">Prepended to the claude command</div>
-      </div>
-      <div class="settings-field-control">
-        <input type="text" class="settings-input" id="nsd-pre-launch" placeholder="e.g. aws-vault exec profile --" value="${escapeHtml(effective.preLaunchCmd || '')}">
-      </div>
-    </div>
-    <div class="settings-field settings-field-wide">
-      <div class="settings-field-info">
-        <span class="settings-label">Additional Directories</span>
-        <div class="settings-description">Extra directories to include (comma-separated)</div>
-      </div>
-      <div class="settings-field-control">
-        <input type="text" class="settings-input" id="nsd-add-dirs" placeholder="/path/to/dir1, /path/to/dir2" value="${escapeHtml(effective.addDirs || '')}">
-      </div>
-    </div>
+    <div class="session-config-fields"></div>
+    <div class="session-config-error"></div>
     <div class="new-session-actions">
       <button class="new-session-cancel-btn">Cancel</button>
       <button class="new-session-start-btn">Start</button>
@@ -248,21 +239,7 @@ async function showNewSessionDialog(project) {
   overlay.appendChild(dialog);
   document.body.appendChild(overlay);
 
-  // Bind mode grid clicks
-  const modeGrid = dialog.querySelector('#nsd-mode-grid');
-  modeGrid.addEventListener('click', (e) => {
-    const btn = e.target.closest('.permission-option');
-    if (!btn) return;
-    const mode = btn.dataset.mode;
-    if (mode === 'dangerous-skip') {
-      dangerousSkip = !dangerousSkip;
-      if (dangerousSkip) selectedMode = null;
-    } else {
-      dangerousSkip = false;
-      selectedMode = mode === 'null' ? null : mode;
-    }
-    modeGrid.innerHTML = renderModeGrid();
-  });
+  const form = mountSessionConfig(dialog, effective);
 
   function close() {
     overlay.remove();
@@ -270,23 +247,13 @@ async function showNewSessionDialog(project) {
   }
 
   function start() {
-    const options = {};
-    if (dangerousSkip) {
-      options.dangerouslySkipPermissions = true;
-    } else if (selectedMode) {
-      options.permissionMode = selectedMode;
-    }
-    if (dialog.querySelector('#nsd-worktree').checked) {
-      options.worktree = true;
-      options.worktreeName = dialog.querySelector('#nsd-worktree-name').value.trim();
-    }
-    if (dialog.querySelector('#nsd-chrome').checked) {
-      options.chrome = true;
-    }
-    const preLaunch = dialog.querySelector('#nsd-pre-launch').value.trim();
-    if (preLaunch) options.preLaunchCmd = preLaunch;
-    options.addDirs = dialog.querySelector('#nsd-add-dirs').value.trim();
-    if (effective.mcpEmulation === false) options.mcpEmulation = false;
+    const options = readSessionConfig(form, dialog);
+    if (!options) return;
+    // Deliberately NOT filtered. getOptions() returns every registry key,
+    // including permissionMode:null, model:'', worktreeName:'' and
+    // mcpEmulation:false; main.js and buildLaunchArgs each guard on
+    // truthiness, so the falsy ones emit no flag. Filtering here would only
+    // put back the "missing or merely falsy?" ambiguity the registry removed.
     close();
     launchNewSession(project, options);
   }
@@ -298,7 +265,9 @@ async function showNewSessionDialog(project) {
   // Keyboard support
   function onKey(e) {
     if (e.key === 'Escape') close();
-    if (e.key === 'Enter' && !e.target.matches('input')) start();
+    // textarea is new here: Additional System Prompt is multi-line, and Enter
+    // inside it must insert a newline rather than launch the session.
+    if (e.key === 'Enter' && !e.target.matches('input, textarea')) start();
   }
   document.addEventListener('keydown', onKey);
 }
@@ -312,54 +281,12 @@ async function showResumeSessionDialog(session) {
   const dialog = document.createElement('div');
   dialog.className = 'new-session-dialog';
 
-  let selectedMode = effective.permissionMode || null;
-  let dangerousSkip = effective.dangerouslySkipPermissions || false;
-
-  const modes = PERMISSION_MODES;
-
-  function renderModeGrid() {
-    return modes.map(m => {
-      const isSelected = !dangerousSkip && selectedMode === m.value;
-      return `<button class="permission-option${isSelected ? ' selected' : ''}" data-mode="${m.value}"><span class="perm-name">${m.label}</span><span class="perm-desc">${m.desc}</span></button>`;
-    }).join('') +
-    `<button class="permission-option dangerous${dangerousSkip ? ' selected' : ''}" data-mode="dangerous-skip"><span class="perm-name">Dangerous Skip</span><span class="perm-desc">Skip all safety prompts (use with caution)</span></button>`;
-  }
-
   const sessionName = session.name || session.aiTitle || session.summary || session.sessionId.slice(0, 8);
 
   dialog.innerHTML = `
     <h3>Resume Session — ${escapeHtml(sessionName)}</h3>
-    <div class="settings-field">
-      <div class="settings-label">Permission Mode</div>
-      <div class="permission-grid" id="rsd-mode-grid">${renderModeGrid()}</div>
-    </div>
-    <div class="settings-field">
-      <div class="settings-field-info">
-        <span class="settings-label">Chrome</span>
-        <div class="settings-description">Enable Chrome browser automation</div>
-      </div>
-      <div class="settings-field-control">
-        <label class="settings-toggle"><input type="checkbox" id="rsd-chrome" ${effective.chrome ? 'checked' : ''}><span class="settings-toggle-slider"></span></label>
-      </div>
-    </div>
-    <div class="settings-field settings-field-wide">
-      <div class="settings-field-info">
-        <span class="settings-label">Pre-launch Command</span>
-        <div class="settings-description">Prepended to the claude command</div>
-      </div>
-      <div class="settings-field-control">
-        <input type="text" class="settings-input" id="rsd-pre-launch" placeholder="e.g. aws-vault exec profile --" value="${escapeHtml(effective.preLaunchCmd || '')}">
-      </div>
-    </div>
-    <div class="settings-field settings-field-wide">
-      <div class="settings-field-info">
-        <span class="settings-label">Additional Directories</span>
-        <div class="settings-description">Extra directories to include (comma-separated)</div>
-      </div>
-      <div class="settings-field-control">
-        <input type="text" class="settings-input" id="rsd-add-dirs" placeholder="/path/to/dir1, /path/to/dir2" value="${escapeHtml(effective.addDirs || '')}">
-      </div>
-    </div>
+    <div class="session-config-fields"></div>
+    <div class="session-config-error"></div>
     <div class="new-session-actions">
       <button class="new-session-cancel-btn">Cancel</button>
       <button class="new-session-start-btn">Resume</button>
@@ -369,21 +296,15 @@ async function showResumeSessionDialog(session) {
   overlay.appendChild(dialog);
   document.body.appendChild(overlay);
 
-  // Bind mode grid clicks
-  const modeGrid = dialog.querySelector('#rsd-mode-grid');
-  modeGrid.addEventListener('click', (e) => {
-    const btn = e.target.closest('.permission-option');
-    if (!btn) return;
-    const mode = btn.dataset.mode;
-    if (mode === 'dangerous-skip') {
-      dangerousSkip = !dangerousSkip;
-      if (dangerousSkip) selectedMode = null;
-    } else {
-      dangerousSkip = false;
-      selectedMode = mode === 'null' ? null : mode;
-    }
-    modeGrid.innerHTML = renderModeGrid();
-  });
+  const form = mountSessionConfig(dialog, effective);
+  // Resuming an existing session cannot move it into a fresh worktree — the
+  // old dialog offered no worktree control for exactly that reason, and the
+  // shared registry has no per-dialog field list. Hiding the rows keeps the
+  // one registry while still not offering a setting that does nothing here.
+  for (const key of ['worktree', 'worktreeName']) {
+    const row = dialog.querySelector(`[data-config-field="${key}"]`);
+    if (row) row.hidden = true;
+  }
 
   function close() {
     overlay.remove();
@@ -391,19 +312,12 @@ async function showResumeSessionDialog(session) {
   }
 
   function resume() {
-    const options = {};
-    if (dangerousSkip) {
-      options.dangerouslySkipPermissions = true;
-    } else if (selectedMode) {
-      options.permissionMode = selectedMode;
-    }
-    if (dialog.querySelector('#rsd-chrome').checked) {
-      options.chrome = true;
-    }
-    const preLaunch = dialog.querySelector('#rsd-pre-launch').value.trim();
-    if (preLaunch) options.preLaunchCmd = preLaunch;
-    options.addDirs = dialog.querySelector('#rsd-add-dirs').value.trim();
-    if (effective.mcpEmulation === false) options.mcpEmulation = false;
+    const options = readSessionConfig(form, dialog);
+    if (!options) return;
+    // Whatever the registry resolved for the hidden worktree rows is dropped
+    // rather than sent: a resume must not create one.
+    delete options.worktree;
+    delete options.worktreeName;
     close();
     openSession(session, options);
   }
@@ -414,7 +328,7 @@ async function showResumeSessionDialog(session) {
 
   function onKey(e) {
     if (e.key === 'Escape') close();
-    if (e.key === 'Enter' && !e.target.matches('input')) resume();
+    if (e.key === 'Enter' && !e.target.matches('input, textarea')) resume();
   }
   document.addEventListener('keydown', onKey);
 }

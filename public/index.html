@@ -2,6 +2,62 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <!-- Content-Security-Policy. The renderer is loaded with loadFile(), so the
+       document origin is file://. `file:` is listed beside 'self' in every
+       fetch directive on purpose: for a file:// document the two denote the
+       same set (a scheme-source with no host), and naming the scheme removes
+       any dependence on how the engine resolves 'self' for an opaque origin.
+
+       script-src has no 'unsafe-inline' and no 'unsafe-eval', which is the
+       point of the policy: this page has zero inline <script> bodies, zero
+       inline on*= handlers and zero javascript: URLs, and no bundle it loads
+       calls eval() or new Function(). The live XSS vector it closes is
+       rendered session content: viewer-toolbar.js:14 notes marked() does not
+       strip `<img src=x onerror=...>`, and jsonl-viewer.js injects transcript
+       HTML. Handlers assigned as properties (el.onclick = fn) are unaffected.
+
+       style-src keeps 'unsafe-inline' deliberately: xterm and CodeMirror
+       (style-mod) both create <style> elements at runtime, and the app sets
+       element.style throughout. A strict style policy would blank the
+       terminal with no error the user can see.
+
+       img-src needs data: (jsonl-viewer.js:390, :400 build data: screenshots)
+       and file: (jsonl-viewer.js:584); blob: is for the file preview's
+       object URLs.
+
+       img-src deliberately omits http: and https:, so a remote image in
+       rendered markdown does not load. That is narrower than the markdown
+       sanitiser, and the divergence is a decision rather than an oversight:
+       safeUrlValue() keeps http/https in SAFE_SCHEMES (viewer-toolbar.js:80)
+       because a markdown LINK has to stay clickable, and href and src share
+       that one scheme test (viewer-toolbar.js:78, :135), so with src on the
+       img allowlist (viewer-toolbar.js:58) the sanitiser will emit
+       <img src="https://..."> that this directive then refuses.
+       This directive is the one that decides.
+
+       Why this way round: an <img> fetches with no click. Markdown preview is
+       sticky per panel (viewer-panel.js:36, :192 restore it from
+       localStorage) and re-renders on every file-watcher event
+       (viewer-panel.js:533), so with the project file browser landed, a
+       README from a repository the user merely cloned would beacon its
+       reader's IP to a host the document chose — on selection, and again on
+       every save — with nobody choosing to load anything. After layers 1 and
+       2 close script and javascript: URLs (viewer-toolbar.js:26-33), that
+       automatic GET is the only channel a hostile document has left, and
+       status badges are not worth leaving it open in a local dev tool. The
+       cost is real and is paid knowingly: remote images never render.
+       style.css frames and labels them (see "remote images" there) so the
+       gap reads as a policy and not as a broken document.
+
+       The other half of making the two controls agree is in a file this
+       change does not touch: narrowing the sanitiser's scheme set for src
+       while leaving href alone would stop it emitting an <img> that can
+       never load. Until that lands, this comment is the note that says which
+       control is authoritative.
+
+       frame-src covers the PDF preview (blob:) and the sandboxed HTML
+       preview (switchboard-preview:, preview-assets.js:5). -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' file:; script-src 'self' file:; style-src 'self' 'unsafe-inline' file:; img-src 'self' data: blob: file:; font-src 'self' data: file:; connect-src 'self' file:; frame-src 'self' blob: file: switchboard-preview:; object-src 'none'; base-uri 'none'; form-action 'none'">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Switchboard</title>
   <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css">
@@ -78,6 +134,9 @@
         </div>
         <div id="terminal-header-controls">
           <span id="terminal-header-status"></span>
+          <!-- Shown only while a task log is the active view; task-runner.js
+               toggles it (updateTaskHeader / leaveTaskLogView). -->
+          <button id="terminal-restart-task-btn" title="Restart task" style="display:none;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8.1 8.1 0 1 0 2 5.3"/><path d="M20 4v7h-7"/></svg></button>
           <button id="terminal-stop-btn" title="Stop process"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><rect x="2" y="2" width="8" height="8" rx="1"/></svg></button>
         </div>
       </div>
@@ -112,13 +171,48 @@
   <script src="../node_modules/morphdom/dist/morphdom-umd.js"></script>
   <script src="codemirror-bundle.js"></script>
   <script src="icons.js"></script>
+  <!-- Must precede viewer-toolbar.js, viewer-panel.js and jsonl-viewer.js: all
+       three call renderMarkdownSafe(), and it publishes onto window at load.
+       Without this tag they throw ReferenceError on the first markdown render
+       and nothing displays — the CSP is a backstop against injected script, not
+       a substitute for the sanitiser running at all. -->
+  <script src="markdown-sanitize.js"></script>
   <script src="viewer-toolbar.js"></script>
+  <!-- json-reader.js reads .json and .jsonc. Its full path wants jsonc-parser
+       (key order, duplicate keys, exact number text taken from the file,
+       comments and trailing commas), and this fork does not have it: not in
+       package.json, not in node_modules, and no npm script builds a bundle of
+       it. A <script src="jsonc-parser-bundle.js"> tag sat here and 404ed on
+       every launch - that file was never generated and, unlike
+       codemirror-bundle.js, was not even gitignored.
+
+       Dropping the tag loses nothing, because json-reader.js was written for
+       the module's absence: getJsonc() resolves lazily and returns null in
+       the renderer (json-reader.js:62-79; main.js:255-256 sets
+       contextIsolation, so there is no require() to fall back to), and
+       parseWithoutJsonc() stands JSON.parse in (json-reader.js:214). A .json
+       file therefore still reads, carrying a visible note that duplicate keys
+       and exact number text are not shown (json-reader.js:218 ->
+       viewer-panel.js:303-310). A .jsonc file still reads whenever it happens
+       to be plain JSON; when it actually uses a comment or a trailing comma
+       it reports that the module is missing rather than blaming the file
+       (json-reader.js:228).
+
+       Restoring the full path needs four things landing together: a
+       package.json dependency, an esbuild script beside bundle:codemirror, a
+       .gitignore line, and this tag back. Any subset of those is worse than
+       none of them. -->
+  <script src="json-reader.js"></script>
   <script src="viewer-panel.js"></script>
   <script src="file-panel.js"></script>
   <script src="settings-panel.js"></script>
+  <script src="session-config.js"></script>
+  <script src="session-config-form.js"></script>
   <script src="utils.js"></script>
   <script src="terminal-themes.js"></script>
+  <script src="terminal-links.js"></script>
   <script src="terminal-manager.js"></script>
+  <script src="task-runner.js"></script>
   <script src="grid-view.js"></script>
   <script src="stats-view.js"></script>
   <script src="jsonl-viewer.js"></script>

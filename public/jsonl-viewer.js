@@ -1,16 +1,23 @@
 // --- JSONL Message History Viewer ---
 // Depends on globals: escapeHtml (utils.js), hideAllViewers, placeholder,
 // terminalArea, jsonlViewer, jsonlViewerTitle, jsonlViewerSessionId, jsonlViewerBody (app.js)
+// Depends on: renderMarkdownSafe (markdown-sanitize.js)
 
 function renderJsonlText(text) {
   if (window.marked) {
-    // Escape XML/HTML-like tags so they render as visible text,
-    // but preserve markdown code blocks (which may contain HTML examples).
-    const escaped = text.replace(/<(\/?[a-zA-Z][a-zA-Z0-9_-]*(?:\s[^>]*)?\/?)\>/g, '&lt;$1&gt;');
-    let html = window.marked.parse(escaped);
-    return html;
+    // Escape XML/HTML-like tags so they render as visible text, then allowlist
+    // the parser's output. This used to be a local regex that only caught
+    // `<tag ...>` shapes and left the parse result untouched; renderMarkdownSafe
+    // is that same idea generalised (comments and declarations too) plus the
+    // URL-scheme check, which the local regex could not do — `[x](javascript:…)`
+    // is pure markdown with no tag in it. A transcript is attacker-reachable:
+    // it is the verbatim text of whatever the session read, including a file
+    // fetched from the network.
+    return renderMarkdownSafe(text);
   }
-  // Fallback if marked isn't loaded
+  // Fallback if marked isn't loaded. Everything below is built from
+  // escapeHtml() output, so the interpolations cannot carry markup and this
+  // path needs no further sanitising.
   let html = escapeHtml(text);
   html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="jsonl-code-block"><code>$2</code></pre>');
   html = html.replace(/`([^`]+)`/g, '<code class="jsonl-inline-code">$1</code>');

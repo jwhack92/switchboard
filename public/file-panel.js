@@ -33,6 +33,11 @@ let diffBodyEl = null;
 let diffActionsEl = null;
 let diffToggleBtn = null;
 
+// Project file browser DOM
+let browserToolbar = null;
+let browserListEl = null;
+let filesToggleEl = null;
+
 const PANEL_WIDTH_KEY = 'filePanelWidth';
 const DEFAULT_PANEL_WIDTH = parseInt(localStorage.getItem(PANEL_WIDTH_KEY), 10) || 450;
 const MIN_PANEL_WIDTH = 280;
@@ -79,6 +84,23 @@ function initFilePanel() {
     onSave: (filePath, content) => window.api.saveFileForPanel(filePath, content),
     onClose: handleClose,
   });
+
+  // ── Project file browser ──
+  const browserContainer = document.createElement('div');
+  browserContainer.id = 'file-panel-browser';
+  browserContainer.className = 'file-browser';
+  browserContainer.style.display = 'none';
+  filePanelContentEl.appendChild(browserContainer);
+
+  browserToolbar = window.createViewerToolbar({ close: true });
+  browserToolbar.setTitle('Files');
+  browserToolbar.closeBtn.addEventListener('click', handleClose);
+  browserContainer.appendChild(browserToolbar.el);
+
+  browserListEl = document.createElement('div');
+  browserListEl.className = 'file-browser-list';
+  browserListEl.addEventListener('click', handleBrowserClick);
+  browserContainer.appendChild(browserListEl);
 
   // ── Diff-specific UI ──
   const diffContainer = document.createElement('div');
@@ -286,6 +308,17 @@ function openFileTab(sessionId, data) {
     label: basename(data.filePath),
     filePath: data.filePath,
     content: data.content,
+    // The rest of project-files.js's readPreviewFile shape. Carried verbatim
+    // so renderTabContent can hand it to ViewerPanel without re-reading.
+    previewType: data.previewType,
+    mimeType: data.mimeType,
+    base64: data.base64,
+    previewUrl: data.previewUrl,
+    unavailable: data.unavailable,
+    // Where to land: { line, column } from a terminal link or the file tree.
+    target: data.target,
+    // The folder to reopen the browser at, when this file came from it.
+    browserPath: data.browserPath,
   };
 
   state.panelVisible = true;
@@ -313,10 +346,201 @@ function destroyCurrentTab(state) {
   }
 }
 
-async function openFileInPanel(sessionId, filePath) {
+/**
+ * Open an absolute path in the panel.
+ *
+ * @param {string} sessionId
+ * @param {string} filePath  absolute
+ * @param {Object} [target]  { line, column } — where to put the cursor. The
+ *   terminal link provider passes its resolved target here as the third
+ *   argument (public/terminal-links.js:121), which is how a click on
+ *   `main.js:523` lands on line 523 instead of at the top of the file.
+ */
+async function openFileInPanel(sessionId, filePath, target) {
   const result = await window.api.readFileForPanel(filePath);
-  if (!result.ok) return;
-  openFileTab(sessionId, { filePath, content: result.content });
+  if (!result.ok) {
+    // PREVIEW_UNAVAILABLE means "a real file, just not one we can show" —
+    // a placeholder, not a failure. Anything else is a genuine error and the
+    // panel stays shut rather than opening onto nothing.
+    if (result.code !== 'PREVIEW_UNAVAILABLE') return;
+    openFileTab(sessionId, { filePath, unavailable: result.error });
+    return;
+  }
+  openFileTab(sessionId, { ...result, filePath: result.filePath || filePath, target });
+}
+
+// ── Project File Browser ────────────────────────────────────────────
+//
+// Session-scoped: the root is the session's own project path, and every path
+// crossing IPC is RELATIVE to it. project-files.js resolves and re-checks it
+// against that root (resolveProjectEntry), so a `..` or a symlink out of the
+// tree is refused in the main process rather than trusted from here.
+
+/**
+ * The project root for a session, or '' if it has none yet.
+ *
+ * try/catch rather than `typeof sessionMap === 'undefined'`: sessionMap is a
+ * top-level `const` in app.js (app.js:902), and `typeof` on a const still in
+ * its temporal dead zone THROWS a ReferenceError instead of answering
+ * 'undefined'. Today initFilePanel() is invoked at app.js:1837, below that
+ * declaration, so the window never opens — but that is a fact about the line
+ * order of a file this one does not own.
+ */
+function sessionProjectPath(sessionId) {
+  try {
+    const session = sessionMap.get(sessionId);
+    return (session && session.projectPath) || '';
+  } catch {
+    return '';
+  }
+}
+
+async function openFileBrowser(sessionId, relativePath = '') {
+  const projectPath = sessionProjectPath(sessionId);
+  if (!projectPath) return;
+
+  const state = getSessionState(sessionId);
+  destroyCurrentTab(state);
+  state.currentTab = { type: 'browser', relativePath, projectPath };
+  state.panelVisible = true;
+
+  if (currentPanelSessionId === sessionId) {
+    showPanel(state);
+    renderPanel(sessionId);
+  }
+}
+
+async function renderBrowserContent(sessionId, tab) {
+  browserToolbar.setTitle(basename(tab.projectPath));
+  // '' is the project root, which reads better as the folder's own name.
+  browserToolbar.setPath(tab.relativePath || '.');
+  browserListEl.innerHTML = '';
+
+  const result = await window.api.listProjectDirectory(tab.projectPath, tab.relativePath);
+
+  // The panel may have moved on while the read was in flight.
+  const current = getSessionState(sessionId).currentTab;
+  if (current !== tab || currentPanelSessionId !== sessionId) return;
+
+  if (!result.ok) {
+    const error = document.createElement('div');
+    error.className = 'file-browser-error';
+    error.textContent = result.error || 'Could not read this folder.';
+    browserListEl.appendChild(error);
+    return;
+  }
+
+  if (tab.relativePath) {
+    browserListEl.appendChild(browserRow({
+      name: '..',
+      // One level up, or back to the root. Computed here rather than sent as
+      // '..' so the main process never has to reason about a traversal.
+      relativePath: parentRelativePath(tab.relativePath),
+      type: 'directory',
+      viewable: true,
+    }, true));
+  }
+
+  if (!result.entries.length) {
+    const empty = document.createElement('div');
+    empty.className = 'file-browser-empty';
+    empty.textContent = 'This folder is empty.';
+    browserListEl.appendChild(empty);
+    return;
+  }
+
+  // Already sorted directories-first, then natural order by name
+  // (main.js listProjectDirectoryAsync). Do not re-sort.
+  for (const entry of result.entries) browserListEl.appendChild(browserRow(entry, false));
+
+  // main caps a listing at MAX_BROWSER_ENTRIES so an enormous folder cannot
+  // block its process. Say so: showing the first N of a folder with no notice
+  // is indistinguishable from showing all of it, and the file you came for may
+  // simply not be on screen.
+  if (result.truncated) {
+    const note = document.createElement('div');
+    note.className = 'file-browser-truncated';
+    note.textContent = `Showing the first ${result.entries.length} of ${result.total} entries.`;
+    note.title = 'This folder is too large to list in full. Open it in your editor or file manager to see everything.';
+    browserListEl.appendChild(note);
+  }
+}
+
+function browserRow(entry, isUp) {
+  const row = document.createElement('div');
+  row.className = 'file-browser-row ' + entry.type
+    + (entry.type === 'file' && !entry.viewable ? ' unviewable' : '')
+    + (isUp ? ' file-browser-up' : '');
+  row.dataset.path = entry.relativePath;
+  row.dataset.type = entry.type;
+  row.dataset.viewable = entry.viewable ? '1' : '';
+
+  const icon = document.createElement('span');
+  icon.className = 'file-browser-icon';
+  icon.textContent = entry.type === 'directory' ? '\u{1F4C1}' : '\u{1F4C4}';
+  row.appendChild(icon);
+
+  const name = document.createElement('span');
+  name.className = 'file-browser-name';
+  // textContent, never innerHTML: a file name is attacker-chosen in any repo
+  // that was cloned rather than written.
+  name.textContent = entry.name;
+  row.appendChild(name);
+
+  if (entry.type === 'file') {
+    const size = document.createElement('span');
+    size.className = 'file-browser-size';
+    size.textContent = formatBytes(entry.size);
+    row.appendChild(size);
+  }
+  return row;
+}
+
+function handleBrowserClick(e) {
+  const row = e.target.closest('.file-browser-row');
+  if (!row || !currentPanelSessionId) return;
+  const state = getSessionState(currentPanelSessionId);
+  const tab = state.currentTab;
+  if (!tab || tab.type !== 'browser') return;
+
+  if (row.dataset.type === 'directory') {
+    openFileBrowser(currentPanelSessionId, row.dataset.path);
+    return;
+  }
+  if (row.dataset.type !== 'file') return;   // a socket, a fifo: nothing to open
+  openProjectFile(currentPanelSessionId, tab.projectPath, row.dataset.path);
+}
+
+async function openProjectFile(sessionId, projectPath, relativePath) {
+  const result = await window.api.readProjectFile(projectPath, relativePath);
+  if (!result.ok) {
+    if (result.code !== 'PREVIEW_UNAVAILABLE') return;
+    // A real file that cannot be shown: a placeholder, not a toast. The user
+    // asked for it by clicking it, so answering with nothing is worse.
+    openFileTab(sessionId, {
+      filePath: relativePath,
+      unavailable: result.error,
+      browserPath: parentRelativePath(relativePath),
+    });
+    return;
+  }
+  openFileTab(sessionId, { ...result, browserPath: parentRelativePath(relativePath) });
+}
+
+function parentRelativePath(relativePath) {
+  const parts = String(relativePath || '').replace(/\\/g, '/').split('/');
+  parts.pop();
+  return parts.join('/');
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return '';
+  if (bytes < 1024) return bytes + ' B';
+  const units = ['KB', 'MB', 'GB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return (value < 10 ? value.toFixed(1) : Math.round(value)) + ' ' + units[unit];
 }
 
 function closeAllDiffs(sessionId) {
@@ -381,6 +605,12 @@ function switchPanel(sessionId) {
 }
 
 function updateMcpIndicator() {
+  // The Files button is only meaningful for a session that has a project
+  // root to browse — a bare terminal session has none.
+  if (filesToggleEl) {
+    filesToggleEl.style.display = (currentPanelSessionId && sessionProjectPath(currentPanelSessionId))
+      ? '' : 'none';
+  }
   if (!mcpIndicatorEl) return;
   if (!currentPanelSessionId) {
     mcpIndicatorEl.style.display = 'none';
@@ -404,18 +634,39 @@ function renderPanel(sessionId) {
 function renderTabContent(sessionId, tab) {
   const vpContainer = document.getElementById('file-panel-viewer');
   const diffContainer = document.getElementById('file-panel-diff');
+  const browserContainer = document.getElementById('file-panel-browser');
 
   if (!tab) {
     vpContainer.style.display = 'none';
     diffContainer.style.display = 'none';
+    browserContainer.style.display = 'none';
     return;
   }
+
+  if (tab.type === 'browser') {
+    vpContainer.style.display = 'none';
+    diffContainer.style.display = 'none';
+    browserContainer.style.display = 'flex';
+    renderBrowserContent(sessionId, tab);
+    return;
+  }
+  browserContainer.style.display = 'none';
 
   if (tab.type === 'file') {
     // Use ViewerPanel
     diffContainer.style.display = 'none';
     vpContainer.style.display = 'flex';
-    fpViewerPanel.open(tab.label, tab.filePath, tab.content);
+    fpViewerPanel.open(tab.label, tab.filePath, tab.content || '', {
+      previewType: tab.previewType,
+      mimeType: tab.mimeType,
+      base64: tab.base64,
+      previewUrl: tab.previewUrl,
+      unavailable: tab.unavailable,
+      target: tab.target,
+    });
+    // One-shot: re-rendering the same tab (a resize, a session switch back)
+    // must not yank the cursor back to where the link pointed.
+    tab.target = null;
   } else {
     // Diff mode
     vpContainer.style.display = 'none';
@@ -507,6 +758,22 @@ let mcpIndicatorEl = null;
 function addMcpToggle() {
   const controls = document.getElementById('terminal-header-controls');
   if (!controls) return;
+
+  // Entry point for the project file browser. Nothing else opens it — the
+  // panel is otherwise only ever pushed open by the MCP bridge.
+  filesToggleEl = document.createElement('button');
+  filesToggleEl.className = 'fp-toolbar-btn fp-files-btn';
+  filesToggleEl.title = 'Browse project files';
+  filesToggleEl.textContent = 'Files';
+  filesToggleEl.addEventListener('click', () => {
+    if (!currentPanelSessionId) return;
+    const tab = getSessionState(currentPanelSessionId).currentTab;
+    if (tab && tab.type === 'browser') { handleClose(); return; }
+    // Reopen where the user last was: the folder of the file on screen, or
+    // the project root.
+    openFileBrowser(currentPanelSessionId, (tab && tab.browserPath) || '');
+  });
+  controls.appendChild(filesToggleEl);
 
   mcpIndicatorEl = document.createElement('span');
   mcpIndicatorEl.className = 'mcp-toggle enabled';

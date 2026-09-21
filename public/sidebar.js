@@ -310,6 +310,16 @@ function renderProjects(projects, resort) {
     const shortName = shortProjectPath(project.projectPath);
     header.innerHTML = `<span class="arrow">&#9660;</span> <span class="project-name">${shortName}</span>`;
 
+    // The .vscode/tasks.json menu. The button itself is built by task-runner.js
+    // so the running badge, the error state and this row stay with the code that
+    // repaints them between renders (updateProjectTaskButtons queries these very
+    // nodes). It needs project.tasks, which loadProjects() hydrates before it
+    // calls refreshSidebar; unhydrated it degrades to "Set up project tasks"
+    // rather than throwing. The click is bound in rebindSidebarEvents, like
+    // every other header button — morphdom reuses these nodes, so a listener
+    // attached here would be attached to whichever render happened to build it.
+    if (typeof createProjectTaskButton === 'function') header.appendChild(createProjectTaskButton(project));
+
     const scheduleBtn = document.createElement('button');
     scheduleBtn.className = 'project-schedule-btn';
     scheduleBtn.title = 'Create scheduled task';
@@ -367,6 +377,11 @@ function renderProjects(projects, resort) {
       wtHeader.className = 'worktree-header';
       wtHeader.id = 'ph-' + wtFId;
       wtHeader.innerHTML = `<span class="worktree-branch-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 8c0-2.76-2.46-5-5.5-5S2 5.24 2 8h2l1-1 1 1h4"/><path d="M13 7.14A5.82 5.82 0 0 1 16.5 6c3.04 0 5.5 2.24 5.5 5h-3l-1-1-1 1h-3"/><path d="M5.89 9.71c-2.15 2.15-2.3 5.47-.35 7.43l4.24-4.25.7-.7.71-.71 2.12-2.12c-1.95-1.96-5.27-1.8-7.42.35"/><path d="M11 15.5c.5 2.5-.17 4.5-1 6.5h4c2-5.5-.5-12-1-14"/></svg></span> <span class="worktree-name">${escapeHtml(wtName)}</span>`;
+
+      // A worktree is its own folder with its own .vscode/tasks.json, so it gets
+      // its own menu. The `true` gives it .worktree-task-btn, which the stylesheet
+      // hides until the row is hovered unless a task is actually running there.
+      if (typeof createProjectTaskButton === 'function') wtHeader.appendChild(createProjectTaskButton(wt, true));
 
       const wtHideBtn = document.createElement('button');
       wtHideBtn.className = 'worktree-hide-btn';
@@ -479,6 +494,10 @@ function rebindSidebarEvents(projects) {
     if (newBtn) {
       newBtn.onclick = (e) => { e.stopPropagation(); showNewSessionPopover(project, newBtn); };
     }
+    const taskBtn = header.querySelector('.project-task-btn');
+    if (taskBtn && typeof showTaskPopover === 'function') {
+      taskBtn.onclick = (e) => { e.stopPropagation(); showTaskPopover(project, taskBtn); };
+    }
     const scheduleBtn = header.querySelector('.project-schedule-btn');
     if (scheduleBtn) {
       scheduleBtn.onclick = (e) => { e.stopPropagation(); launchScheduleCreator(project); };
@@ -507,7 +526,7 @@ function rebindSidebarEvents(projects) {
       };
     }
     header.onclick = (e) => {
-      if (e.target.closest('.project-new-btn') || e.target.closest('.project-archive-btn') || e.target.closest('.project-settings-btn') || e.target.closest('.project-schedule-btn')) return;
+      if (e.target.closest('.project-new-btn') || e.target.closest('.project-archive-btn') || e.target.closest('.project-settings-btn') || e.target.closest('.project-schedule-btn') || e.target.closest('.project-task-btn')) return;
       header.classList.toggle('collapsed');
     };
   }
@@ -518,6 +537,10 @@ function rebindSidebarEvents(projects) {
     const wtProject = projects.find(p => folderId(p.projectPath) === wtFId);
     if (!wtProject) return;
 
+    const wtTaskBtn = wtHeader.querySelector('.project-task-btn');
+    if (wtTaskBtn && typeof showTaskPopover === 'function') {
+      wtTaskBtn.onclick = (e) => { e.stopPropagation(); showTaskPopover(wtProject, wtTaskBtn); };
+    }
     const wtNewBtn = wtHeader.querySelector('.worktree-new-btn');
     if (wtNewBtn) {
       wtNewBtn.onclick = (e) => { e.stopPropagation(); showNewSessionPopover(wtProject, wtNewBtn); };
@@ -533,7 +556,7 @@ function rebindSidebarEvents(projects) {
       };
     }
     wtHeader.onclick = (e) => {
-      if (e.target.closest('.worktree-new-btn') || e.target.closest('.worktree-hide-btn')) return;
+      if (e.target.closest('.worktree-new-btn') || e.target.closest('.worktree-hide-btn') || e.target.closest('.project-task-btn')) return;
       wtHeader.classList.toggle('collapsed');
     };
   });

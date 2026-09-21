@@ -59,6 +59,20 @@ function setActiveSession(id) {
   activeSessionId = id;
   if (id) sessionStorage.setItem('activeSessionId', id);
   else sessionStorage.removeItem('activeSessionId');
+  // A session and a task log are two modes of the SAME pane, and
+  // #terminal-stop-btn carries one handler per mode: this file's, guarded by
+  // activeSessionId, and task-runner.js's, guarded by activeTaskView. That is
+  // sound only while the two flags are mutually exclusive, so every route into
+  // session mode has to clear the task one. showSession() does it for itself,
+  // but it is not the only route: focusGridCard() (grid-view.js) makes a session
+  // active straight from showGridView's rAF, from navigateGrid and from a click
+  // on a grid card, and reaches this function without going through showSession.
+  // Doing it here covers all of them. leaveTaskLogView is idempotent, so the
+  // showSession path — which already called it — pays nothing.
+  //
+  // Only a REAL session id leaves the task view: showTaskLog sets activeTaskView
+  // and then calls setActiveSession(null), which must not undo what it just set.
+  if (id && typeof activeTaskView !== 'undefined' && activeTaskView) leaveTaskLogView();
   // Update file panel to show this session's open files/diffs
   if (typeof switchPanel === 'function') switchPanel(id);
 }
@@ -975,6 +989,16 @@ async function loadProjects({ resort = false } = {}) {
   } catch {}
 
   await pollActiveSessions();
+  // task-runner.js builds each project's task button out of project.tasks /
+  // .taskError / .hasTaskFile, and only hydrateProjectTasks ever sets them. It
+  // has to run BEFORE the render, not after: renderProjects reads those fields
+  // synchronously while building the header, and a later hydration would leave
+  // the badge stale until the next unrelated refresh. Both lists are passed
+  // because getProjects(false) and getProjects(true) return distinct project
+  // objects (dedup() shares sessions between them, not the projects).
+  // It swallows its own IPC failure, so a missing handler costs the task
+  // buttons their data and never the sidebar.
+  if (typeof hydrateProjectTasks === 'function') await hydrateProjectTasks([cachedProjects, cachedAllProjects]);
   refreshSidebar({ resort });
   renderDefaultStatus();
 }
@@ -1057,6 +1081,32 @@ async function showTerminalHeader(session) {
   } catch {
     terminalHeaderShell.style.display = 'none';
   }
+}
+
+// Every call into the task runner from this file and from sidebar.js is
+// typeof-guarded, because task-runner.js is a separate classic script
+// (index.html:154) and a sidebar that throws mid-render is worse than a missing
+// button. The cost of that is that the feature can go quietly inert again —
+// which is exactly how it shipped in the first place, reachable from nowhere.
+// So check the entry points once, at load, and say so if they are gone. Top-
+// level function declarations in a classic script land on `window`, so this
+// sees them; it runs after task-runner.js has been evaluated.
+for (const entryPoint of ['createProjectTaskButton', 'showTaskPopover', 'hydrateProjectTasks', 'restoreActiveTaskView', 'leaveTaskLogView']) {
+  if (typeof window[entryPoint] !== 'function') {
+    console.error(`[task] ${entryPoint}() is missing — the project task runner is not wired up`);
+  }
+}
+
+// The extension point showTaskLog() calls (`if (typeof onTaskLogShown ===
+// 'function')`, task-runner.js). A task log is a single full-width pane, but
+// showTaskLog only hides #grid-viewer — it leaves #terminals in .grid-layout, so
+// in grid mode the log would be laid out as one more cell beside the very
+// sessions it is meant to replace, at whatever width the column happens to be.
+// hideGridView() unwraps the cards and drops the layout class. The reverse
+// direction needs nothing here: showGridView() already removes .visible from
+// every .terminal-container, the task log's container included.
+function onTaskLogShown() {
+  if (gridViewActive) hideGridView();
 }
 
 // Terminal lifecycle (createTerminalEntry, destroySession, showSession, setupDragAndDrop) → terminal-manager.js
@@ -1377,6 +1427,14 @@ Promise.all([loadProjects(), windowIdentityReady]).then(() => {
       const session = sessionMap.get(activeSessionId);
       if (session) openSession(session);
     }
+  }
+  // Reattach to the task log this window was showing before the reload. It runs
+  // after the session restore above and returns early when activeSessionId is
+  // set, so a restored session always wins the pane; it also needs the task
+  // hydration loadProjects() just awaited, or findProject() would not know the
+  // saved label and it would silently decline to restore anything.
+  if (typeof restoreActiveTaskView === 'function') {
+    Promise.resolve(restoreActiveTaskView()).catch(e => console.warn('[task] could not restore task log', e));
   }
 });
 
