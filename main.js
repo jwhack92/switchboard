@@ -347,9 +347,13 @@ function createWindow(opts = {}) {
     // Liveness is re-checked HERE, not at tear-off time, because this send is
     // the far side of a real gap: session-move flips ownership synchronously,
     // but did-finish-load lands whole window-creation later. A session that
-    // exits inside that gap broadcasts 'process-exited' to every window that
-    // EXISTS — and this one does not yet — so the adopting renderer is the one
-    // participant that never hears it. Without this check it then adopts a
+    // exits inside that gap broadcasts 'process-exited' to every registered
+    // window, and this window IS already registered (registry.register at
+    // main.js:303 runs before loadFile at :310) — but its renderer has not
+    // loaded, so no listener is attached and the message is simply dropped.
+    // The adopting renderer is therefore the one participant that never
+    // hears it. (Registering later would not help: then it would miss the
+    // broadcast for the other reason.) Without this check it then adopts a
     // session main has already forgotten (activeSessions.delete in onExit),
     // which no longer takes the reattach branch in 'open-terminal' and so
     // falls through to the spawn path: a brand-new billed process the user
@@ -357,11 +361,28 @@ function createWindow(opts = {}) {
     // session. Sending exited:true keeps the torn-off scrollback visible
     // behind the normal exit banner instead.
     if (opts.adopt && opts.adopt.sessionId) {
-      const adopted = activeSessions.get(opts.adopt.sessionId);
+      // A missing key does NOT prove the session died. A fork or a plan-accept
+      // re-keys a LIVE session and deletes the old key
+      // (session-transitions.js), so follow the re-key before concluding
+      // anything — otherwise the window is told "session exited during move"
+      // about a session that is alive and still billing, and clicking that
+      // corpse would resume the old id alongside the process still running.
+      let adoptId = opts.adopt.sessionId;
+      let adopted = activeSessions.get(adoptId);
+      if (!adopted) {
+        for (const [liveId, session] of activeSessions) {
+          if (session.priorIds && session.priorIds.includes(adoptId)) {
+            adoptId = liveId;
+            adopted = session;
+            break;
+          }
+        }
+      }
       win.webContents.send('adopt-session', {
-        sessionId: opts.adopt.sessionId,
+        sessionId: adoptId,
         serialized: opts.adopt.serialized || '',
         projectPath: opts.adopt.projectPath,
+        isPlainTerminal: !!opts.adopt.isPlainTerminal,
         exited: !adopted || !!adopted.exited,
       });
       opts.adopt = null;
@@ -1760,17 +1781,27 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
   const win = registry.windowOf(event);
   if (!win) return { ok: false, error: 'no window' };
 
-  // An adopt that lost its session must never become a spawn. skipReplay is
-  // set only by a tear-off, which means "attach to something that already
-  // exists" — if it no longer exists, launching a replacement is never the
-  // right answer, and silently starting a billed process is the worst of the
-  // wrong answers. This is the authoritative guard: the delivery-time check in
-  // createWindow closes the common case, but it cannot close the gap between
-  // that check and this call, and only main knows the truth here.
-  const adoptTarget = sessionOptions && sessionOptions.skipReplay
-    ? activeSessions.get(sessionId) : null;
-  if (sessionOptions && sessionOptions.skipReplay && (!adoptTarget || adoptTarget.exited)) {
-    return { ok: false, error: 'session ended before it could be adopted', exited: true };
+  // An adopt that lost its session must never become a spawn. `adopt` means
+  // "attach to something that already exists" — if it no longer exists,
+  // launching a replacement is never the right answer, and silently starting
+  // a billed process is the worst of the wrong answers. This is the
+  // authoritative guard: the delivery-time check in createWindow closes the
+  // common case, but it cannot close the gap between that check and this
+  // call, and only main knows the truth here.
+  //
+  // Keyed on `adopt`, NOT on skipReplay. skipReplay only means "I brought my
+  // own scrollback", and an adopt brings none whenever the moving window was
+  // not displaying the session — serializeSession returns '' with no local
+  // entry (public/terminal-manager.js:774), and dragging a session that
+  // another window owns is an ordinary supported gesture (the handle is on
+  // every row, public/sidebar.js:941; canDrag needs only a live pty,
+  // public/session-drag.js:55). An earlier version of this guard keyed on
+  // skipReplay and left exactly that path still falling through to pty.spawn.
+  if (sessionOptions && sessionOptions.adopt) {
+    const adoptTarget = activeSessions.get(sessionId);
+    if (!adoptTarget || adoptTarget.exited) {
+      return { ok: false, error: 'session ended before it could be adopted', exited: true };
+    }
   }
 
   // Reattach to existing session

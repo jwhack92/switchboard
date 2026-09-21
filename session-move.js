@@ -68,7 +68,11 @@ function moveSession({ sessionId, targetWindowId, serialized, sourceWindowId, po
     // the cursor rather than on top of the window it came from.
     target = createWindow({
       bounds: newWindowBoundsAt(point),
-      adopt: { sessionId, serialized, projectPath: meta.projectPath },
+      // isPlainTerminal is captured HERE, while the session is still alive.
+      // If it dies before the adopt is delivered main can no longer answer
+      // what kind of session it was, and the destination needs that to know
+      // whether relaunching it means `claude` or a bare shell.
+      adopt: { sessionId, serialized, projectPath: meta.projectPath, isPlainTerminal: !!meta.isPlainTerminal },
     });
     if (!target) return { ok: false, error: 'could not create a window' };
     // Ownership flips now; the adopt payload is delivered on did-finish-load.
@@ -85,6 +89,7 @@ function moveSession({ sessionId, targetWindowId, serialized, sourceWindowId, po
     sessionId,
     serialized: serialized || '',
     projectPath: meta.projectPath,
+    isPlainTerminal: !!meta.isPlainTerminal,
   });
   registry.sendTo(sourceWindowId, 'release-session', sessionId);
   if (target.isMinimized()) target.restore();

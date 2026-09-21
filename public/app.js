@@ -519,12 +519,17 @@ const ADOPT_EXIT_BANNER = '\r\n\x1b[33m── session exited during move ──\
  * empty window. Nothing here attaches: there is no PTY left to attach to, and
  * asking for one would spawn a replacement.
  */
-function showAdoptedCorpse(sessionId, serialized, projectPath) {
+function showAdoptedCorpse(sessionId, serialized, projectPath, isPlainTerminal) {
   let session = sessionMap.get(sessionId);
   if (!session) {
     session = {
       sessionId,
       projectPath: projectPath || '',
+      // Carried through the move from getSessionMeta, captured while the
+      // session was alive (session-move.js). Without it a dead plain terminal
+      // is indistinguishable from a dead Claude session, and clicking the
+      // corpse would try to `claude --resume` a bare shell.
+      type: isPlainTerminal ? 'terminal' : undefined,
       modified: new Date().toISOString(),
       summary: '',
     };
@@ -542,13 +547,16 @@ function showAdoptedCorpse(sessionId, serialized, projectPath) {
   sessionOwners.delete(sessionId);
   showSession(sessionId);
   loadProjects();
+  // Without this the row keeps rendering as running — and keeps offering a
+  // drag handle — until the next idle poll, up to 30s away.
+  pollActiveSessions();
 }
 
 // This window is taking over a session. The PTY never moved — only the view. A
 // live xterm cannot cross BrowserWindows, so we build a fresh one and paint it
 // from the serialized buffer the source window handed over, then attach with
 // skipReplay so main does not also replay its 256KB tail on top.
-window.api.onAdoptSession(async ({ sessionId, serialized, projectPath, exited }) => {
+window.api.onAdoptSession(async ({ sessionId, serialized, projectPath, exited, isPlainTerminal }) => {
   try {
     // The session may not be in this window's sidebar at all, so resolve its
     // metadata from main rather than from the local sessionMap.
@@ -560,7 +568,7 @@ window.api.onAdoptSession(async ({ sessionId, serialized, projectPath, exited })
       // real output the user just dragged, and dropping it silently leaves an
       // empty window with no explanation of where their session went.
       if (!meta) {
-        showAdoptedCorpse(sessionId, serialized, projectPath);
+        showAdoptedCorpse(sessionId, serialized, projectPath, isPlainTerminal);
         return;
       }
       session = {
@@ -579,7 +587,8 @@ window.api.onAdoptSession(async ({ sessionId, serialized, projectPath, exited })
     // usual banner and do NOT call openTerminal - for a session main has
     // already dropped, that call is a spawn, not an attach.
     if (exited) {
-      showAdoptedCorpse(sessionId, serialized, session.projectPath);
+      showAdoptedCorpse(sessionId, serialized, session.projectPath,
+        isPlainTerminal || session.type === 'terminal');
       return;
     }
 
@@ -589,19 +598,39 @@ window.api.onAdoptSession(async ({ sessionId, serialized, projectPath, exited })
       try { entry.terminal.write(serialized); } catch (e) { console.warn('[tearoff] replay failed', e); }
     }
 
+    // adopt:true is what marks this call an ADOPT, and it is deliberately NOT
+    // derived from `serialized`. skipReplay only says "I brought my own
+    // scrollback, do not replay yours" - and an adopt legitimately brings none
+    // whenever the moving window was not the one displaying the session
+    // (serializeSession returns '' with no local entry,
+    // terminal-manager.js:774; the drag handle is on EVERY row,
+    // sidebar.js:941, and canDrag needs only a live pty, session-drag.js:55).
+    // Gating main's spawn guard on skipReplay therefore left that entire
+    // ordinary path - drag a session from a window that is not showing it -
+    // still able to fall through to pty.spawn.
     const result = await window.api.openTerminal(
-      sessionId, session.projectPath, false, { skipReplay: !!serialized });
+      sessionId, session.projectPath, false, { skipReplay: !!serialized, adopt: true });
     if (!result || !result.ok) {
       // result.exited is main's spawn guard firing: the session ended between
       // the check above and this call. That is an ordinary ending, not a
       // failure, so it gets the same banner every other exit gets.
+      // The 'process-exited' broadcast for this same death was sent before
+      // this reply and has already been handled. For an INTENTIONAL exit that
+      // means destroySession has disposed the terminal and dropped it from
+      // openSessions (terminal-manager.js) — writing to it is a no-op, and
+      // calling showSession would mount nothing while hiding the placeholder,
+      // leaving a blank pane. For an unintentional exit that handler has
+      // already written its own `session exited (code N)` banner, so adding
+      // ours would print two. Either way, if it got here first it has done
+      // the right thing and there is nothing left for us to do.
+      const stillMounted = openSessions.has(sessionId);
       if (result && result.exited) {
-        try { entry.terminal.write(ADOPT_EXIT_BANNER); } catch {}
+        if (stillMounted) { try { entry.terminal.write(ADOPT_EXIT_BANNER); } catch {} }
       } else {
-        entry.terminal.write(`\r\nError adopting session: ${result && result.error}\r\n`);
+        try { entry.terminal.write(`\r\nError adopting session: ${result && result.error}\r\n`); } catch {}
       }
       entry.closed = true;
-      showSession(sessionId);
+      if (stillMounted) showSession(sessionId);
       loadProjects();
       return;
     }

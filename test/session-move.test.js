@@ -100,6 +100,38 @@ test('adopt carries the projectPath, which the destination may not know', () => 
   assert.strictEqual(adopt[3].projectPath, '/proj');
 });
 
+test('adopt carries isPlainTerminal, captured while the session is still alive', () => {
+  // If the session dies before the adopt is delivered, main can no longer say
+  // what kind of session it was — activeSessions is gone by then. The
+  // destination needs it to know whether relaunching means `claude` or a bare
+  // shell, so it has to travel with the move rather than be looked up later.
+  const { calls } = harness({ sessions: { s1: { projectPath: '/proj', isPlainTerminal: true } } });
+  sessionMove.moveSession({
+    sessionId: 's1', targetWindowId: 20, serialized: '', sourceWindowId: 10,
+  });
+  const adopt = calls.find(c => c[2] === 'adopt-session');
+  assert.strictEqual(adopt[3].isPlainTerminal, true);
+});
+
+test('a tear-off carries isPlainTerminal too, on the construction payload', () => {
+  const { created } = harness({ sessions: { s1: { projectPath: '/proj', isPlainTerminal: true } } });
+  sessionMove.moveSession({
+    sessionId: 's1', targetWindowId: null, serialized: 'buf', sourceWindowId: 10,
+  });
+  assert.strictEqual(created[0].adopt.isPlainTerminal, true);
+});
+
+test('a Claude session reports isPlainTerminal false, not undefined', () => {
+  // The renderer treats the flag as a boolean; a missing value must read as
+  // "not a plain terminal" rather than as absent metadata.
+  const { calls } = harness();
+  sessionMove.moveSession({
+    sessionId: 's1', targetWindowId: 20, serialized: '', sourceWindowId: 10,
+  });
+  const adopt = calls.find(c => c[2] === 'adopt-session');
+  assert.strictEqual(adopt[3].isPlainTerminal, false);
+});
+
 test('dropping a session on the window it already lives in is a no-op', () => {
   const { calls } = harness();
   const res = sessionMove.moveSession({

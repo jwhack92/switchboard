@@ -179,6 +179,13 @@ function detectSessionTransitions(folder) {
         session.realSessionId = newId;
         // Update slug from new session
         if (signals.slug) session.sessionSlug = signals.slug;
+        // Remember where this session used to live. A re-key DELETES the old
+        // key, so anything still holding the old id — most importantly a
+        // tear-off whose adopt payload has not been delivered yet — would
+        // otherwise look it up, find nothing, and conclude the session had
+        // exited, when in fact it is alive under a new id and still billing.
+        // See the adopt delivery in main.js's createWindow.
+        session.priorIds = [...(session.priorIds || []), sessionId];
         activeSessions.delete(sessionId);
         activeSessions.set(newId, session);
         // Re-key MCP server to match new session ID
