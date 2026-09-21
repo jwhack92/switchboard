@@ -63,7 +63,12 @@ async function launchScheduleCreator(project) {
   refreshSidebar();
 
   const entry = createTerminalEntry(session);
-  // Resume the pre-seeded session
+  // Resume the pre-seeded session. createScheduleSession has already written
+  // the transcript, so say so: the seed carries no user message, which means it
+  // never lands in the session cache, and main.js would otherwise read "not
+  // cached" as "never got going" and launch --session-id against a file that
+  // exists — which the CLI rejects with "Session ID … is already in use".
+  options.hasTranscript = true;
   options.appendSystemPrompt = result.systemPrompt;
   const openResult = await window.api.openTerminal(result.sessionId, project.projectPath, false, options);
   if (!openResult.ok) {

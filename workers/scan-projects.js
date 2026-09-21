@@ -3,7 +3,8 @@ const fs = require('fs');
 const path = require('path');
 const { getFolderIndexMtimeMs } = require('../folder-index-state');
 const { deriveProjectPath } = require('../derive-project-path');
-const { readSessionFile } = require('../read-session-file');
+const { getHarness, DEFAULT_HARNESS } = require('../harnesses');
+const { readSessionFile } = getHarness(DEFAULT_HARNESS);
 
 const PROJECTS_DIR = workerData.projectsDir;
 

@@ -3,7 +3,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { readSessionFile } = require('../read-session-file');
+const { readSessionFile } = require('../harnesses/claude');
 const { scanLines, readHead } = require('../jsonl-scan');
 
 function tmpdir() {

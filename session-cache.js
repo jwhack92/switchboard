@@ -3,7 +3,8 @@ const fs = require('fs');
 const { Worker } = require('worker_threads');
 const { getFolderIndexMtimeMs } = require('./folder-index-state');
 const { deriveProjectPath } = require('./derive-project-path');
-const { readSessionFile } = require('./read-session-file');
+const { getHarness, DEFAULT_HARNESS } = require('./harnesses');
+const { readSessionFile } = getHarness(DEFAULT_HARNESS);
 const { encodeProjectPath } = require('./encode-project-path');
 
 /**
@@ -43,7 +44,8 @@ function init(ctx) {
   setName = ctx.db.setName;
 }
 
-// readSessionFile is imported from read-session-file.js (shared with worker)
+// readSessionFile comes from the Claude harness, which owns the transcript
+// format. workers/scan-projects.js takes it from the same place.
 
 /** Read one folder from filesystem by scanning .jsonl files directly */
 function readFolderFromFilesystem(folder) {

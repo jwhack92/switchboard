@@ -5,7 +5,7 @@ const os = require('os');
 const path = require('path');
 
 const { deriveProjectPath } = require('../derive-project-path');
-const { readSessionFile } = require('../read-session-file');
+const { readSessionFile } = require('../harnesses/claude');
 
 // Adding a project writes a one-line .jsonl "seed" into ~/.claude/projects/<folder>/.
 // It exists because the folder name is a lossy slug of the path, so that file is

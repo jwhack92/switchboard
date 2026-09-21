@@ -70,6 +70,21 @@ const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslS
 const { startScheduler } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 
+// Which CLI drives a session, and what its output and its launch flags mean.
+// This fork is Claude-only, so the one harness is resolved once here instead of
+// per session — see harnesses/index.js for the shape.
+//
+// Required AFTER the electron-reloader line above, deliberately. The reloader
+// freezes module.children at that instant, so a module required BEFORE it
+// relaunches the app on every save — and a relaunch kills every PTY and every
+// Claude session running in one. harnesses/ therefore sits on the same side as
+// db.js, session-cache.js, shell-profiles.js and pty-env.js: the cost is that
+// an edit under harnesses/ needs a manual restart before it is in effect (its
+// unit tests still run without the app), which is the trade this file already
+// makes for every other module of its kind.
+const { getHarness, DEFAULT_HARNESS } = require('./harnesses');
+const claudeHarness = getHarness(DEFAULT_HARNESS);
+
 
 // --- Auto-updater (only in packaged builds) ---
 let autoUpdater = null;
@@ -452,7 +467,7 @@ ipcMain.handle('add-project', (_event, projectPath) => {
     // of which directory the folder belongs to - cache_meta holds the same
     // mapping but is wiped by schema migrations.
     //
-    // It must NOT contain a user message. read-session-file.js takes the first
+    // It must NOT contain a user message. The Claude harness parser takes the first
     // user message as the session title, so a seed shaped like one appeared in
     // the sidebar as a session called "New project"; clicking it resumed that
     // id, so the real conversation was appended to the seed file and kept the
@@ -1245,8 +1260,19 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
   // can do nothing about ("No saved session found with ID ..."). Start it
   // fresh instead, which is what re-opening a session that never got going
   // means in practice.
+  //
+  // The cache stands in for "has a transcript", and for one caller that stand-in
+  // is wrong in the other direction: the schedule creator WRITES a transcript
+  // itself (schedule-ipc.js create-schedule-session) and then resumes into it.
+  // That seed holds one assistant message and no user message, so readSessionFile
+  // rejects it (`!st.summary` → null, harnesses/claude.js) and it is never
+  // cached — on every invocation, permanently. Without hasTranscript the launch
+  // therefore fell through to --session-id against a file that already exists,
+  // which the CLI refuses outright: "Session ID <id> is already in use."
+  // (verified against claude 2.x on this machine). A caller that knows it laid
+  // the transcript down says so, and --resume is used instead.
   let startFresh = isNew;
-  if (!isNew && !isPlainTerminal && !getCachedSession(sessionId)) {
+  if (!isNew && !isPlainTerminal && !sessionOptions?.hasTranscript && !getCachedSession(sessionId)) {
     log.info(`[open-terminal] ${sessionId} has no transcript; starting a new session instead of resuming`);
     startFresh = true;
   }
@@ -1338,50 +1364,21 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         }
       }, 300);
     } else {
-      // Build claude command, using array to prevent accidental shell injection
-      const claudeArgs = [];
-      if (sessionOptions?.forkFrom) {
-        claudeArgs.push('--resume', String(sessionOptions.forkFrom), '--fork-session');
-      } else if (startFresh) {
-        claudeArgs.push('--session-id', String(sessionId));
-      } else {
-        claudeArgs.push('--resume', String(sessionId));
-      }
+      // Argv is built by the harness and quoted here, so a value can never be
+      // spliced into the command line as shell syntax.
+      //
+      // BOTH flags are passed, because they answer different questions and this
+      // fork can disagree about them. Upstream has a single `isNew` and hands it
+      // `startFresh`; doing that here would silently re-enable --worktree on a
+      // recovery start (see startFresh above), and a second --worktree for a
+      // session that already made one breaks the launch.
+      //   startFresh — begin a NEW CONVERSATION: --session-id over --resume.
+      //   isNew      — created by THIS launch: the only gate on --worktree.
+      const claudeArgs = claudeHarness.buildLaunchArgs({
+        sessionId, isNew, startFresh, options: sessionOptions,
+      });
 
-      if (sessionOptions) {
-        if (sessionOptions.dangerouslySkipPermissions) {
-          claudeArgs.push('--dangerously-skip-permissions');
-        } else if (sessionOptions.permissionMode) {
-          claudeArgs.push('--permission-mode', String(sessionOptions.permissionMode));
-        }
-        // --worktree only applies when STARTING a session — it creates a fresh
-        // isolated git worktree. Resuming (isNew === false) must reuse the
-        // session's existing directory, so ignore the worktree option on resume
-        // regardless of which call site supplied it (sidebar click, schedule
-        // creator, fork, …). Otherwise a resume tries to spin up a new worktree
-        // and fails to attach.
-        if (isNew && sessionOptions.worktree) {
-          claudeArgs.push('--worktree');
-          if (sessionOptions.worktreeName) {
-            claudeArgs.push(String(sessionOptions.worktreeName));
-          }
-        }
-        if (sessionOptions.chrome) {
-          claudeArgs.push('--chrome');
-        }
-        if (sessionOptions.addDirs) {
-          const dirs = String(sessionOptions.addDirs).split(',').map(d => d.trim()).filter(Boolean);
-          for (const dir of dirs) {
-            claudeArgs.push('--add-dir', dir);
-          }
-        }
-      }
-
-      if (sessionOptions?.appendSystemPrompt) {
-        claudeArgs.push('--append-system-prompt', String(sessionOptions.appendSystemPrompt));
-      }
-
-      let claudeCmd = 'claude ' + quoteArgvForShell(shell, claudeArgs);
+      let claudeCmd = claudeHarness.binary + ' ' + quoteArgvForShell(shell, claudeArgs);
 
       // preLaunchCmd is raw shell by design (e.g. "aws-vault exec profile --") — block newlines only
       if (sessionOptions?.preLaunchCmd) {
@@ -1454,19 +1451,25 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         const payload = m[2].slice(0, 120);
         // Detect Claude CLI busy state from OSC 0 title (spinner chars = busy, ✳ = idle)
         if (code === '0') {
-          // Claude marks a working session by prefixing its terminal title with a
-          // spinner frame. Versions through 2.1.227 used braille; 2.1.228+ emit the
-          // four rotating half-circles U+25D0-U+25D3. Testing only the braille range
-          // meant this stopped matching at that release, silently: measured across
-          // this machine's logs, busy=true appeared 0 times in 10,730 title events,
-          // every one of them U+25D0 or U+25D1. Both ranges are accepted so an older
-          // CLI keeps working. (Upstream doctly/switchboard a8fe1e3 does the same.)
-          const firstChar = payload.charAt(0);
-          const charCode = firstChar ? firstChar.charCodeAt(0) : -1;  // empty title: no state
-          const isBusy = (charCode >= 0x2800 && charCode <= 0x28FF)   // braille, <= 2.1.227
-            || (charCode >= 0x25D0 && charCode <= 0x25D3);            // half-circles, 2.1.228+
-          const isIdle = firstChar === '\u2733'; // ✳
-          log.debug(`[OSC 0] session=${currentId} char=U+${charCode >= 0 ? charCode.toString(16).toUpperCase() : 'NONE'} busy=${isBusy} idle=${isIdle} wasBusy=${!!session._cliBusy}`);
+          // What a title means is the harness's business: Claude prefixes a
+          // working session's title with a spinner frame (braille through
+          // 2.1.227, the half-circles U+25D0-U+25D3 from 2.1.228) and an idle
+          // one with U+2733. See harnesses/claude.js parseTitleState.
+          const titleState = claudeHarness.parseTitleState(payload);
+          // Remembered for the OSC 9;4 handler below, which trusts the title
+          // over a progress report from any process in the PTY. Only a title
+          // that actually says something updates it — a plain title (null)
+          // leaves the last real reading standing rather than reading as idle.
+          if (titleState) session._titleBusy = titleState === 'busy';
+          const isBusy = titleState === 'busy';
+          const isIdle = titleState === 'idle';
+          // Keep the raw codepoint in the log. A glyph the harness does not
+          // recognise reads as state=none, which is indistinguishable from a
+          // plain title — and it was exactly this field that caught Claude
+          // 2.1.228 moving the spinner from braille to half-circles.
+          const firstChar = payload.trim()[0];
+          const cp = firstChar ? 'U+' + firstChar.codePointAt(0).toString(16).toUpperCase().padStart(4, '0') : 'none';
+          log.debug(`[OSC 0] session=${currentId} char=${cp} state=${titleState || 'none'} wasBusy=${!!session._cliBusy}`);
           if (isBusy && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;
@@ -1487,7 +1490,23 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         // OSC 9;4 progress: 4;0; = clear/done, 4;1;N = running at N%, 4;2;N = error, 4;3; = indeterminate
         if (payload.startsWith('4;')) {
           const level = payload.split(';')[1];
-          if (level === '0') continue; // 4;0 is also used for clearing, making it unreliable as an idle signal
+          // 4;0 is NOT treated as idle here, deliberately — upstream's
+          // progressBusyState() vetoes it with the terminal title, and that veto
+          // does not work for this fork.
+          //
+          // For a Claude session _titleBusy is true in exactly the states
+          // _cliBusy is, so the clear can never fire: the change is inert.
+          // For a PLAIN TERMINAL nothing ever sets _titleBusy, so the veto is
+          // permanently false and any child emitting OSC 9;4 progress — curl,
+          // npm, git clone — would go busy on 4;1 and idle on 4;0. That reaches
+          // setActivity() in the renderer, which calls
+          // window.speech.announceFinished(). The app would talk at you because
+          // a download finished.
+          //
+          // So: no benefit where it would be safe, an audible regression where
+          // it would fire. Revisit only if a title-busy signal exists for plain
+          // terminals, which would need something other than Claude's OSC 0.
+          if (level === '0') continue;
           log.debug(`[OSC 9;4] session=${currentId} level=${level} payload="${payload}" wasBusy=${!!session._cliBusy}`);
           if ((level === '1' || level === '2' || level === '3') && !session._cliBusy) {
             session._cliBusy = true;
