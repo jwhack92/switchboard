@@ -656,7 +656,13 @@ async function adoptSession({ sessionId, serialized, projectPath, exited, isPlai
       } else {
         try { entry.terminal.write(`\r\nError adopting session: ${result && result.error}\r\n`); } catch {}
       }
-      entry.closed = true;
+      // Do NOT mark the entry closed when the session is alive and we simply
+      // ran out of retries: `closed` is what makes a later click take the
+      // destroy-then-reopen path, which for an id main no longer holds is a
+      // spawn — the very thing this whole change exists to prevent. Only a
+      // session we actually believe is dead gets closed.
+      const stillLive = !!(result && result.rekeyedTo);
+      if (!stillLive) entry.closed = true;
       if (stillMounted) showSession(sessionId);
       loadProjects();
       return;

@@ -2321,7 +2321,11 @@ ipcMain.handle('get-session-meta', (_event, sessionId) => {
     projectPath: session.projectPath,
     isPlainTerminal: !!session.isPlainTerminal,
     exited: !!session.exited,
-    ownerWindowId: registry.ownerId(sessionId),
+    // liveId, not sessionId: rekeyOwner moves ownership to the new id and
+    // deletes the old one (window-registry.js), so asking under the stale id
+    // reports null for a session that is owned. Every other field in this
+    // reply already describes the live session; this one used to disagree.
+    ownerWindowId: registry.ownerId(liveId),
     mcpActive: !!session.mcpServer,
   };
 });
