@@ -198,6 +198,31 @@ const MAX_BUFFER_SIZE = 256 * 1024;
 // Active PTY sessions
 const activeSessions = new Map();
 
+/**
+ * Find a live session by an id that may be STALE.
+ *
+ * A fork or a plan-accept re-keys a live session and deletes its old key
+ * (session-transitions.js), so `activeSessions.get(oldId)` returning nothing
+ * does NOT mean the session died — it may be alive, still billing, under a new
+ * id. Anything that reads a missing key as death gets this wrong, and the
+ * expensive version of getting it wrong is telling a window its session ended
+ * and then resuming the old id alongside the process that is still running.
+ *
+ * Returns { id, session } with the id the session actually lives under now, or
+ * { id, session: null } when it really is gone. Direct hit first; the scan is
+ * over live sessions only, which is a handful.
+ */
+function resolveLiveSession(sessionId) {
+  const direct = activeSessions.get(sessionId);
+  if (direct) return { id: sessionId, session: direct };
+  for (const [liveId, session] of activeSessions) {
+    if (session.priorIds && session.priorIds.includes(sessionId)) {
+      return { id: liveId, session };
+    }
+  }
+  return { id: sessionId, session: null };
+}
+
 registry.init({ log });
 
 // Window geometry is persisted as a LIST, written by one debounced snapshotter
@@ -367,17 +392,7 @@ function createWindow(opts = {}) {
       // anything — otherwise the window is told "session exited during move"
       // about a session that is alive and still billing, and clicking that
       // corpse would resume the old id alongside the process still running.
-      let adoptId = opts.adopt.sessionId;
-      let adopted = activeSessions.get(adoptId);
-      if (!adopted) {
-        for (const [liveId, session] of activeSessions) {
-          if (session.priorIds && session.priorIds.includes(adoptId)) {
-            adoptId = liveId;
-            adopted = session;
-            break;
-          }
-        }
-      }
+      const { id: adoptId, session: adopted } = resolveLiveSession(opts.adopt.sessionId);
       win.webContents.send('adopt-session', {
         sessionId: adoptId,
         serialized: opts.adopt.serialized || '',
@@ -1798,9 +1813,16 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
   // public/session-drag.js:55). An earlier version of this guard keyed on
   // skipReplay and left exactly that path still falling through to pty.spawn.
   if (sessionOptions && sessionOptions.adopt) {
-    const adoptTarget = activeSessions.get(sessionId);
+    const { id: liveId, session: adoptTarget } = resolveLiveSession(sessionId);
     if (!adoptTarget || adoptTarget.exited) {
       return { ok: false, error: 'session ended before it could be adopted', exited: true };
+    }
+    // Alive, but re-keyed since the adopt payload was built. Attaching under
+    // the id the caller asked for would bind buffers and ownership to a key
+    // nothing else uses, so hand back the new id and let the renderer adopt
+    // that instead. Refusing outright would paint a corpse for a live session.
+    if (liveId !== sessionId) {
+      return { ok: false, error: 'session was re-keyed during the move', rekeyedTo: liveId };
     }
   }
 
@@ -2286,10 +2308,16 @@ ipcMain.handle('new-window', () => {
 // Metadata a destination window needs to build a view for a session it may
 // never have had in its own sidebar.
 ipcMain.handle('get-session-meta', (_event, sessionId) => {
-  const session = activeSessions.get(sessionId);
+  // Follow a re-key rather than reporting null: a caller holding an id from
+  // before a fork or plan-accept is asking about a session that is alive under
+  // a new id, and answering "no such session" makes it paint a corpse for a
+  // process that is still running. `sessionId` in the reply is the id the
+  // session lives under NOW, which may differ from the one asked about.
+  const { id: liveId, session } = resolveLiveSession(sessionId);
   if (!session) return null;
   return {
-    sessionId,
+    sessionId: liveId,
+    rekeyedFrom: liveId === sessionId ? undefined : sessionId,
     projectPath: session.projectPath,
     isPlainTerminal: !!session.isPlainTerminal,
     exited: !!session.exited,

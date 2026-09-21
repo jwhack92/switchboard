@@ -556,14 +556,14 @@ function showAdoptedCorpse(sessionId, serialized, projectPath, isPlainTerminal) 
 // live xterm cannot cross BrowserWindows, so we build a fresh one and paint it
 // from the serialized buffer the source window handed over, then attach with
 // skipReplay so main does not also replay its 256KB tail on top.
-window.api.onAdoptSession(async ({ sessionId, serialized, projectPath, exited, isPlainTerminal }) => {
+async function adoptSession({ sessionId, serialized, projectPath, exited, isPlainTerminal }, depth = 0) {
   try {
     // The session may not be in this window's sidebar at all, so resolve its
     // metadata from main rather than from the local sessionMap.
     let session = sessionMap.get(sessionId);
     if (!session) {
       const meta = await window.api.getSessionMeta(sessionId);
-      // Null means main has already forgotten it - it exited during the move.
+      // Null means main has already forgotten it — it exited during the move.
       // Show the history rather than returning: the serialized scrollback is
       // real output the user just dragged, and dropping it silently leaves an
       // empty window with no explanation of where their session went.
@@ -571,6 +571,11 @@ window.api.onAdoptSession(async ({ sessionId, serialized, projectPath, exited, i
         showAdoptedCorpse(sessionId, serialized, projectPath, isPlainTerminal);
         return;
       }
+      // main answers with the id the session lives under NOW. A fork or
+      // plan-accept landing mid-move re-keys it, and everything after this
+      // point — the terminal entry, the attach, the ownership — has to use
+      // the new id or it binds to a key nothing else uses.
+      if (meta.rekeyedFrom) sessionId = meta.sessionId;
       session = {
         sessionId,
         projectPath: meta.projectPath || projectPath,
@@ -611,21 +616,43 @@ window.api.onAdoptSession(async ({ sessionId, serialized, projectPath, exited, i
     const result = await window.api.openTerminal(
       sessionId, session.projectPath, false, { skipReplay: !!serialized, adopt: true });
     if (!result || !result.ok) {
+      // Alive, but re-keyed between our liveness check and this call (a fork
+      // or plan-accept landed in the gap). Adopt the id it actually lives
+      // under now instead of declaring a running session dead. Depth-capped
+      // because this recurses, and a re-key chain should never be long.
+      if (result && result.rekeyedTo && result.rekeyedTo !== sessionId && depth < 3) {
+        releaseSessionView(sessionId);
+        await adoptSession({
+          sessionId: result.rekeyedTo, serialized, projectPath, isPlainTerminal,
+        }, depth + 1);
+        return;
+      }
+
       // result.exited is main's spawn guard firing: the session ended between
-      // the check above and this call. That is an ordinary ending, not a
-      // failure, so it gets the same banner every other exit gets.
-      // The 'process-exited' broadcast for this same death was sent before
-      // this reply and has already been handled. For an INTENTIONAL exit that
-      // means destroySession has disposed the terminal and dropped it from
-      // openSessions (terminal-manager.js) — writing to it is a no-op, and
-      // calling showSession would mount nothing while hiding the placeholder,
-      // leaving a blank pane. For an unintentional exit that handler has
-      // already written its own `session exited (code N)` banner, so adding
-      // ours would print two. Either way, if it got here first it has done
-      // the right thing and there is nothing left for us to do.
+      // the check above and this call. The 'process-exited' broadcast for that
+      // same death was sent BEFORE this reply, so its handler has usually run
+      // already, and what it did depends on how the session ended:
+      //
+      //   intentional exit  -> destroySession disposed the terminal and
+      //                        dropped it from openSessions. Our entry is
+      //                        gone, so rebuild it as a corpse; otherwise the
+      //                        drag lands on a bare placeholder that never
+      //                        says what happened to the session.
+      //   unintentional     -> the entry survives and ALREADY carries its own
+      //                        `session exited (code N)` banner, which is
+      //                        strictly more informative than ours. Adding
+      //                        ADOPT_EXIT_BANNER on top just prints two.
+      //
+      // entry.closed is the signal: onProcessExited sets it on this same
+      // object before writing its banner.
       const stillMounted = openSessions.has(sessionId);
       if (result && result.exited) {
-        if (stillMounted) { try { entry.terminal.write(ADOPT_EXIT_BANNER); } catch {} }
+        if (!stillMounted) {
+          showAdoptedCorpse(sessionId, serialized, session.projectPath,
+            isPlainTerminal || session.type === 'terminal');
+          return;
+        }
+        if (!entry.closed) { try { entry.terminal.write(ADOPT_EXIT_BANNER); } catch {} }
       } else {
         try { entry.terminal.write(`\r\nError adopting session: ${result && result.error}\r\n`); } catch {}
       }
@@ -644,7 +671,8 @@ window.api.onAdoptSession(async ({ sessionId, serialized, projectPath, exited, i
   } catch (e) {
     console.error('[tearoff] adopt failed', e);
   }
-});
+}
+window.api.onAdoptSession(adoptSession);
 
 // Another window has taken this session. Drop our view WITHOUT close-terminal —
 // the new owner is already attached, and detaching would pull it out from under

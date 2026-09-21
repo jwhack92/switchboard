@@ -43,6 +43,28 @@ function init(ctx) {
   getSessionMeta = ctx.getSessionMeta;
 }
 
+/**
+ * Tell the window that was DISPLAYING the session to drop its view, when that
+ * is not the window the drag came from.
+ *
+ * The drag handle is on every sidebar row and canDrag needs only a live pty
+ * (public/session-drag.js:55), so the window a session is dragged FROM is not
+ * necessarily the window showing it: from window A you can drag a session that
+ * window B is displaying. Only `sourceWindowId` used to be released, so B kept
+ * a mounted xterm for a session it no longer owns — output routes to the new
+ * owner, and B's keystrokes and resizes are dropped by the owner guards, so
+ * the view looks live and is frozen. Its row does flip to `owned-elsewhere`,
+ * but clicking that short-circuits on the still-present entry and only
+ * re-shows the dead view, so nothing but another drag or a reload recovers it.
+ *
+ * setOwner returns the displaced owner for exactly this purpose
+ * (window-registry.js); both call sites used to discard it.
+ */
+function releaseDisplacedOwner(prevOwner, sourceWindowId, sessionId) {
+  if (prevOwner == null || prevOwner === sourceWindowId) return;
+  registry.sendTo(prevOwner, 'release-session', sessionId);
+}
+
 // --- the move itself -----------------------------------------------------
 
 /**
@@ -76,15 +98,16 @@ function moveSession({ sessionId, targetWindowId, serialized, sourceWindowId, po
     });
     if (!target) return { ok: false, error: 'could not create a window' };
     // Ownership flips now; the adopt payload is delivered on did-finish-load.
-    registry.setOwner(sessionId, target.id);
+    const prevOwner = registry.setOwner(sessionId, target.id);
     registry.sendTo(sourceWindowId, 'release-session', sessionId);
+    releaseDisplacedOwner(prevOwner, sourceWindowId, sessionId);
     log.info(`[move] ${sessionId}: window ${sourceWindowId} → new window ${target.id}`);
     return { ok: true, targetWindowId: target.id, created: true };
   }
 
   // Existing window. Flip ownership before telling anyone, so the source's
   // release cannot detach a session the target is about to display.
-  registry.setOwner(sessionId, target.id);
+  const prevOwner = registry.setOwner(sessionId, target.id);
   registry.sendTo(target.id, 'adopt-session', {
     sessionId,
     serialized: serialized || '',
@@ -92,6 +115,7 @@ function moveSession({ sessionId, targetWindowId, serialized, sourceWindowId, po
     isPlainTerminal: !!meta.isPlainTerminal,
   });
   registry.sendTo(sourceWindowId, 'release-session', sessionId);
+  releaseDisplacedOwner(prevOwner, sourceWindowId, sessionId);
   if (target.isMinimized()) target.restore();
   target.focus();
   log.info(`[move] ${sessionId}: window ${sourceWindowId} → window ${target.id}`);

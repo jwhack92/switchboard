@@ -180,6 +180,42 @@ test('tearing off to a new window hands the buffer over at construction', () => 
   assert.strictEqual(release[1], 10);
 });
 
+test('a drag from a THIRD window releases the window that was displaying it', () => {
+  // The drag handle is on every row and canDrag needs only a live pty, so the
+  // window a session is dragged FROM need not be the one showing it. If only
+  // the source is released, the displaying window keeps a mounted xterm whose
+  // input is silently dropped — a live-looking, frozen view.
+  const { calls, owners } = harness({ windows: [10, 20, 30] });
+  owners.set('s1', 20);                       // window 20 is displaying it
+  sessionMove.moveSession({
+    sessionId: 's1', targetWindowId: 30, serialized: '', sourceWindowId: 10,
+  });
+  const released = calls.filter(c => c[2] === 'release-session').map(c => c[1]);
+  assert.ok(released.includes(10), 'the source window is told to release');
+  assert.ok(released.includes(20), 'the DISPLAYING window is told to release too');
+  assert.ok(!released.includes(30), 'the new owner is never told to release');
+});
+
+test('a drag from the window that owns it releases that window only once', () => {
+  const { calls, owners } = harness();
+  owners.set('s1', 10);
+  sessionMove.moveSession({
+    sessionId: 's1', targetWindowId: 20, serialized: '', sourceWindowId: 10,
+  });
+  const released = calls.filter(c => c[2] === 'release-session' && c[1] === 10);
+  assert.strictEqual(released.length, 1, 'no duplicate release for the source');
+});
+
+test('a tear-off from a third window also releases the displaying window', () => {
+  const { calls, owners } = harness({ windows: [10, 20] });
+  owners.set('s1', 20);
+  sessionMove.moveSession({
+    sessionId: 's1', targetWindowId: null, serialized: '', sourceWindowId: 10,
+  });
+  const released = calls.filter(c => c[2] === 'release-session').map(c => c[1]);
+  assert.ok(released.includes(10) && released.includes(20));
+});
+
 test('a cancelled drag moves nothing', () => {
   harness();
   assert.strictEqual(sessionMove.isDragging(), false);
