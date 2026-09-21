@@ -8,8 +8,8 @@
   "scripts": {
     "start": "npm run bundle:codemirror && electron .",
     "test": "node --test",
-    "electron": "electron .",
-    "electron-dev": "SWITCHBOARD_DATA_DIR=\"$HOME/.switchboard-dev\" electron .",
+    "electron": "npm run bundle:codemirror && electron .",
+    "electron-dev": "npm run bundle:codemirror && SWITCHBOARD_DATA_DIR=\"$HOME/.switchboard-dev\" electron .",
     "bundle:codemirror": "esbuild public/codemirror-setup.js --bundle --outfile=public/codemirror-bundle.js --format=iife --platform=browser --minify",
     "generate-icons": "node scripts/generate-icons.js && node scripts/generate-dmg-background.js",
     "build": "npm run bundle:codemirror && electron-builder",
