@@ -1137,6 +1137,7 @@ ipcMain.handle('get-active-terminals', () => {
 ipcMain.handle('stop-session', (_event, sessionId) => {
   const session = activeSessions.get(sessionId);
   if (!session || session.exited) return { ok: false, error: 'not running' };
+  session.stopRequested = true;
   session.pty.kill();
   return { ok: true };
 });
@@ -1532,7 +1533,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
     registry.sendToOwner(currentId, 'terminal-data', currentId, data);
   });
 
-  ptyProcess.onExit(({ exitCode }) => {
+  ptyProcess.onExit(({ exitCode, signal }) => {
     session.exited = true;
     // Clean up MCP server
     const mcpId = session.realSessionId || sessionId;
@@ -1540,15 +1541,20 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
     session.mcpServer = null;
 
     const realId = session.realSessionId || sessionId;
+    // The renderer needs to tell "the user ended this" from "this died" to
+    // decide whether to tear the terminal down or leave it up with a banner.
+    // A signal kill reports exitCode 0, so pass the signal and the
+    // stop-session flag along rather than making it guess from the code.
+    const stopRequested = !!session.stopRequested;
     // The owning window needs to render the exit banner. Every OTHER window
     // needs it too, because they all show this session as "running" in their
     // sidebar (activePtyIds is app-wide by design), so they must stop.
-    registry.broadcast('process-exited', realId, exitCode);
+    registry.broadcast('process-exited', realId, exitCode, signal, stopRequested);
     // If a fork/plan-accept transition re-keyed this session under realId
     // but the PTY exited before transition detection ran, also notify the
     // renderer for the original sessionId so it doesn't stay stuck as "Running".
     if (realId !== sessionId && activeSessions.has(sessionId)) {
-      registry.broadcast('process-exited', sessionId, exitCode);
+      registry.broadcast('process-exited', sessionId, exitCode, signal, stopRequested);
     }
     activeSessions.delete(realId);
     // Clean up the original key too in case transition detection hasn't run yet
