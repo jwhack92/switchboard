@@ -342,11 +342,26 @@ function createWindow(opts = {}) {
     // A torn-off window is told what to adopt only once its renderer exists.
     // Ownership was already flipped to this window by session-move, so the
     // source window's release cannot detach it from under us.
+    //
+    // Liveness is re-checked HERE, not at tear-off time, because this send is
+    // the far side of a real gap: session-move flips ownership synchronously,
+    // but did-finish-load lands whole window-creation later. A session that
+    // exits inside that gap broadcasts 'process-exited' to every window that
+    // EXISTS — and this one does not yet — so the adopting renderer is the one
+    // participant that never hears it. Without this check it then adopts a
+    // session main has already forgotten (activeSessions.delete in onExit),
+    // which no longer takes the reattach branch in 'open-terminal' and so
+    // falls through to the spawn path: a brand-new billed process the user
+    // never asked for, in a window they believe is just showing a moved
+    // session. Sending exited:true keeps the torn-off scrollback visible
+    // behind the normal exit banner instead.
     if (opts.adopt && opts.adopt.sessionId) {
+      const adopted = activeSessions.get(opts.adopt.sessionId);
       win.webContents.send('adopt-session', {
         sessionId: opts.adopt.sessionId,
         serialized: opts.adopt.serialized || '',
         projectPath: opts.adopt.projectPath,
+        exited: !adopted || !!adopted.exited,
       });
       opts.adopt = null;
     }
@@ -1703,6 +1718,19 @@ ipcMain.handle('archive-session', (_event, sessionId, archived) => {
 ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, sessionOptions) => {
   const win = registry.windowOf(event);
   if (!win) return { ok: false, error: 'no window' };
+
+  // An adopt that lost its session must never become a spawn. skipReplay is
+  // set only by a tear-off, which means "attach to something that already
+  // exists" — if it no longer exists, launching a replacement is never the
+  // right answer, and silently starting a billed process is the worst of the
+  // wrong answers. This is the authoritative guard: the delivery-time check in
+  // createWindow closes the common case, but it cannot close the gap between
+  // that check and this call, and only main knows the truth here.
+  const adoptTarget = sessionOptions && sessionOptions.skipReplay
+    ? activeSessions.get(sessionId) : null;
+  if (sessionOptions && sessionOptions.skipReplay && (!adoptTarget || adoptTarget.exited)) {
+    return { ok: false, error: 'session ended before it could be adopted', exited: true };
+  }
 
   // Reattach to existing session
   if (activeSessions.has(sessionId)) {

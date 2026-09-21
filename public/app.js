@@ -505,18 +505,64 @@ window.api.onProcessExited((sessionId, exitCode, signal, userStopped) => {
 
 // ── Session tear-off (see session-drag.js for the gesture) ──────────────
 
+/** The banner an adopt shows when the session it was carrying is already gone. */
+const ADOPT_EXIT_BANNER = '\r\n\x1b[33m── session exited during move ──\x1b[0m\r\n';
+
+/**
+ * Mount a session that died while it was being dragged between windows.
+ *
+ * The move is already irreversible by the time we learn this: the source
+ * window has been told to release, so its terminal is gone, and the only copy
+ * of the scrollback left anywhere is the serialized blob in this payload. So
+ * this paints that history into a fresh, closed terminal rather than throwing
+ * it away - the user dragged a session and must land on its output, not on an
+ * empty window. Nothing here attaches: there is no PTY left to attach to, and
+ * asking for one would spawn a replacement.
+ */
+function showAdoptedCorpse(sessionId, serialized, projectPath) {
+  let session = sessionMap.get(sessionId);
+  if (!session) {
+    session = {
+      sessionId,
+      projectPath: projectPath || '',
+      modified: new Date().toISOString(),
+      summary: '',
+    };
+    sessionMap.set(sessionId, session);
+  }
+  if (openSessions.has(sessionId)) releaseSessionView(sessionId);
+  const entry = createTerminalEntry(session);
+  try {
+    if (serialized) entry.terminal.write(serialized);
+    entry.terminal.write(ADOPT_EXIT_BANNER);
+  } catch (e) {
+    console.warn('[tearoff] corpse replay failed', e);
+  }
+  entry.closed = true;
+  sessionOwners.delete(sessionId);
+  showSession(sessionId);
+  loadProjects();
+}
+
 // This window is taking over a session. The PTY never moved — only the view. A
 // live xterm cannot cross BrowserWindows, so we build a fresh one and paint it
 // from the serialized buffer the source window handed over, then attach with
 // skipReplay so main does not also replay its 256KB tail on top.
-window.api.onAdoptSession(async ({ sessionId, serialized, projectPath }) => {
+window.api.onAdoptSession(async ({ sessionId, serialized, projectPath, exited }) => {
   try {
     // The session may not be in this window's sidebar at all, so resolve its
     // metadata from main rather than from the local sessionMap.
     let session = sessionMap.get(sessionId);
     if (!session) {
       const meta = await window.api.getSessionMeta(sessionId);
-      if (!meta) return;
+      // Null means main has already forgotten it - it exited during the move.
+      // Show the history rather than returning: the serialized scrollback is
+      // real output the user just dragged, and dropping it silently leaves an
+      // empty window with no explanation of where their session went.
+      if (!meta) {
+        showAdoptedCorpse(sessionId, serialized, projectPath);
+        return;
+      }
       session = {
         sessionId,
         projectPath: meta.projectPath || projectPath,
@@ -529,6 +575,14 @@ window.api.onAdoptSession(async ({ sessionId, serialized, projectPath }) => {
 
     if (openSessions.has(sessionId)) releaseSessionView(sessionId);
 
+    // Main told us it died in the tear-off gap. Show the history behind the
+    // usual banner and do NOT call openTerminal - for a session main has
+    // already dropped, that call is a spawn, not an attach.
+    if (exited) {
+      showAdoptedCorpse(sessionId, serialized, session.projectPath);
+      return;
+    }
+
     const entry = createTerminalEntry(session);
     if (serialized) {
       // Written before attaching so the live stream lands after the history.
@@ -538,8 +592,17 @@ window.api.onAdoptSession(async ({ sessionId, serialized, projectPath }) => {
     const result = await window.api.openTerminal(
       sessionId, session.projectPath, false, { skipReplay: !!serialized });
     if (!result || !result.ok) {
-      entry.terminal.write(`\r\nError adopting session: ${result && result.error}\r\n`);
+      // result.exited is main's spawn guard firing: the session ended between
+      // the check above and this call. That is an ordinary ending, not a
+      // failure, so it gets the same banner every other exit gets.
+      if (result && result.exited) {
+        try { entry.terminal.write(ADOPT_EXIT_BANNER); } catch {}
+      } else {
+        entry.terminal.write(`\r\nError adopting session: ${result && result.error}\r\n`);
+      }
       entry.closed = true;
+      showSession(sessionId);
+      loadProjects();
       return;
     }
     if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
