@@ -67,7 +67,14 @@ const cleanPtyEnv = buildPtyEnv(process.env);
 // Shell profiles → shell-profiles.js
 const { resolveEffectiveSettings } = require('./resolve-effective-settings');
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgvForShell } = require('./shell-profiles');
-const { startScheduler } = require('./schedule-runner');
+// The old file-based cron loop (`startScheduler`) is GONE — projects.js owns
+// scheduling now, and two tickers would each fire every schedule-*.md task.
+// What survives is `scanSchedules`, the reader for those files: it feeds
+// projects.importLegacySchedules once per launch, which turns each file into
+// a folder schedule in the DB. schedule-ipc.js also survives (see its init
+// below) — it has no timer of its own, only the user-pressed "run now" and
+// the /create-schedule slash command, so it cannot double-fire anything.
+const { scanSchedules } = require('./schedule-runner');
 const { encodeProjectPath } = require('./encode-project-path');
 
 // Which CLI drives a session, and what its output and its launch flags mean.
@@ -82,7 +89,7 @@ const { encodeProjectPath } = require('./encode-project-path');
 // an edit under harnesses/ needs a manual restart before it is in effect (its
 // unit tests still run without the app), which is the trade this file already
 // makes for every other module of its kind.
-const { getHarness, DEFAULT_HARNESS } = require('./harnesses');
+const { getHarness, DEFAULT_HARNESS, allHarnesses } = require('./harnesses');
 const claudeHarness = getHarness(DEFAULT_HARNESS);
 
 // Ported-feature modules, all deliberately on THIS side of the reloader line
@@ -157,16 +164,29 @@ if (app.isPackaged || process.env.FORCE_UPDATER) {
     registry.broadcast('updater-event', 'error', { message: err?.message || String(err) });
   });
 }
+// The module object as well as the names: the project handlers below reach
+// for db functions that are only needed in one place (getTrack,
+// setSessionAssignment, rekeyScheduleSession), and projects.init wants the
+// whole module.
+const dbModule = require('./db');
 const {
   getMeta, getAllMeta, toggleStar, setName, setArchived,
   isCachePopulated, getAllCached, getCachedByFolder, getCachedFolder, getCachedSession, upsertCachedSessions,
   deleteCachedSession, deleteCachedFolder,
   getFolderMeta, getAllFolderMeta, setFolderMeta,
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
-  searchByType, isSearchIndexPopulated, searchFtsRecreated,
+  searchByType, searchSessionIds, isSearchIndexPopulated, searchFtsRecreated,
   getSetting, setSetting, mergeSetting, deleteSetting,
+  // A session whose id changes (fork / plan-accept) has to take its filing
+  // with it. Upstream also destructures `moveSessionAssignment`, for the
+  // temp-id launch of a harness that only learns its id from its
+  // transcript; this fork is Claude-only and passes --session-id, so the
+  // id is real from the first byte and that path does not exist here.
+  // These two and dbModule.rekeyScheduleSession are handed to
+  // session-transitions.js, which owns the one rekey point we do have.
+  copySessionAssignment, rekeyPlanLinks,
   closeDb,
-} = require('./db');
+} = dbModule;
 
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const PLANS_DIR = path.join(os.homedir(), '.claude', 'plans');
@@ -456,6 +476,43 @@ sessionCache.init({
 const { readSessionFile, readFolderFromFilesystem, refreshFolder, reconcileCacheFromFilesystem,
         buildProjectsFromCache, notifyRendererProjectsChanged, sendStatus, populateCacheViaWorker } = sessionCache;
 
+// --- Projects (a piece of work with a folder on disk) ---
+//
+// Deliberately required HERE, below the electron-reloader line at the top of
+// this file, for the same reason db.js / harnesses/ / task-manager are: the
+// reloader froze module.children at that point, so anything required ABOVE it
+// relaunches the whole app when it is saved — and a relaunch kills every PTY,
+// every running Claude session and every task. projects.js is exactly the
+// wrong module to have that property: it holds fs.watch handles for each
+// project's plan tracker AND the in-memory half of the schedule double-fire
+// guard (projects.js `firedSlots` / `lastTickMs`), which a relaunch would
+// silently empty mid-hour. The cost is the usual one this file already pays
+// everywhere else: editing projects.js needs a manual restart to take effect.
+const projects = require('./projects');
+projects.init({
+  db: dbModule,
+  log,
+  buildProjectsFromCache,
+  notifyRendererProjectsChanged,
+  // The whole of decision D5 (Claude only) inside projects.js is this one
+  // function. It must come from the harness registry, never `() => true`:
+  // that default is for tests, and here it would let a track name any CLI id
+  // and then fail at launch with nothing to run it.
+  isHarnessId: (id) => allHarnesses().some(h => h.id === id),
+  plansDir: PLANS_DIR,
+});
+// An upgrade can change the working rules in the brief. Bring every project's
+// managed blocks up to date once at startup; unchanged files are not written.
+projects.syncAllProjectBriefs().catch(err => log.error('[projects] brief sync failed:', err?.message || String(err)));
+// Watch every project's plan-tracker.md and todos.md so a tick made by a
+// session is credited to it and the page refreshes. `project-plan-changed` is
+// state every window renders, so it broadcasts — upstream sends it at its
+// single mainWindow, which this fork does not have.
+projects.initPlanWatch({
+  activeSessions,
+  send: (channel, ...args) => registry.broadcast(channel, ...args),
+});
+
 // --- IPC: browse-folder ---
 ipcMain.handle('browse-folder', async (event) => {
   const global = getSetting('global') || {};
@@ -558,6 +615,131 @@ ipcMain.handle('remove-project', (_event, projectPath) => {
 
     notifyRendererProjectsChanged();
     return { ok: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// --- IPC: projects ---
+// Every mutating handler notifies the renderer itself (projects.js calls
+// notifyRendererProjectsChanged, which broadcasts), so both the Sessions and
+// the Projects tab refresh from one event.
+//
+// `guarded` is not decoration: several of these THROW rather than returning
+// { error } -- folderGitStatus, projectGitInfo and projectGitDiff all throw on
+// a missing project -- and an uncaught throw inside an ipcMain.handle rejects
+// the renderer's promise with a stringified stack, which is what the project
+// page would then render in place of the tab.
+function guarded(fn) {
+  return async (_event, ...args) => {
+    try { return await fn(...args); } catch (err) {
+      log.error('[projects]', err);
+      return { error: err.message };
+    }
+  };
+}
+ipcMain.handle('get-project-tree', guarded((showArchived) => {
+  // Mirrors get-projects: until the cache is populated there is nothing to
+  // file, and the renderer is told via projects-changed once there is.
+  if (!isCachePopulated() || !isSearchIndexPopulated()) return { projects: [] };
+  return projects.buildProjectTree(!!showArchived);
+}));
+ipcMain.handle('create-project', guarded((spec) => projects.createProject(spec || {})));
+ipcMain.handle('update-project', guarded((id, patch) => projects.updateProject(id, patch || {})));
+ipcMain.handle('delete-project', guarded((id) => projects.deleteProject(id)));
+ipcMain.handle('attach-project-folder', guarded((id, spec) => projects.attachFolder(id, spec || {})));
+ipcMain.handle('detach-project-folder', guarded((id, folderPath, opts) => projects.detachFolder(id, folderPath, opts || {})));
+ipcMain.handle('set-session-assignment', guarded((sessionId, projectId, trackId) => {
+  const cleanProjectId = projectId || null;
+  const cleanTrackId = trackId || null;
+  const result = projects.assignSession(sessionId, cleanProjectId, cleanTrackId);
+  // Raw terminals have no transcript to rehydrate this relationship from.
+  // Keep the live PTY metadata aligned with the durable row so a renderer
+  // reload cannot put a moved terminal back in its old location.
+  if (!result?.error) {
+    const session = activeSessions.get(sessionId);
+    if (session?.isPlainTerminal) {
+      session.projectId = cleanProjectId;
+      session.trackId = cleanProjectId ? cleanTrackId : null;
+    }
+  }
+  return result;
+}));
+ipcMain.handle('create-track', guarded((projectId, spec) => projects.createTrack(projectId, spec || {})));
+ipcMain.handle('update-track', guarded((id, patch) => projects.updateTrack(id, patch || {})));
+ipcMain.handle('delete-track', guarded((id, options = {}) => {
+  const track = dbModule.getTrack(id);
+  if (!track) return { error: 'Track not found' };
+  const archiveSessions = options.archiveSessions === true;
+  // Raw terminals have no transcript row, but participate in track deletion.
+  for (const [sid, session] of activeSessions) {
+    if (session.trackId === id && session.isPlainTerminal) dbModule.setSessionAssignment(sid, track.projectId, id);
+  }
+  const result = projects.deleteTrack(id, { archiveSessions });
+  if (result.error) return result;
+  const affected = new Set(result.sessionIds);
+  for (const [sid, session] of activeSessions) {
+    if (session.trackId !== id && !affected.has(sid)) continue;
+    session.trackId = null;
+    session.formerTrackName = track.name;
+    if (archiveSessions && !session.exited) {
+      session.stopRequested = true;
+      try { session.pty.kill(); } catch (error) { log.error('[delete-track] stop failed', error); }
+    }
+  }
+  return result;
+}));
+ipcMain.handle('get-projects-root', guarded(() => projects.projectsRoot()));
+ipcMain.handle('get-project-git-status', guarded((id, opts) => projects.folderGitStatus(id, opts || {})));
+ipcMain.handle('get-project-git-info', guarded((id) => projects.projectGitInfo(id)));
+ipcMain.handle('get-project-git-diff', guarded((id, folderPath, filePath) => projects.projectGitDiff(id, folderPath, filePath)));
+ipcMain.handle('get-folder-git-status', guarded((folderPath) => projects.folderGitInfo(String(folderPath || ''))));
+// The .env files a folder has, and the ones the dialog ticks by default,
+// so a new worktree can be offered its repository's local environment.
+ipcMain.handle('list-env-files', guarded((folderPath) => ({
+  ok: true,
+  files: projects.listEnvFiles(String(folderPath || '')),
+  defaults: projects.defaultEnvSelection(String(folderPath || '')),
+})));
+ipcMain.handle('save-project-brief', guarded((id, content) => projects.saveBrief(id, content)));
+ipcMain.handle('create-project-file', guarded((id, name, content) => projects.createProjectFile(id, name, content)));
+ipcMain.handle('add-project-files', guarded((id, sourcePaths) => projects.addProjectFiles(id, sourcePaths)));
+ipcMain.handle('list-recent-project-files', guarded((id) => projects.listRecentProjectFiles(id)));
+ipcMain.handle('get-project-plan', guarded((id) => projects.readProjectPlan(id)));
+ipcMain.handle('set-plan-item', guarded((id, kind, line, done) => projects.setPlanItem(id, kind, line, done)));
+ipcMain.handle('append-plan-item', guarded((id, kind, text) => projects.appendPlanItem(id, kind, text)));
+ipcMain.handle('edit-plan-item', guarded((id, kind, line, text) => projects.editPlanItem(id, kind, line, text)));
+ipcMain.handle('adopt-plan', guarded((id, filename, opts) => projects.adoptPlan(id, filename, opts || {})));
+ipcMain.handle('list-templates', guarded(() => projects.listTemplates()));
+
+// --- IPC: scheduled tasks ---
+// The rows only; the tick that fires them is startScheduleTicker, further down.
+ipcMain.handle('list-schedules', guarded(() => projects.listSchedules()));
+ipcMain.handle('create-schedule', guarded((spec) => projects.createSchedule(spec || {})));
+ipcMain.handle('update-schedule', guarded((id, patch) => projects.updateSchedule(id, patch || {})));
+ipcMain.handle('delete-schedule', guarded((id) => projects.deleteSchedule(id)));
+ipcMain.handle('resolve-schedule-launch', guarded((id) => projects.resolveScheduleLaunch(id)));
+// Takes a DIALOG SPEC (what the user has picked so far), not a saved row.
+ipcMain.handle('get-schedule-context', guarded((spec) => projects.resolveScheduleContext(spec || {})));
+
+// --- IPC: harnesses --- (which CLIs this build can drive)
+// `enabled` is always true here: upstream reads a global `disabledHarnesses`
+// setting, which this fork does not have because it registers exactly one
+// harness (D5) and switching that one off would leave nothing to run.
+// public/schedules.js treats a row without `enabled` as on, so the shape is
+// upstream's either way.
+ipcMain.handle('get-harnesses', () => allHarnesses()
+  .filter(h => h.buildLaunchArgs)
+  .map(h => ({ id: h.id, label: h.label, enabled: true })));
+
+// Reveal a folder in the OS file manager. Only existing directories, so a
+// renderer value can never launch a file.
+ipcMain.handle('open-path', async (_event, target) => {
+  try {
+    const resolved = path.resolve(String(target || ''));
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return { error: 'Not a folder' };
+    const err = await shell.openPath(resolved);
+    return err ? { error: err } : { ok: true };
   } catch (err) {
     return { error: err.message };
   }
@@ -1201,6 +1383,16 @@ ipcMain.handle('save-memory', (_event, filePath, content) => {
 });
 
 // --- IPC: search ---
+// Project-scoped search: which of THESE session ids match. A separate
+// channel rather than a 5th parameter on `search`, deliberately -- upstream
+// grew `searchByType(type, query, limit, titleOnly, sessionIds)` but no
+// caller on either side passes the 5th argument, so the unscoped path below
+// stays byte-for-byte what it was.
+ipcMain.handle('search-session-ids', (_event, query, sessionIds) => {
+  if (typeof query !== 'string' || !Array.isArray(sessionIds) || sessionIds.some(id => typeof id !== 'string')) return [];
+  return searchSessionIds(query, sessionIds);
+});
+
 ipcMain.handle('search', (_event, type, query, titleOnly) => {
   return searchByType(type, query, 50, !!titleOnly);
 });
@@ -1275,8 +1467,6 @@ speechIpc.init({
   driverStore,
   custody,
 });
-// Hoisted so the quit handler can stop the cron loop before reaping.
-let stopScheduler = null;
 
 const SETTING_DEFAULTS = {
   // Spoken output. speakReplies: 'off' | 'focused' — whether the focused
@@ -1355,9 +1545,11 @@ const taskManager = createTaskManager({
   // into the parent session's channel instead of its own.
   baseEnv: cleanPtyEnv,
   getShellProfile: (projectPath) => resolveShell(effectiveShellProfileId(projectPath)),
-  // Upstream passes projects.worktreeParentFor here; this fork has no such
-  // registry, so a worktree falls back to task-config's own
-  // `.claude/worktrees/<name>` inference (task-config.js:573).
+  // A project worktree inherits its source repo's tasks.json. Without this a
+  // worktree falls back to task-config's own `.claude/worktrees/<name>`
+  // inference (task-config.js:573), which a project-managed worktree living
+  // under the projects root does not match.
+  resolveWorktreeParent: (projectPath) => projects.worktreeParentFor(projectPath),
   log,
   send: (channel, ...args) => registry.broadcast(channel, ...args),
   // (c) The confirmation survives a restart, per (project, label, fingerprint).
@@ -1441,6 +1633,46 @@ ipcMain.handle('rename-session', (_event, sessionId, name) => {
   const summary = cached?.summary || '';
   updateSearchTitle(sessionId, 'session', (name ? name + ' ' : '') + summary);
   return { name: name || null };
+});
+
+// The text of the last thing the assistant actually said, for the project
+// page's turn preview. Tool calls and thinking blocks are skipped: the hover
+// is a preview of the reply, not of the work.
+//
+// Upstream keeps this rule in its own module (session-preview.js,
+// `lastAssistantMessage`) which this fork has not ported. It is inlined here
+// rather than left unimplemented because the call site
+// (public/projects-view.js:169) swallows a missing channel in a bare
+// `catch { return; }` -- the preview would simply never appear, with nothing
+// anywhere saying why. If session-preview.js is ever ported, delete this and
+// require it: two copies of one rule is how they drift.
+const LAST_MESSAGE_MAX = 4000;
+ipcMain.handle('get-session-last-message', (_event, sessionId) => {
+  const folder = getCachedFolder(sessionId);
+  if (!folder) return { error: 'Session not found in cache' };
+  try {
+    const content = fs.readFileSync(path.join(PROJECTS_DIR, folder, sessionId + '.jsonl'), 'utf-8');
+    const lines = content.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      let entry;
+      try { entry = JSON.parse(lines[i]); } catch { continue; }
+      if (!entry || (entry.type !== 'assistant' && entry.message?.role !== 'assistant')) continue;
+      const body = entry.message?.content;
+      let text = '';
+      if (typeof body === 'string') text = body;
+      else if (Array.isArray(body)) {
+        text = body.filter(b => b && b.type === 'text' && typeof b.text === 'string').map(b => b.text).join('\n\n');
+      }
+      text = text.replace(/\r\n?/g, '\n').trim();
+      if (!text) continue;
+      if (text.length <= LAST_MESSAGE_MAX) return { text, truncated: false };
+      return { text: text.slice(0, LAST_MESSAGE_MAX).trimEnd(), truncated: true };
+    }
+    return { text: '', truncated: false };
+  } catch (err) {
+    return { error: err.message };
+  }
 });
 
 // --- IPC: archive-session ---
@@ -1528,6 +1760,39 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
   }
 
   const isPlainTerminal = sessionOptions?.type === 'terminal';
+
+  // A session that belongs to a project starts with that project's root and
+  // every attached folder as extra directories, so the brief loads wherever
+  // it starts and the agent can edit the repos. A new session says which
+  // project in its options; a resumed one is looked up by its assignment.
+  let projectEnv = {};
+  // A fork of a project session belongs to the same project and track, even
+  // when it is started from the Sessions tab where no project is in play.
+  if (!isPlainTerminal && sessionOptions?.forkFrom && !sessionOptions.projectId) {
+    const source = getMeta(sessionOptions.forkFrom);
+    if (source?.projectId) sessionOptions = { ...sessionOptions, projectId: source.projectId, trackId: source.trackId || null };
+  }
+  if (!isPlainTerminal) {
+    const launchProjectId = sessionOptions?.projectId || getMeta(sessionId)?.projectId || null;
+    if (launchProjectId) {
+      try {
+        const ctx = projects.launchContext(launchProjectId, projectPath);
+        if (ctx && ctx.addDirs.length) {
+          sessionOptions = { ...(sessionOptions || {}), addDirs: projects.mergeAddDirs(sessionOptions?.addDirs, ctx.addDirs) };
+          projectEnv = ctx.env;
+        }
+        // A project worktree is already the isolated checkout; asking Claude
+        // for another one on top of it would nest worktrees.
+        if (ctx?.worktree && sessionOptions?.worktree) {
+          sessionOptions = { ...sessionOptions };
+          delete sessionOptions.worktree;
+          delete sessionOptions.worktreeName;
+        }
+      } catch (err) {
+        log.error('[projects] launch context failed', err);
+      }
+    }
+  }
 
   // A session that never wrote a transcript cannot be resumed — the CLI has no
   // record of the id, and asking it to resume one produces an error the user
@@ -1673,6 +1938,9 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         ...cleanPtyEnv,
         TERM: 'xterm-256color', COLORTERM: 'truecolor',
         TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
+        // Empty unless this is a project session with extra directories;
+        // then it is what makes each added directory's CLAUDE.md load.
+        ...projectEnv,
       };
       if (mcpServer) {
         ptyEnv.CLAUDE_CODE_SSE_PORT = String(mcpServer.port);
@@ -1703,6 +1971,43 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
     mcpServer, _openedAt: Date.now(),
   };
   activeSessions.set(sessionId, session);
+
+  // A session launched from a project is filed there. `session.projectId` is
+  // not decoration: projects.js reads it off activeSessions to decide which
+  // running session gets credit for a plan item someone just ticked
+  // (projects.js runningProjectSession).
+  if (startFresh && !isPlainTerminal && sessionOptions?.projectId) {
+    try {
+      const assignment = projects.recordLaunchAssignment(sessionId, sessionOptions);
+      if (assignment) {
+        session.projectId = assignment.projectId;
+        session.trackId = assignment.trackId;
+        // Started from a phase or a todo on the project page.
+        const item = sessionOptions.planItem;
+        if (item?.itemText) projects.recordPlanLink(assignment.projectId, item.file, item.itemText, sessionId, 'started');
+      }
+    } catch (err) {
+      log.error('[projects] could not record launch assignment', err);
+    }
+  }
+  // Started by a schedule: the session remembers which, the schedule
+  // remembers the run. Folder schedules have no project, so this is separate
+  // from the assignment above -- and it is required for CORRECTNESS, not
+  // just for display: `lastRunAt` is the durable half of the double-fire
+  // guard (projects.js dueSchedules), and the in-memory half does not
+  // survive a restart. Without this write, a restart inside the catch-up
+  // window replays a run that already happened.
+  if (startFresh && !isPlainTerminal && sessionOptions?.scheduleId) {
+    try { projects.recordScheduleRun(sessionOptions.scheduleId, sessionId); } catch (err) {
+      log.error('[schedule] could not record the run', err);
+    }
+  }
+  // A resumed project session is a project session too, for the plan watcher.
+  if (!isPlainTerminal && !session.projectId) {
+    const meta = getMeta(session.realSessionId || sessionId);
+    if (meta?.projectId) { session.projectId = meta.projectId; session.trackId = meta.trackId || null; }
+  }
+
   // The window that spawned it owns it. Without this a brand-new session has no
   // owner, and since every push goes through sendToOwner that means its PTY
   // output is delivered nowhere — the terminal opens and stays blank.
@@ -1990,6 +2295,19 @@ sessionTransitions.init({
   // A fork re-keys the session; ownership and the MCP window must follow it.
   sendToOwner: registry.sendToOwner,
   rekeyOwner: registry.rekeyOwner,
+  // ...and so must everything that names the session by id. A fork or a
+  // plan-accept is the ONLY place in this fork where a session's id changes
+  // (Claude is launched with --session-id, so there is no temp id to
+  // resolve), which makes this the one place all three have to be applied:
+  //   copySessionAssignment  the new id belongs to the same project/track
+  //   rekeyPlanLinks         a plan item says which session is working it
+  //   rekeyScheduleSession   schedule.lastSessionId is what the ticker asks
+  //                          isSessionBusy about -- left on the dead id, a
+  //                          still-working scheduled run stops blocking the
+  //                          next occurrence and the schedule doubles up.
+  copySessionAssignment,
+  rekeyPlanLinks,
+  rekeyScheduleSession: dbModule.rekeyScheduleSession,
 });
 const { detectSessionTransitions } = sessionTransitions;
 
@@ -2090,6 +2408,170 @@ ipcMain.handle('updater-install', () => {
   if (!autoUpdater) return;
   autoUpdater.quitAndInstall();
 });
+
+// --- Scheduled task ticker ---
+//
+// Main owns the clock. A renderer timer is throttled the moment its window is
+// hidden or backgrounded, and a schedule has to fire at the minute it names.
+// Each fire is one 'schedule-due' event and the RENDERER starts the session,
+// because the terminal lives there.
+let scheduleTickerStop = null;
+
+// "Still working" is the CLI being busy, not the PTY being open: an
+// interactive session sits at its prompt until someone closes it, and a
+// schedule must not be blocked forever by its own last run having a terminal
+// left open. `_cliBusy` is maintained by the OSC 0 / OSC 9;4 handlers above.
+function isSessionBusy(sessionId) {
+  const session = activeSessions.get(sessionId);
+  return !!session && !session.exited && !!session._cliBusy;
+}
+
+/**
+ * The one window a due schedule is launched in.
+ *
+ * NOT registry.broadcast. 'schedule-due' is an instruction to start a session,
+ * not state for every window to render: broadcast it and each window starts
+ * its own copy — N windows, N Claude sessions, N times the money, for one
+ * schedule. Upstream cannot make this mistake because it has a single
+ * mainWindow; this fork has to choose, and choosing wrong is invisible until
+ * someone opens a second window.
+ *
+ * Not sendToOwner either — the session does not exist yet, so nothing owns it.
+ * Lowest window id rather than "whichever is focused" so a schedule's sessions
+ * keep landing in the same window run after run instead of following the
+ * user's attention around.
+ *
+ * A window that is still LOADING does not count. ipcRenderer.on is not
+ * buffered: a 'schedule-due' sent before public/schedules.js has run is
+ * simply gone, and the slot behind it has already been burned. On this
+ * machine the renderer can take a while, so "a window exists" is not the
+ * same question as "something can receive this".
+ */
+function scheduleHostWindow() {
+  const windows = registry.allWindows().filter(w => {
+    // A crashed renderer leaves the BrowserWindow alive with a dead
+    // webContents; anything sent at it is dropped in silence.
+    try { return !w.webContents.isDestroyed() && !w.webContents.isLoading(); } catch { return false; }
+  });
+  if (!windows.length) return null;
+  return windows.reduce((lowest, w) => (w.id < lowest.id ? w : lowest));
+}
+
+function fireSchedules(ids, reason) {
+  if (!ids.length) return;
+  const win = scheduleHostWindow();
+  if (!win) return;
+
+  // The global stop has to keep reaching scheduled runs, and after this slice
+  // it no longer does on its own. The old path spawned the run from main
+  // through runScheduleCommand, which vetoes synchronously immediately before
+  // the spawn; the new path hands the launch to the renderer, which comes back
+  // through open-terminal like any user action and never passes that gate.
+  // So the gate is here too. Like the old one this DROPS the run rather than
+  // queueing it -- projects.dueSchedules has already burned the slot by the
+  // time we are called, which is the same "vetoed means missed" the old
+  // runCommand had.
+  const gate = driverStore.isHalted();
+  if (gate.halted) {
+    for (const id of ids) {
+      log.warn(`[schedule] VETOED ${id} - global stop in force: ${gate.reason}`);
+      try { driverStore.appendEvent('SPAWN_VETOED', { name: `schedule:${id}`, reason: gate.reason }); } catch {}
+    }
+    return;
+  }
+
+  for (const id of ids) {
+    const launch = projects.resolveScheduleLaunch(id);
+    if (launch.error) { log.warn(`[schedule] ${id}: ${launch.error}`); continue; }
+    log.info(`[schedule] ${reason}: ${launch.schedule.name}`);
+    registry.sendTo(win.id, 'schedule-due', launch);
+  }
+}
+
+function startScheduleTicker() {
+  if (scheduleTickerStop) return;
+  let timer = null;
+  let stopped = false;
+
+  function armNextTick() {
+    // Re-aimed at the next wall-clock minute after EVERY tick, rather than a
+    // fixed-period setInterval started from one aligned point (which is what
+    // upstream does). This machine is CPU-constrained and a tick can arrive
+    // minutes late; a periodic timer that fires late stays late, and every
+    // later run inherits the drift, so a 09:00 schedule creeps to 09:04 and
+    // stays there until restart. Recomputing the delay from the clock puts
+    // the next tick back on :00.
+    //
+    // This is NOT a second gate and NOT a shorter interval. Due-ness is still
+    // decided in exactly one place, projects.dueSchedules, over
+    // (its previous call, now] -- that window is what makes a late tick
+    // survivable, and re-aiming only decides when we next ask.
+    const now = new Date();
+    const delay = 60000 - (now.getSeconds() * 1000 + now.getMilliseconds());
+    timer = setTimeout(tick, Math.max(1, delay));
+  }
+
+  function tick() {
+    try {
+      // No window means nothing can launch. Returning BEFORE dueSchedules is
+      // the whole point of the check: that call burns each due slot whether
+      // or not the fire lands, so asking it now would silently consume runs
+      // nobody could start. Left unasked, the next tick's window still covers
+      // those minutes, clamped by schedule-time's MAX_TICK_CATCHUP_MINUTES.
+      if (!scheduleHostWindow()) return;
+      // EXACTLY TWO ARGUMENTS. The [lastTick, now] window is projects.js's own
+      // state; a `since` passed from here would be a second clock, and the
+      // slot one path burns would not be the slot the other reads.
+      fireSchedules(projects.dueSchedules(new Date(), isSessionBusy), 'due');
+    } catch (err) {
+      log.error('[schedule] tick failed', err);
+    } finally {
+      // The chain re-arms even when the body threw. A setInterval survives a
+      // throwing callback for free; a self-aiming chain does not, and a chain
+      // that dies stops every schedule silently forever.
+      if (!stopped) armNextTick();
+    }
+  }
+
+  armNextTick();
+
+  // Catch-up runs, for the schedules that asked for one, once the renderer
+  // has loaded. "Missed while the app was closed" means missed since the last
+  // recorded run. This shares projects.js's fire memo with the tick above --
+  // missedSchedules burns the slot of everything it returns -- so the
+  // catch-up and the first real tick cannot both fire the same occurrence.
+  //
+  // Upstream fires this on a bare 20s timer. Here it waits for a window that
+  // can actually receive it and retries until one does, because 20s is not a
+  // safe assumption on this machine and firing early is not harmless: the
+  // event lands nowhere AND the slots are spent, so the run is lost rather
+  // than delayed.
+  const CATCHUP_RETRY_MS = 5 * 1000;
+  const catchUpDeadline = Date.now() + 5 * 60 * 1000;
+  let catchUp = null;
+  function tryCatchUp() {
+    if (stopped) return;
+    if (!scheduleHostWindow()) {
+      if (Date.now() >= catchUpDeadline) {
+        log.warn('[schedule] catch-up abandoned - no window finished loading in time');
+        return;
+      }
+      catchUp = setTimeout(tryCatchUp, CATCHUP_RETRY_MS);
+      return;
+    }
+    try { fireSchedules(projects.missedSchedules(new Date(), isSessionBusy), 'catch-up'); } catch (err) {
+      log.error('[schedule] catch-up failed', err);
+    }
+  }
+  catchUp = setTimeout(tryCatchUp, 20 * 1000);
+
+  scheduleTickerStop = () => {
+    stopped = true;
+    clearTimeout(timer);
+    clearTimeout(catchUp);
+    scheduleTickerStop = null;
+  };
+}
 
 // --- App lifecycle ---
 // Prevent a second Electron instance from killing active PTY sessions.
@@ -2240,8 +2722,30 @@ if (!gotSingleInstanceLock) {
       log.warn(`[schedule] global stop is in force: ${startupHalt.reason} — scheduled tasks will be vetoed`);
     }
 
+    // schedule-ipc.js survives the move to DB-backed schedules: it owns no
+    // timer, only the user-pressed "run now" (public/plans-memory-view.js)
+    // and the /create-schedule slash command (public/dialogs.js). Neither
+    // can double-fire anything, because neither fires on its own.
     scheduleIpc.init(log, runScheduleCommand);
-    stopScheduler = startScheduler(log, runScheduleCommand);
+
+    // Retry the legacy import each launch: each schedule-*.md that lands
+    // becomes a folder schedule and is remembered in the DB's import ledger
+    // (including after the schedule is deleted, so a retry cannot resurrect
+    // it), while a folder that was missing this time can still be picked up
+    // next time. schedule-runner.js is kept for exactly this: scanSchedules
+    // reads those files. Its `startScheduler` cron loop is NOT started and
+    // no longer imported -- two tickers would each fire every one of them.
+    try {
+      const imported = projects.importLegacySchedules(scanSchedules(log));
+      if (imported) log.info(`[schedule] Imported ${imported} schedule file(s) as folder schedules`);
+    } catch (err) { log.error('[schedule] legacy import failed', err); }
+
+    // The driver lock, honoured rather than merely logged. The old
+    // startScheduler ran whatever `lock.ok` said, which made the warning
+    // above untrue: a second instance did schedule. A scheduled run is a
+    // Claude session, so two instances ticking is two of every run.
+    if (lock.ok) startScheduleTicker();
+    else log.warn('[schedule] ticker not started - another instance holds the driver lock');
 
     // Re-index search if FTS table was recreated (e.g. tokenizer config change)
     if (searchFtsRecreated) populateCacheViaWorker();
@@ -2291,9 +2795,16 @@ app.on('before-quit', () => {
     }
   }
 
-  // Scheduled runs are separate processes, not PTYs, so the loop above never
-  // touched them. Stop the timer, then kill what we are holding.
-  try { if (stopScheduler) stopScheduler(); } catch {}
+  // The plan-tracker watchers are projects.js's, not projectsWatcher's.
+  try { projects.stopPlanWatchers(); } catch (err) {
+    log.error('[projects] plan watcher shutdown failed:', err.message);
+  }
+
+  // A DUE schedule now starts an ordinary PTY session, so the loop above did
+  // reach those. What it did not reach is a legacy "run now", which is still
+  // a separate child process. Stop the tick first, then kill what custody is
+  // holding.
+  try { if (scheduleTickerStop) scheduleTickerStop(); } catch {}
   try {
     const report = custody.reap();
     if (report.degraded) {

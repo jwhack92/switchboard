@@ -12,6 +12,10 @@ contextBridge.exposeInMainWorld('api', {
   readMemory: (filePath) => ipcRenderer.invoke('read-memory', filePath),
   saveMemory: (filePath, content) => ipcRenderer.invoke('save-memory', filePath, content),
   getProjects: (showArchived) => ipcRenderer.invoke('get-projects', showArchived),
+  // Which CLIs this build can drive, as [{ id, label, enabled }]. One row
+  // (Claude) in this fork; the schedule dialog still asks, so that a build
+  // that registers more needs no renderer change.
+  getHarnesses: () => ipcRenderer.invoke('get-harnesses'),
   getActiveSessions: () => ipcRenderer.invoke('get-active-sessions'),
   getActiveTerminals: () => ipcRenderer.invoke('get-active-terminals'),
   stopSession: (id) => ipcRenderer.invoke('stop-session', id),
@@ -20,7 +24,12 @@ contextBridge.exposeInMainWorld('api', {
   archiveSession: (id, archived) => ipcRenderer.invoke('archive-session', id, archived),
   openTerminal: (id, projectPath, isNew, sessionOptions) => ipcRenderer.invoke('open-terminal', id, projectPath, isNew, sessionOptions),
   search: (type, query, titleOnly) => ipcRenderer.invoke('search', type, query, titleOnly),
+  // Project-scoped search: which of THESE session ids match. Returns an
+  // array of ids (empty on a malformed request), never an { error } object.
+  searchSessionIds: (query, sessionIds) => ipcRenderer.invoke('search-session-ids', query, sessionIds),
   readSessionJsonl: (sessionId) => ipcRenderer.invoke('read-session-jsonl', sessionId),
+  // { text, truncated } for the project page's turn preview, or { error }.
+  getSessionLastMessage: (sessionId) => ipcRenderer.invoke('get-session-last-message', sessionId),
 
   // Settings
   getSetting: (key) => ipcRenderer.invoke('get-setting', key),
@@ -49,7 +58,71 @@ contextBridge.exposeInMainWorld('api', {
   browseFolder: () => ipcRenderer.invoke('browse-folder'),
   addProject: (projectPath) => ipcRenderer.invoke('add-project', projectPath),
   removeProject: (projectPath) => ipcRenderer.invoke('remove-project', projectPath),
+
+  // ── Projects (a piece of work with a folder on disk; see projects.js) ─
+  // Every one of these goes through main's `guarded` wrapper, so a failure
+  // arrives as a resolved { error: message } rather than a rejected promise.
+  getProjectTree: (showArchived) => ipcRenderer.invoke('get-project-tree', showArchived),
+  createProject: (spec) => ipcRenderer.invoke('create-project', spec),
+  updateProject: (id, patch) => ipcRenderer.invoke('update-project', id, patch),
+  deleteProject: (id) => ipcRenderer.invoke('delete-project', id),
+  attachProjectFolder: (id, spec) => ipcRenderer.invoke('attach-project-folder', id, spec),
+  detachProjectFolder: (id, folderPath, opts) => ipcRenderer.invoke('detach-project-folder', id, folderPath, opts),
+  setSessionAssignment: (sessionId, projectId, trackId) => ipcRenderer.invoke('set-session-assignment', sessionId, projectId, trackId),
+  createTrack: (projectId, spec) => ipcRenderer.invoke('create-track', projectId, spec),
+  updateTrack: (id, patch) => ipcRenderer.invoke('update-track', id, patch),
+  deleteTrack: (id, options) => ipcRenderer.invoke('delete-track', id, options),
+  getProjectsRoot: () => ipcRenderer.invoke('get-projects-root'),
+  getProjectGitStatus: (id, opts) => ipcRenderer.invoke('get-project-git-status', id, opts),
+  getProjectGitInfo: (id) => ipcRenderer.invoke('get-project-git-info', id),
+  getProjectGitDiff: (id, folderPath, filePath) => ipcRenderer.invoke('get-project-git-diff', id, folderPath, filePath),
+  getFolderGitStatus: (folderPath) => ipcRenderer.invoke('get-folder-git-status', folderPath),
+  // { ok, files, defaults } — the .env files a folder has, and the ones the
+  // new-worktree dialog should tick by default.
+  listEnvFiles: (folderPath) => ipcRenderer.invoke('list-env-files', folderPath),
+  saveProjectBrief: (id, content) => ipcRenderer.invoke('save-project-brief', id, content),
+  createProjectFile: (id, name, content) => ipcRenderer.invoke('create-project-file', id, name, content),
+  addProjectFiles: (id, sourcePaths) => ipcRenderer.invoke('add-project-files', id, sourcePaths),
+  listRecentProjectFiles: (id) => ipcRenderer.invoke('list-recent-project-files', id),
+  getProjectPlan: (id) => ipcRenderer.invoke('get-project-plan', id),
+  setPlanItem: (id, kind, line, done) => ipcRenderer.invoke('set-plan-item', id, kind, line, done),
+  appendPlanItem: (id, kind, text) => ipcRenderer.invoke('append-plan-item', id, kind, text),
+  editPlanItem: (id, kind, line, text) => ipcRenderer.invoke('edit-plan-item', id, kind, line, text),
+  adoptPlan: (id, filename, opts) => ipcRenderer.invoke('adopt-plan', id, filename, opts),
+  listTemplates: () => ipcRenderer.invoke('list-templates'),
+  // A plan tracker or todos file changed on disk (main watches every project
+  // root). Payload is the projectId.
+  onProjectPlanChanged: (callback) => {
+    ipcRenderer.on('project-plan-changed', (_event, projectId) => callback(projectId));
+  },
+
+  // ── Scheduled tasks (DB-backed; see projects.js) ─────────────────────
+  // These replace the file-based trio above for everything except the legacy
+  // schedule-*.md files, which main imports into this table once per launch.
+  listSchedules: () => ipcRenderer.invoke('list-schedules'),
+  createSchedule: (spec) => ipcRenderer.invoke('create-schedule', spec),
+  updateSchedule: (id, patch) => ipcRenderer.invoke('update-schedule', id, patch),
+  deleteSchedule: (id) => ipcRenderer.invoke('delete-schedule', id),
+  resolveScheduleLaunch: (id) => ipcRenderer.invoke('resolve-schedule-launch', id),
+  // Takes a DIALOG SPEC (what the user has picked so far), not a saved row.
+  getScheduleContext: (spec) => ipcRenderer.invoke('get-schedule-context', spec),
+  // A schedule is due NOW. Main has already decided that — it owns the clock,
+  // because a renderer timer is throttled while its window is hidden — and it
+  // sends this to exactly ONE window, so the handler must not re-check the
+  // time or coordinate with other windows.
+  //
+  // `launch` is resolveScheduleLaunch's { schedule, target, runtime }: open a
+  // terminal at target.projectPath with schedule.prompt as initialPrompt and
+  // schedule.id as scheduleId on the launch options, and WITHOUT stealing
+  // focus. Recording the run is main's job (open-terminal does it), so the
+  // handler must not try to.
+  onScheduleDue: (callback) => {
+    ipcRenderer.on('schedule-due', (_event, launch) => callback(launch));
+  },
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
+  // Reveal a FOLDER in the OS file manager. Main refuses anything that is
+  // not an existing directory, so this can never launch a file.
+  openPath: (target) => ipcRenderer.invoke('open-path', target),
   writeClipboard: (text) => ipcRenderer.invoke('clipboard-write-text', text),
 
   // Send (fire-and-forget)

@@ -307,8 +307,24 @@ function renderProjects(projects, resort) {
     const header = document.createElement('div');
     header.className = 'project-header';
     header.id = 'ph-' + fId;
-    const shortName = shortProjectPath(project.projectPath);
-    header.innerHTML = `<span class="arrow">&#9660;</span> <span class="project-name">${shortName}</span>`;
+    // A folder that belongs to a project (its root, or one attached to it) is
+    // labelled by the project — "<project> · repos/website" — instead of by its
+    // last two path segments, so the Sessions tab and the Projects tab agree on
+    // what a folder is called. Both helpers live in projects-view.js and return
+    // null for a folder no project owns, which is the unchanged case.
+    const rootLabel = typeof projectRootLabel === 'function' ? projectRootLabel(project.projectPath) : null;
+    const shortName = rootLabel || shortProjectPath(project.projectPath);
+    header.title = project.projectPath;
+    if (rootLabel) header.classList.add('project-header--in-project');
+    // A project worktree (checked out under <project>/repos/) gets the same
+    // branch mark a Claude worktree has.
+    const folderMode = typeof projectFolderMode === 'function' ? projectFolderMode(project.projectPath) : null;
+    const branchMark = folderMode === 'worktree'
+      ? '<span class="worktree-branch-icon project-worktree-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 8c0-2.76-2.46-5-5.5-5S2 5.24 2 8h2l1-1 1 1h4"/><path d="M13 7.14A5.82 5.82 0 0 1 16.5 6c3.04 0 5.5 2.24 5.5 5h-3l-1-1-1 1h-3"/><path d="M5.89 9.71c-2.15 2.15-2.3 5.47-.35 7.43l4.24-4.25.7-.7.71-.71 2.12-2.12c-1.95-1.96-5.27-1.8-7.42.35"/><path d="M11 15.5c.5 2.5-.17 4.5-1 6.5h4c2-5.5-.5-12-1-14"/></svg></span> '
+      : '';
+    // escapeHtml: shortProjectPath was already trusted here, but a project NAME
+    // is user-typed and reaches this line through projectRootLabel.
+    header.innerHTML = `<span class="arrow">&#9660;</span> ${branchMark}<span class="project-name">${escapeHtml(shortName)}</span>`;
 
     // The .vscode/tasks.json menu. The button itself is built by task-runner.js
     // so the running badge, the error state and this row stay with the code that
@@ -320,10 +336,17 @@ function renderProjects(projects, resort) {
     // attached here would be attached to whichever render happened to build it.
     if (typeof createProjectTaskButton === 'function') header.appendChild(createProjectTaskButton(project));
 
+    // The folder's scheduled tasks: a plain clock opens the dialog for a new
+    // one; with schedules it is tinted, counts them, and lists them. The title
+    // is set by decorateScheduleButton, so it is only spelled out here for the
+    // case where schedules.js is not loaded.
     const scheduleBtn = document.createElement('button');
     scheduleBtn.className = 'project-schedule-btn';
     scheduleBtn.title = 'Create scheduled task';
     scheduleBtn.innerHTML = ICONS.schedule(16);
+    if (typeof decorateScheduleButton === 'function' && typeof schedulesForFolder === 'function') {
+      decorateScheduleButton(scheduleBtn, schedulesForFolder(project.projectPath));
+    }
     header.appendChild(scheduleBtn);
 
     const settingsBtn = document.createElement('button');
@@ -500,7 +523,16 @@ function rebindSidebarEvents(projects) {
     }
     const scheduleBtn = header.querySelector('.project-schedule-btn');
     if (scheduleBtn) {
-      scheduleBtn.onclick = (e) => { e.stopPropagation(); launchScheduleCreator(project); };
+      // The clock now opens the folder's schedule list (schedules.js), which
+      // is the DB-backed replacement for the old schedule-*.md creator. Main
+      // imports the legacy files into the same store at startup, so nothing is
+      // lost. The fallback keeps the old creator reachable if schedules.js
+      // failed to load rather than leaving the button dead.
+      scheduleBtn.onclick = (e) => {
+        e.stopPropagation();
+        if (typeof showFolderScheduleMenu === 'function') showFolderScheduleMenu(project.projectPath, scheduleBtn);
+        else if (typeof launchScheduleCreator === 'function') launchScheduleCreator(project);
+      };
     }
     const settingsBtn = header.querySelector('.project-settings-btn');
     if (settingsBtn) {
@@ -638,6 +670,32 @@ function rebindSidebarEvents(projects) {
     if (!session) return;
 
     item.onclick = () => openSession(session);
+
+    // Right-click a session row: "Move to project…", the same menu the
+    // Projects tab puts on its own session rows (projects-view.js:627,
+    // showMovePopover → sessionMoveItems). Upstream hangs this off a "…"
+    // button; this fork has no "…" button — the six hover controls on the row
+    // already cover the rest of that menu — so the right-click is the one
+    // route to it, and it needs no button chrome the stylesheet has not got.
+    //
+    // Three guards, in order:
+    //  - the drag handle has its OWN contextmenu ("move to another window",
+    //    session-drag.js:273). That is a capture-phase document listener, so
+    //    it has already run and preventDefault()ed by the time this bubble
+    //    handler fires; without the check both menus would open and the
+    //    second would replace the first.
+    //  - a raw terminal is skipped, as upstream skips it: moving one calls
+    //    persistTerminalSession, which this fork's terminal-manager.js does
+    //    not have yet (see needsWiring).
+    //  - no projects-view.js loaded → leave the native menu alone.
+    item.oncontextmenu = (e) => {
+      if (e.defaultPrevented) return;
+      if (e.target.closest && e.target.closest('.session-drag-handle')) return;
+      if (session.type === 'terminal') return;
+      if (typeof showMovePopover !== 'function') return;
+      e.preventDefault();
+      showMovePopover(session, item);
+    };
 
     const pin = item.querySelector('.session-pin');
     if (pin) {
@@ -805,6 +863,15 @@ function buildSessionItem(session) {
   shortIdEl.title = session.sessionId;
   shortIdEl.textContent = session.sessionId.split('-')[0];
   metaEl.append(timeEl, shortIdEl);
+
+  // Started by a scheduled task: a clock, with which one and when in its
+  // tooltip. Compact, because this row already carries six controls.
+  if (session.scheduleId && typeof scheduleChipHtml === 'function') {
+    const chip = document.createElement('span');
+    chip.className = 'session-schedule-chip';
+    chip.innerHTML = scheduleChipHtml(session, { compact: true });
+    metaEl.appendChild(chip);
+  }
 
   if (session.type === 'terminal') {
     const badge = document.createElement('span');

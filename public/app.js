@@ -3,6 +3,11 @@ const statusBarActivity = document.getElementById('status-bar-activity');
 const terminalsEl = document.getElementById('terminals');
 const sidebarContent = document.getElementById('sidebar-content');
 const plansContent = document.getElementById('plans-content');
+// The Projects tab's sidebar pane (projects-view.js morphdoms into it). It is
+// read at load, so index.html must declare it; renderProjectList() returns
+// early when it is missing, which is why the load-time entry-point check
+// further down shouts instead of letting the tab fail quietly.
+const projectsContent = document.getElementById('projects-content');
 const placeholder = document.getElementById('placeholder');
 const archiveToggle = document.getElementById('archive-toggle');
 const starToggle = document.getElementById('star-toggle');
@@ -91,6 +96,11 @@ let showRunningOnly = false;
 let showTodayOnly = false;
 let cachedProjects = [];
 let cachedAllProjects = [];
+// Projects tab (projects-view.js): project → tracks → sessions, from
+// get-project-tree. dedupTree() makes these hold the SAME session objects as
+// the two folder caches above, so a rename, pin or exit changes every view.
+let cachedProjectTree = { projects: [] };    // archived excluded
+let cachedProjectTreeAll = { projects: [] }; // everything
 let activePtyIds = new Set();
 let sortedOrder = []; // [{ projectPath, itemIds: [itemId, ...] }, ...] — single source of truth for sidebar order
 let activeTab = 'sessions';
@@ -149,6 +159,49 @@ const attentionSessions = new Set(); // sessions needing user action (OSC 9)
 const responseReadySessions = new Set(); // Claude finished, user hasn't looked (terminal state)
 const sessionBusyState = new Map(); // sessionId → boolean (currently active)
 
+// --- When something last happened to a session ---
+//
+// The Projects tab sorts by this, not by `modified`: a working session
+// rewrites its transcript constantly, so `modified` reshuffles the list several
+// times a minute while nothing the user cares about has changed. Only a turn
+// ENDING, an attention notification, or a session appearing is an event.
+//
+// Not persisted: every event coincides with a transcript write, so after a
+// restart the transcript's own mtime says the same thing.
+const sessionEventTimes = new Map(); // sessionId → ms since epoch
+
+function bumpSessionEvent(sessionId) {
+  if (!sessionId) return;
+  sessionEventTimes.set(sessionId, Date.now());
+  if (typeof refreshProjectViews === 'function') refreshProjectViews({ reason: 'sessions' });
+}
+
+/**
+ * The time to sort a session by: the later of its last event and the
+ * transcript's last message. While the CLI is busy the session keeps the time
+ * it had when the turn began (pinned in setActivity), so a running session does
+ * not climb the list on every write; the turn ending moves it.
+ *
+ * Read by projects-view.js (projectSortTime and every pane grouping), so it has
+ * to tolerate a session object with no `modified` at all — a just-launched
+ * pending row.
+ */
+function sessionEventTime(session) {
+  if (!session) return 0;
+  const id = session.sessionId;
+  const known = sessionEventTimes.get(id) || 0;
+  const t = new Date(session.modified).getTime();
+  const modified = Number.isFinite(t) ? t : 0;
+  if (known && sessionBusyState.get(id) === true) return known;
+  return Math.max(known, modified);
+}
+
+function rekeySessionEventTime(oldId, newId) {
+  if (oldId === newId || !sessionEventTimes.has(oldId)) return;
+  sessionEventTimes.set(newId, sessionEventTimes.get(oldId));
+  sessionEventTimes.delete(oldId);
+}
+
 // Central activity dispatcher
 function setActivity(sessionId, active) {
   // response-ready normally stays latched until the user looks at the session.
@@ -172,6 +225,14 @@ function setActivity(sessionId, active) {
   const wasActive = sessionBusyState.get(sessionId) || false;
   sessionBusyState.set(sessionId, active);
 
+  // A turn is starting: pin the row where it is until the turn ends, so the
+  // Projects tab does not reshuffle under the pointer on every transcript
+  // write. sessionEventTime() reads this back while sessionBusyState is true.
+  if (active && !wasActive) {
+    const pinned = sessionMap.get(sessionId);
+    if (pinned) sessionEventTimes.set(sessionId, sessionEventTime(pinned));
+  }
+
   // Idle → busy on the focused session: start the summarizer now so its ~4s
   // startup overlaps the work rather than delaying the spoken reply.
   if (!wasActive && active && sessionId === activeSessionId && window.speech) {
@@ -179,6 +240,8 @@ function setActivity(sessionId, active) {
   }
 
   if (wasActive && !active) {
+    // A finished turn is the event the Projects tab sorts by.
+    bumpSessionEvent(sessionId);
     // Activity ended → response-ready if user isn't looking at this session
     if (sessionId !== activeSessionId) {
       responseReadySessions.add(sessionId);
@@ -200,6 +263,8 @@ function setActivity(sessionId, active) {
     const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
     if (item) item.classList.toggle('cli-busy', active);
   }
+  // The Projects tab rolls working / finished / needs-you up onto its rows.
+  if (typeof updateProjectStatusDots === 'function') updateProjectStatusDots();
 }
 
 function clearUnread(sessionId) {
@@ -208,6 +273,7 @@ function clearUnread(sessionId) {
   if (item) {
     item.classList.remove('response-ready');
   }
+  if (typeof updateProjectStatusDots === 'function') updateProjectStatusDots();
 }
 
 // User-initiated: put a session back into the response-ready state, as if
@@ -222,6 +288,7 @@ function markUnread(sessionId) {
     item.classList.remove('cli-busy');
     item.classList.add('response-ready');
   }
+  if (typeof updateProjectStatusDots === 'function') updateProjectStatusDots();
 }
 
 function clearNotifications(sessionId) {
@@ -229,6 +296,7 @@ function clearNotifications(sessionId) {
   attentionSessions.delete(sessionId);
   const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
   if (item) item.classList.remove('needs-attention');
+  if (typeof updateProjectStatusDots === 'function') updateProjectStatusDots();
 }
 // Terminal themes, utils (cleanDisplayName, formatDate, escapeHtml, shellEscape)
 // are defined in terminal-themes.js and utils.js (loaded before app.js).
@@ -297,6 +365,11 @@ function rekeySessionMaps(oldId, newId) {
     sessionBusyState.delete(oldId);
   }
   if (gridFocusedSessionId === oldId) gridFocusedSessionId = newId;
+  rekeySessionEventTime(oldId, newId);
+  // The Projects tab remembers, per project, which session was last open.
+  // The tree lists themselves need no fixing: dedupTree() makes them hold the
+  // same session objects, whose .sessionId the caller has already rewritten.
+  if (typeof rekeyProjectSessionState === 'function') rekeyProjectSessionState(oldId, newId);
 }
 
 window.api.onSessionDetected((tempId, realId) => {
@@ -388,6 +461,7 @@ window.api.onProcessExited((sessionId, exitCode, signal, userStopped) => {
     const pending = pendingSessions.get(sessionId);
     if (pending) pending.exited = true;
     if (gridViewActive) updateGridCount();
+    if (typeof updateProjectStatusDots === 'function') updateProjectStatusDots();
     pollActiveSessions();
     return;
   }
@@ -413,7 +487,12 @@ window.api.onProcessExited((sessionId, exitCode, signal, userStopped) => {
         proj.sessions = proj.sessions.filter(s => s.sessionId !== sessionId);
       }
     }
+    // The project tree holds the same rows; dropping it from one cache and not
+    // the other leaves a ghost in the project pane that nothing can clear.
+    if (typeof removeSessionFromTrees === 'function') removeSessionFromTrees(sessionId);
     sessionMap.delete(sessionId);
+    sessionEventTimes.delete(sessionId);
+    if (typeof forgetProjectSessionState === 'function') forgetProjectSessionState(sessionId);
     refreshSidebar();
     // The pending marker can outlive the .jsonl by a beat (reconciliation only
     // runs in loadProjects), so re-sync: a session that did write real data
@@ -574,8 +653,13 @@ window.api.onTerminalNotification((sessionId, message) => {
   // 4. "Claude Code wants to enter plan mode"         → wants to enter
   if (/attention|approval|permission|needs your|wants to enter/i.test(message) && sessionId !== activeSessionId) {
     attentionSessions.add(sessionId);
+    // The CLI asking for something is an event: it should move the session up
+    // the Projects tab even mid-turn, which is the one case sessionEventTime's
+    // busy pin must not suppress.
+    bumpSessionEvent(sessionId);
     const item = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
     if (item) item.classList.add('needs-attention');
+    if (typeof updateProjectStatusDots === 'function') updateProjectStatusDots();
     if (window.speech) window.speech.announceAttention(sessionId, speechNameFor(sessionId), message);
   } else if (/waiting for your input/i.test(message)) {
     // "Claude is waiting for your input" — delayed idle notification, mark response-ready
@@ -597,7 +681,12 @@ window.api.onCliBusyState((sessionId, busy) => {
 // --- Single entry point for all sidebar renders ---
 // resort=true: re-sort items by priority+time (use for user-initiated actions)
 // resort=false (default): preserve existing DOM order, new items go to top
-function refreshSidebar({ resort = false } = {}) {
+//
+// `reason` is passed straight through to the Projects tab. 'sessions' means
+// only the session list moved, so the project page patches itself in place
+// instead of rebuilding — a rebuild several times a minute would throw away
+// the Plan tab's expansion state, an open Add-todo field and any inline edit.
+function refreshSidebar({ resort = false, reason = 'project' } = {}) {
   // When searching, always use all projects (search ignores archive filter)
   let projects = (searchMatchIds !== null)
     ? cachedAllProjects
@@ -617,6 +706,7 @@ function refreshSidebar({ resort = false } = {}) {
   }
 
   renderProjects(projects, resort);
+  if (typeof refreshProjectViews === 'function') refreshProjectViews({ reason });
 }
 
 // --- Archive toggle ---
@@ -696,7 +786,9 @@ function clearSearch() {
   searchInput.value = '';
   searchBar.classList.remove('has-query');
   if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = null; }
-  if (activeTab === 'sessions') {
+  // Both tabs are driven by searchMatchIds: the Sessions tab filters its
+  // folder groups, the Projects tab its project rows (renderProjectList).
+  if (activeTab === 'sessions' || activeTab === 'projects') {
     searchMatchIds = null;
     searchMatchProjectPaths = null;
     refreshSidebar({ resort: true });
@@ -727,7 +819,7 @@ searchInput.addEventListener('input', () => {
     }
 
     try {
-      if (activeTab === 'sessions') {
+      if (activeTab === 'sessions' || activeTab === 'projects') {
         const results = await window.api.search('session', query, searchTitlesOnly);
         searchMatchIds = new Set(results.map(r => r.id));
         // When title-only, also match project names
@@ -753,7 +845,7 @@ searchInput.addEventListener('input', () => {
         renderMemories(matchIds);
       }
     } catch {
-      if (activeTab === 'sessions') {
+      if (activeTab === 'sessions' || activeTab === 'projects') {
         searchMatchIds = null;
         searchMatchProjectPaths = null;
         refreshSidebar({ resort: true });
@@ -784,11 +876,14 @@ function isDismissibleSession(sessionId) {
 function dismissSession(sessionId) {
   pendingSessions.delete(sessionId);
   sessionMap.delete(sessionId);
+  sessionEventTimes.delete(sessionId);
   for (const projList of [cachedProjects, cachedAllProjects]) {
     for (const proj of projList) {
       proj.sessions = proj.sessions.filter(s => s.sessionId !== sessionId);
     }
   }
+  if (typeof removeSessionFromTrees === 'function') removeSessionFromTrees(sessionId);
+  if (typeof forgetProjectSessionState === 'function') forgetProjectSessionState(sessionId);
   if (openSessions.has(sessionId)) destroySession(sessionId);
   if (activeSessionId === sessionId) {
     setActiveSession(null);
@@ -865,6 +960,9 @@ function updateRunningIndicators() {
     const dot = group.querySelector('.slug-group-dot');
     if (dot) dot.classList.toggle('running', hasRunning);
   });
+  // The poll is the only thing that notices a PTY that died outside this
+  // window, so the project rows have to be rolled up from here too.
+  if (typeof updateProjectStatusDots === 'function') updateProjectStatusDots();
   // Update grid card dots and status text
   for (const [sid, card] of gridCards) {
     const running = activePtyIds.has(sid);
@@ -929,23 +1027,48 @@ function dedup(projects) {
   }
 }
 
-async function loadProjects({ resort = false } = {}) {
+// The project tree and the schedule list are optional riders on loadProjects:
+// both come from channels the Projects slice adds, and a fork running without
+// them must still load its Sessions tab. A missing channel is not an undefined
+// function call that throws inside Promise.all's argument list; it is an empty
+// tree. But it IS shouted about once at load (see the entry-point check), so
+// it cannot go quietly inert the way a silently-swallowed failure would.
+function fetchProjectTree(showArchived) {
+  if (typeof window.api.getProjectTree !== 'function') return Promise.resolve({ projects: [] });
+  return window.api.getProjectTree(showArchived).catch(() => ({ projects: [] }));
+}
+
+async function loadProjects({ resort = false, reason = 'project' } = {}) {
   const wasEmpty = cachedProjects.length === 0;
   if (wasEmpty) {
     loadingStatus.textContent = 'Loading\u2026';
     loadingStatus.className = 'active';
     loadingStatus.style.display = '';
   }
-  const [defaultProjects, allProjects] = await Promise.all([
+  const [defaultProjects, allProjects, tree, treeAll] = await Promise.all([
     window.api.getProjects(false),
     window.api.getProjects(true),
+    fetchProjectTree(false),
+    fetchProjectTree(true),
+    // Scheduled tasks ride along: the folder clocks and the session chips read
+    // the cache it fills, and both are rebuilt by the refreshSidebar below.
+    typeof loadSchedules === 'function' ? loadSchedules().catch(() => null) : null,
   ]);
   cachedProjects = defaultProjects;
   cachedAllProjects = allProjects;
+  cachedProjectTree = tree || { projects: [] };
+  cachedProjectTreeAll = treeAll || { projects: [] };
   loadingStatus.style.display = 'none';
   loadingStatus.className = '';
   dedup(cachedProjects);
   dedup(cachedAllProjects);
+  // Must run after dedup(): it folds the tree's session rows onto the SAME
+  // objects the folder caches hold, which is what keeps a pin or a rename in
+  // one tab visible in the other.
+  if (typeof dedupTree === 'function') {
+    dedupTree(cachedProjectTree);
+    dedupTree(cachedProjectTreeAll);
+  }
 
   // Reconcile pending sessions: remove ones that now have real data
   let hasReinjected = false;
@@ -967,13 +1090,17 @@ async function loadProjects({ resort = false } = {}) {
           proj.sessions.unshift(pending.session);
         }
       }
+      // A pending session has no transcript, so the tree main just built does
+      // not contain it either. Without this a session launched from a project
+      // vanishes from that project's pane on the very next refresh.
+      if (typeof injectPendingIntoTree === 'function') injectPendingIntoTree(pending.session);
     }
   }
 
   // Track active plain terminals in pendingSessions/sessionMap (data now comes from backend)
   try {
     const activeTerminals = await window.api.getActiveTerminals();
-    for (const { sessionId, projectPath } of activeTerminals) {
+    for (const { sessionId, projectPath, projectId, trackId } of activeTerminals) {
       if (pendingSessions.has(sessionId)) continue; // already tracked
       const folder = encodeProjectPath(projectPath);
       // Find the session object already injected by the backend
@@ -983,8 +1110,14 @@ async function loadProjects({ resort = false } = {}) {
         if (session) break;
       }
       if (!session) continue;
+      // An attached folder can sit outside the project's root, so cwd alone is
+      // not enough to say where a raw terminal belongs. These are undefined
+      // until main's get-active-terminals reply carries them (see needsWiring).
+      if (projectId) session.projectId = projectId;
+      if (trackId) session.trackId = trackId;
       pendingSessions.set(sessionId, { session, projectPath, folder });
       sessionMap.set(sessionId, session);
+      if (typeof injectPendingIntoTree === 'function') injectPendingIntoTree(session);
     }
   } catch {}
 
@@ -998,8 +1131,15 @@ async function loadProjects({ resort = false } = {}) {
   // objects (dedup() shares sessions between them, not the projects).
   // It swallows its own IPC failure, so a missing handler costs the task
   // buttons their data and never the sidebar.
-  if (typeof hydrateProjectTasks === 'function') await hydrateProjectTasks([cachedProjects, cachedAllProjects]);
-  refreshSidebar({ resort });
+  //
+  // The second argument adds every project root and attached folder, so a
+  // project's task menu is complete even for a folder with no sessions of its
+  // own — those folders are in the tree and in no `projects` list at all.
+  if (typeof hydrateProjectTasks === 'function') {
+    const extraPaths = typeof treeTaskPaths === 'function' ? treeTaskPaths(cachedProjectTreeAll) : [];
+    await hydrateProjectTasks([cachedProjects, cachedAllProjects], extraPaths);
+  }
+  refreshSidebar({ resort, reason });
   renderDefaultStatus();
 }
 
@@ -1007,9 +1147,20 @@ async function loadProjects({ resort = false } = {}) {
 // rebindSidebarEvents, buildSessionItem, startRename) → sidebar.js
 
 
-async function launchNewSession(project, sessionOptions) {
+/**
+ * `project` is either a folder row from the Sessions tab ({ projectPath, … })
+ * or a project/track launch target from the Projects tab, which also carries
+ * projectId/trackId (projects-view.js launchTargetFor).
+ *
+ * `focus: false` is what a SCHEDULED launch passes (public/schedules.js
+ * launchScheduledSession). A background schedule that fired while the user was
+ * mid-sentence in another session must not yank the view — the terminal is
+ * still created and attached, it is just not shown.
+ */
+async function launchNewSession(project, sessionOptions, { focus = true } = {}) {
   const sessionId = crypto.randomUUID();
   const projectPath = project.projectPath;
+  const options = { ...(sessionOptions || {}) };
   const session = {
     sessionId,
     summary: 'New session',
@@ -1022,6 +1173,23 @@ async function launchNewSession(project, sessionOptions) {
     modified: new Date().toISOString(),
     created: new Date().toISOString(),
   };
+
+  // Launched from a project (or one of its tracks): main files the session
+  // there when it spawns, and the Projects tab shows it right away. Both
+  // copies are needed — the option tells main, the session field tells the
+  // tree injection below where to put the row before main has replied.
+  if (project.projectId) {
+    options.projectId = project.projectId;
+    if (project.trackId) options.trackId = project.trackId;
+    session.projectId = project.projectId;
+    session.trackId = project.trackId || null;
+  }
+  // Started by a scheduled task: the row carries a clock chip, and main
+  // records the run against the schedule (recordScheduleRun) from scheduleId.
+  if (options.scheduleId) {
+    session.scheduleId = options.scheduleId;
+    session.scheduledAt = new Date().toISOString();
+  }
 
   // Track as pending (no .jsonl yet)
   const folder = encodeProjectPath(projectPath);
@@ -1037,12 +1205,15 @@ async function launchNewSession(project, sessionOptions) {
     }
     proj.sessions.unshift(session);
   }
+  if (typeof injectPendingIntoTree === 'function') injectPendingIntoTree(session);
   refreshSidebar();
 
   const entry = createTerminalEntry(session);
 
-  // Open terminal in main process with session options
-  const result = await window.api.openTerminal(sessionId, projectPath, true, sessionOptions || null);
+  // Open terminal in main process with session options. `null` rather than an
+  // empty object: main treats a present options object as an explicit config.
+  const result = await window.api.openTerminal(
+    sessionId, projectPath, true, Object.keys(options).length ? options : null);
   if (!result.ok) {
     entry.terminal.write(`\r\nError: ${result.error}\r\n`);
     entry.closed = true;
@@ -1050,7 +1221,9 @@ async function launchNewSession(project, sessionOptions) {
   }
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
 
-  showSession(sessionId);
+  // A scheduled launch runs in the background: it shows up in the lists like
+  // any session, but does not take over whatever the user is looking at.
+  if (focus) showSession(sessionId);
   pollActiveSessions();
 }
 
@@ -1097,6 +1270,36 @@ for (const entryPoint of ['createProjectTaskButton', 'showTaskPopover', 'hydrate
   }
 }
 
+// Same check for the Projects tab, for the same reason and with more force:
+// every call into projects-view.js and schedules.js from this file and from
+// sidebar.js is typeof-guarded, so the whole slice can go inert without a
+// single error — which is exactly how the last harvested feature shipped. One
+// report at load, naming what is missing, rather than silence.
+{
+  const missing = [];
+  for (const fn of [
+    // projects-view.js
+    'renderProjectList', 'showProjectHome', 'refreshProjectViews', 'leaveProjectViews',
+    'updateProjectStatusDots', 'dedupTree', 'injectPendingIntoTree', 'removeSessionFromTrees',
+    'treeTaskPaths', 'rekeyProjectSessionState', 'forgetProjectSessionState',
+    'selectedProject', 'enterWorking', 'onSessionShown', 'onMessagesShown',
+    'hideProjectChrome', 'showContextMenu', 'sessionMenuItems', 'showMovePopover',
+    'projectRootLabel', 'projectFolderMode', 'findTreeProject', 'taskPseudoProject',
+    'updateProjectTaskIndicators',
+    // schedules.js
+    'loadSchedules', 'schedulesForFolder', 'decorateScheduleButton',
+    'showFolderScheduleMenu', 'scheduleChipHtml',
+  ]) {
+    if (typeof window[fn] !== 'function') missing.push(fn + '()');
+  }
+  if (!projectsContent) missing.push('#projects-content');
+  if (!document.querySelector('.sidebar-tab[data-tab="projects"]')) missing.push('.sidebar-tab[data-tab="projects"]');
+  if (typeof window.api.getProjectTree !== 'function') missing.push('window.api.getProjectTree');
+  if (missing.length) {
+    console.error('[projects] the Projects tab is not fully wired up — missing: ' + missing.join(', '));
+  }
+}
+
 // The extension point showTaskLog() calls (`if (typeof onTaskLogShown ===
 // 'function')`, task-runner.js). A task log is a single full-width pane, but
 // showTaskLog only hides #grid-viewer — it leaves #terminals in .grid-layout, so
@@ -1105,8 +1308,21 @@ for (const entryPoint of ['createProjectTaskButton', 'showTaskPopover', 'hydrate
 // hideGridView() unwraps the cards and drops the layout class. The reverse
 // direction needs nothing here: showGridView() already removes .visible from
 // every .terminal-container, the task log's container included.
+//
+// MERGED, not two functions. projects-view.js declares an onTaskLogShown() of
+// its own (the enterWorking half below). Two top-level `function` declarations
+// of the same name in two classic scripts do not throw — the script that loads
+// LAST silently wins, and app.js is last in index.html — so the other copy is
+// dead weight, not a second handler. Both bodies have to live here or one of
+// the two behaviours is lost with nothing to show for it at runtime. See
+// needsWiring: the projects-view.js declaration should be deleted outright.
 function onTaskLogShown() {
   if (gridViewActive) hideGridView();
+  // Projects tab: the log opens BESIDE the project's pane, not over it.
+  if (activeTab !== 'projects') return;
+  if (typeof selectedProject !== 'function' || typeof enterWorking !== 'function') return;
+  const project = selectedProject();
+  if (project) enterWorking(project, null);
 }
 
 // Terminal lifecycle (createTerminalEntry, destroySession, showSession, setupDragAndDrop) → terminal-manager.js
@@ -1168,7 +1384,10 @@ window.addEventListener('resize', () => {
 document.querySelectorAll('.sidebar-tab').forEach(tab => {
   tab.addEventListener('click', () => {
     const tabName = tab.dataset.tab;
-    if (tabName === activeTab) return;
+    if (!tabName || tabName === activeTab) return;
+    // Leaving the Projects tab takes its page, strip and pane with it —
+    // otherwise the project chrome stays on screen under the next viewer.
+    if (activeTab === 'projects' && typeof leaveProjectViews === 'function') leaveProjectViews();
     activeTab = tabName;
     document.querySelectorAll('.sidebar-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
 
@@ -1180,6 +1399,7 @@ document.querySelectorAll('.sidebar-tab').forEach(tab => {
 
     // Hide all sidebar content areas
     sidebarContent.style.display = 'none';
+    if (projectsContent) projectsContent.style.display = 'none';
     plansContent.style.display = 'none';
     statsContent.style.display = 'none';
     memoryContent.style.display = 'none';
@@ -1210,6 +1430,19 @@ document.querySelectorAll('.sidebar-tab').forEach(tab => {
       if (projectsChangedWhileAway) {
         projectsChangedWhileAway = false;
         loadProjects();
+      }
+    } else if (tabName === 'projects') {
+      // The Projects tab shares the main area with Sessions: the same grid,
+      // the same active terminal, wrapped in the project strip and pane.
+      searchBar.style.display = '';
+      searchInput.placeholder = 'Search projects...';
+      if (projectsContent) projectsContent.style.display = '';
+      if (projectsChangedWhileAway) {
+        projectsChangedWhileAway = false;
+        loadProjects().then(() => { if (typeof showProjectHome === 'function') showProjectHome(); });
+      } else {
+        if (typeof renderProjectList === 'function') renderProjectList();
+        if (typeof showProjectHome === 'function') showProjectHome();
       }
     } else if (tabName === 'plans') {
       searchBar.style.display = '';
@@ -1440,17 +1673,28 @@ Promise.all([loadProjects(), windowIdentityReady]).then(() => {
 
 // Live-reload sidebar when filesystem changes are detected
 let projectsChangedTimer = null;
+// The strongest reason seen while the debounce window is open. 'sessions'
+// means only transcripts moved, which lets the project page patch itself
+// instead of rebuilding; anything else forces the full re-render.
+let projectsChangedReason = 'sessions';
 let projectsChangedWhileAway = false;
-window.api.onProjectsChanged(() => {
+window.api.onProjectsChanged((reason) => {
   // Debounce to avoid rapid re-renders during bulk changes
   if (projectsChangedTimer) clearTimeout(projectsChangedTimer);
-  if (activeTab !== 'sessions') {
+  if (activeTab !== 'sessions' && activeTab !== 'projects') {
     projectsChangedWhileAway = true;
     return;
   }
+  // A batch that mixes both is a project change: the wider refresh covers
+  // both. `reason` is undefined until preload forwards main's argument (see
+  // needsWiring), and undefined !== 'sessions', so today every change takes
+  // the safe full-rebuild path.
+  if (reason !== 'sessions') projectsChangedReason = 'project';
   projectsChangedTimer = setTimeout(() => {
     projectsChangedTimer = null;
-    loadProjects();
+    const only = projectsChangedReason;
+    projectsChangedReason = 'sessions';
+    loadProjects({ reason: only });
   }, 300);
 });
 
@@ -1464,7 +1708,12 @@ function renderDefaultStatus() {
   const parts = [];
   if (running > 0) parts.push(`${running} running`);
   parts.push(`${totalSessions} sessions`);
-  parts.push(`${totalProjects} projects`);
+  // `cachedAllProjects` counts FOLDERS; a project is a tree node that may span
+  // several of them, so the two are listed separately rather than one being
+  // relabelled as the other.
+  parts.push(`${totalProjects} folders`);
+  const projectCount = (cachedProjectTreeAll?.projects || []).filter(p => p.status === 'active').length;
+  if (projectCount > 0) parts.push(`${projectCount} project${projectCount === 1 ? '' : 's'}`);
   statusBarInfo.textContent = parts.join(' \u00b7 ');
 }
 
