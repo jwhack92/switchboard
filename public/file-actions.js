@@ -4,16 +4,13 @@
 // because nothing in the logic is fork-specific — but two things in its
 // ENVIRONMENT are, and both are somebody else's file to fix:
 //
-//   1. Two window.api entries this file calls DO NOT EXIST in this tree's
-//      preload.js. Upstream has them at preload.js:175 and :179:
-//        openFileExternally(filePath, projectRoot) -> 'open-file-externally'
-//        manageProjectEntry(projectPath, relativePath, action, newName)
-//                                       -> 'manage-project-entry'
-//      Neither ipc channel is handled in this tree's main.js either (it has
-//      'list-project-directory' at :876 and 'read-project-file' at :884 and
-//      stops there), and neither backing function is exported by this tree's
-//      project-files.js:156-164; upstream's manageProjectEntry lives in a
-//      ./file-management module that this tree does not have at all.
+//   1. ONE window.api entry this file calls does not exist in this tree's
+//      preload.js: openFileExternally(filePath, projectRoot) ->
+//      'open-file-externally' (upstream preload.js:175). It was removed on
+//      purpose in Phase 4; see the note further down before restoring it.
+//      manageProjectEntry was the other one, and it HAS since been ported:
+//      ./file-management.js plus the 'manage-project-entry' handler in
+//      main.js and the preload entry beside readProjectFile.
 //      window.api.openPath (preload.js:125) is NOT a substitute: main.js:740
 //      rejects anything that is not an existing directory, on purpose.
 //      Until those land: the two Copy rows still work (writeClipboard
@@ -116,21 +113,25 @@ function fileEntryMenuItems(root, entry, open) {
   };
   // Only offer what this tree can actually do.
   //
-  // manageProjectEntry (open-folder / reveal / rename / trash) needs a
-  // ./file-management module and an IPC channel that were never ported here,
-  // and openFileExternally was deliberately REMOVED in the Phase 4 security
-  // pass: it exposed unconstrained shell.openPath on any absolute path over
-  // contextBridge, with no extension allowlist and — at that time — no caller.
-  // This file is that caller arriving one phase later.
+  // manageProjectEntry (open-folder / reveal / rename / trash) IS available
+  // now: ./file-management.js was ported and wired at main.js's
+  // 'manage-project-entry' handler, with containment coming from
+  // project-files.js's resolveProjectEntry — the parent is resolved rather
+  // than the leaf, so renaming or trashing a symlink acts on the link, and
+  // both still have to land inside the project root.
   //
-  // Rendering a row that throws into an alert is worse than not rendering it:
-  // it tells the user the app can do something it cannot. So each row is gated
-  // on the API it needs actually existing, and the menu degrades to the two
-  // clipboard actions plus preview, which work.
+  // openFileExternally is still absent, deliberately. It was REMOVED in the
+  // Phase 4 security pass: it exposed unconstrained shell.openPath on any
+  // absolute path over contextBridge, with no extension allowlist and — at
+  // that time — no caller. This file is that caller arriving one phase later,
+  // which is a reason to restore the capability properly, not to revert the
+  // deletion. Restoring it means re-adding it WITH the path containment that
+  // removal was about; save-containment.js already has the shape.
   //
-  // To restore the rest: port ./file-management, and re-add openFileExternally
-  // WITH the path containment Phase 4's removal was about — save-containment.js
-  // already has the shape for it. Do not simply revert that deletion.
+  // The gates below stay regardless. Rendering a row that throws into an alert
+  // is worse than not rendering it: it tells the user the app can do something
+  // it cannot. Each row is gated on the API it needs actually existing, so the
+  // menu degrades instead of lying.
   const canManage = typeof window.api.manageProjectEntry === 'function';
   const canOpenExternally = typeof window.api.openFileExternally === 'function';
 

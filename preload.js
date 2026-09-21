@@ -254,6 +254,11 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.invoke('list-project-directory', projectPath, relativePath),
   readProjectFile: (projectPath, relativePath) =>
     ipcRenderer.invoke('read-project-file', projectPath, relativePath),
+  // open-folder / reveal / rename / trash. public/file-actions.js gates its
+  // context-menu rows on this being present, so adding it here is what turns
+  // those rows back on.
+  manageProjectEntry: (projectPath, relativePath, action, newName) =>
+    ipcRenderer.invoke('manage-project-entry', projectPath, relativePath, action, newName),
 
   // ── Terminal file links ──────────────────────────────────────────────
   // Batch-validates references scraped from terminal output. Main stats them;

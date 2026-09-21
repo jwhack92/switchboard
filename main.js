@@ -101,6 +101,7 @@ const claudeHarness = getHarness(DEFAULT_HARNESS);
 // is in effect.
 const { resolveTerminalFiles } = require('./terminal-file-links');
 const { readProjectFile, readPreviewFile, isViewableFile, resolveProjectEntry } = require('./project-files');
+const { manageProjectEntry } = require('./file-management');
 const { PREVIEW_SCHEME, PREVIEW_SCHEMES, handlePreviewAssetRequest } = require('./preview-assets');
 const { createTaskManager } = require('./task-manager');
 const { createPanelPathGuard } = require('./save-containment');
@@ -718,6 +719,46 @@ ipcMain.handle('list-env-files', guarded((folderPath) => ({
 })));
 ipcMain.handle('save-project-brief', guarded((id, content) => projects.saveBrief(id, content)));
 ipcMain.handle('create-project-file', guarded((id, name, content) => projects.createProjectFile(id, name, content)));
+// Open folder / reveal / rename / move-to-trash for an entry in the file
+// browser. NOT wrapped in guarded(): that helper drops the event, and both the
+// containment check and the confirmation dialog need it.
+//
+// Containment is file-management.js's own, via project-files.js's
+// resolveProjectEntry - it resolves the PARENT rather than the leaf, so
+// renaming or trashing a symlink acts on the link and not on whatever it
+// points at, and both still have to land inside the project root. This is the
+// constrained shape Phase 4 asked for when it deleted the unconstrained
+// openFileExternally (a bare shell.openPath on any resolvable path, with no
+// caller). Restoring the capability this way is the point; reverting that
+// deletion would not have been.
+//
+// Diverges from upstream in one place: upstream parents the trash confirmation
+// to a `mainWindow` singleton (upstream/main:main.js:555). This fork is
+// multi-window, so the dialog is parented to the window that actually asked,
+// matching the pattern already used at main.js:544. Getting this wrong puts a
+// modal on a window the user is not looking at.
+ipcMain.handle('manage-project-entry', async (event, projectPath, relativePath, action, newName) => {
+  try {
+    const result = await manageProjectEntry(projectPath, relativePath, action, newName, {
+      shell,
+      confirmTrash: async (filePath, isDirectory) => {
+        const destination = process.platform === 'win32' ? 'Recycle Bin' : 'Trash';
+        const choice = await dialog.showMessageBox(registry.windowOf(event), {
+          type: 'question',
+          message: `Move "${path.basename(filePath)}" to the ${destination}?`,
+          detail: `${isDirectory ? 'The folder and its contents' : 'The file'} can be restored from the ${destination}. Open previews of this item will close; unsaved edits will be discarded.`,
+          buttons: ['Cancel', `Move to ${destination}`], defaultId: 0, cancelId: 0,
+          noLink: true,
+        });
+        return choice.response === 1;
+      },
+    });
+    return { ok: true, ...result };
+  } catch (err) {
+    log.error('[file-management]', err);
+    return { ok: false, error: err.message };
+  }
+});
 ipcMain.handle('add-project-files', guarded((id, sourcePaths) => projects.addProjectFiles(id, sourcePaths)));
 ipcMain.handle('list-recent-project-files', guarded((id) => projects.listRecentProjectFiles(id)));
 ipcMain.handle('get-project-plan', guarded((id) => projects.readProjectPlan(id)));
