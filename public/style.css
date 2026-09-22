@@ -2944,8 +2944,15 @@ body { display: flex; flex-direction: column; }
   align-items: center;
   justify-content: center;
   z-index: 9999;
+  padding: 24px;
 }
 
+/* Same viewport cap as .task-confirm-dialog and .new-session-dialog. A centred
+   flex item in a non-scrolling fixed overlay overflows BOTH ends when it outgrows
+   the window, putting the title and the action row equally out of reach -- so this
+   is a floor for the base, not a fix aimed at one consumer. Today only np-dialog
+   can actually reach that size (#np-folders grows a row per folder added, with
+   nothing bounding it); the rest of this family is fixed-height or a prompt. */
 .add-project-dialog {
   background: #1e1e2e;
   border: 1px solid rgba(255,255,255,0.1);
@@ -2953,6 +2960,9 @@ body { display: flex; flex-direction: column; }
   padding: 20px;
   width: 440px;
   max-width: 90vw;
+  max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   box-shadow: 0 8px 32px rgba(0,0,0,0.5);
 }
 
@@ -3531,6 +3541,7 @@ body { display: flex; flex-direction: column; }
   align-items: center;
   justify-content: center;
   z-index: 1000;
+  padding: 24px;
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
 }
@@ -3542,6 +3553,9 @@ body { display: flex; flex-direction: column; }
   padding: 24px;
   width: 540px;
   max-width: 90vw;
+  max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   box-shadow: 0 16px 48px rgba(0,0,0,0.4);
 }
 
@@ -3637,6 +3651,24 @@ body { display: flex; flex-direction: column; }
   justify-content: flex-end;
   gap: 8px;
   margin-top: 20px;
+}
+
+/* The dialog scrolls, so the buttons pin to its bottom edge rather than sliding
+   away below the fold. The negative side margins let the bar span the dialog's
+   padding, so scrolled content passes behind the bar rather than beside it.
+   Scoped to .new-session-dialog, which makes the class PAIR at schedules.js:229
+   ('new-session-dialog schedule-dialog') load-bearing: on .schedule-dialog alone
+   the max-height above would still apply and this would not, leaving the dialog
+   scrollable with its buttons still sliding off the bottom -- the exact bug this
+   fixes, half-fixed. `inherit` rather than a second #1e1e2a literal: the bar must
+   match whatever background the dialog carries, and a copy diverges in silence. */
+.new-session-dialog .new-session-actions {
+  position: sticky;
+  bottom: 0;
+  margin: 20px -24px 0;
+  padding: 14px 24px;
+  background: inherit;
+  border-top: 1px solid rgba(255,255,255,0.06);
 }
 
 .new-session-cancel-btn {

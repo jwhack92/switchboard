@@ -226,6 +226,10 @@ function showScheduleDialog({ schedule = null, projectId = null, trackId = null,
   const overlay = document.createElement('div');
   overlay.className = 'new-session-overlay';
   const dialog = document.createElement('div');
+  // Both classes, deliberately. .schedule-dialog carries this dialog's own sizing;
+  // .new-session-dialog is what carries the viewport cap and the sticky action bar
+  // (style.css) that keep Cancel/Save reachable once the dialog outgrows the window.
+  // This is the tallest dialog in the app, so it is the one that needs them.
   dialog.className = 'new-session-dialog schedule-dialog';
   dialog.setAttribute('role', 'dialog');
   dialog.setAttribute('aria-modal', 'true');
