@@ -51,7 +51,7 @@ const REQUEST_LINE = 'Write the context handoff now. [ctx-handoff:request]';
 const WARN_AT = 300000;
 const DUE_AT = 400000;
 // Asked before typing into a session whose turn marker does not say "ended".
-const OVERRIDE_CONFIRM = 'This session has not reported the end of its turn. If a permission prompt or a question is open in the terminal, the typed line and Enter could answer it. Type the handoff request anyway?';
+const OVERRIDE_CONFIRM = 'Switchboard cannot confirm that this session is idle at its prompt. If a permission prompt or a question is open in the terminal, the typed line and Enter could answer it. Type the handoff request anyway?';
 const OVERRIDE_TITLE = 'This session has not reported the end of its turn. Click to type the request anyway (asks first).';
 // The turn marker says "ended", but this window has not been told whether the
 // session is busy: the same question, a tooltip that gives the real reason.

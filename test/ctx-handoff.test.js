@@ -181,7 +181,7 @@ test('the request line ends with the marker (the hook matches the end of the pro
 test('the override confirmation is the exact text Jason approved', () => {
   assert.equal(
     OVERRIDE_CONFIRM,
-    'This session has not reported the end of its turn. If a permission prompt or a question is open in the terminal, '
+    'Switchboard cannot confirm that this session is idle at its prompt. If a permission prompt or a question is open in the terminal, '
       + 'the typed line and Enter could answer it. Type the handoff request anyway?'
   );
 });
