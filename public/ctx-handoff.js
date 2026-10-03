@@ -8,7 +8,14 @@
 // This file only READS them. It shows the numbers (a chip on the Sessions
 // sidebar row, a meter in the terminal header) and offers two actions in the
 // header: ask the session to write its handoff, and start a sibling session
-// that reads it. Nothing here pops up and nothing launches by itself.
+// that reads it. Nothing launches by itself, and the only thing that pops up is
+// the question a click gets when the session has not reported the end of its
+// turn (OVERRIDE_CONFIRM). A session that is busy is never typed into.
+//
+// How the state file is read follows the hook's own "Reader contract"
+// (ctx_handoff.py module docstring): crossed_at ties the file to a request,
+// written_at alone never does, a Stop counts only when it is later than the
+// last line typed here, and reads of one file are 500 ms apart or slower.
 //
 // Two halves:
 //   1. Pure functions (no DOM, no window) -- unit-tested under plain Node via
@@ -38,17 +45,39 @@ const REQUEST_LINE = 'Write the context handoff now. [ctx-handoff:request]';
 // from DUE_AT.
 const WARN_AT = 300000;
 const DUE_AT = 400000;
+// Asked before typing into a session whose turn marker does not say "ended".
+const OVERRIDE_CONFIRM = 'This session has not reported the end of its turn. If a permission prompt or a question is open in the terminal, the typed line and Enter could answer it. Type the handoff request anyway?';
+const OVERRIDE_TITLE = 'This session has not reported the end of its turn. Click to type the request anyway (asks first).';
 
 // ---------------------------------------------------------------- pure
+
+// Python's round(): an exact half goes to the even neighbour. Math.round sends
+// it up, which put "413K" here beside "412K" in the status line.
+function roundHalfEven(x) {
+  const floor = Math.floor(x);
+  const diff = x - floor;
+  if (diff < 0.5) return floor;
+  if (diff > 0.5) return floor + 1;
+  return floor % 2 === 0 ? floor : floor + 1;
+}
+
+// The hook's "%.1f". toFixed(1) agrees except on an exact tie, which it sends
+// up and C sends to the even digit. x.25 and x.75 are the only halves of a
+// tenth a double holds exactly, so those are the only ties there are.
+function fixed1HalfEven(v) {
+  const quarters = v * 4;
+  if (Number.isInteger(quarters) && quarters % 2 !== 0) return (roundHalfEven(v * 10) / 10).toFixed(1);
+  return v.toFixed(1);
+}
 
 // Same rule as fmt_tokens() in the hook, so the chip and the status line agree.
 function fmtTokens(n) {
   const v = typeof n === 'number' && isFinite(n) ? n : 0;
   if (v >= 1e6) {
     const m = v / 1e6;
-    return (Number.isInteger(m) ? String(m) : m.toFixed(1)) + 'M';
+    return (Number.isInteger(m) ? String(m) : fixed1HalfEven(m)) + 'M';
   }
-  return Math.round(v / 1000) + 'K';
+  return roundHalfEven(v / 1000) + 'K';
 }
 
 function chipLevel(tokens) {
@@ -91,8 +120,9 @@ function meterModel(sidecar) {
 
 // True only when the LAST hook event was a Stop. A session waiting on a
 // permission prompt looks idle to Switchboard (measured), so the busy flag
-// alone must never be what lets this file type into a terminal. Without the
-// hook's last_stop_at / last_prompt_at keys this is false, and typing stays off.
+// alone must never be what lets this file type into a terminal unasked. Without
+// the hook's last_stop_at / last_prompt_at keys this is false ("unknown", not
+// "ended"), and typing needs the confirmed override -- see buttonModel.
 function turnEnded(state) {
   if (!state || typeof state !== 'object') return false;
   if (typeof state.last_stop_at !== 'number') return false;
@@ -137,8 +167,16 @@ function chipState(input) {
  * off / Writing… / Continue in new session); `update` is the small one beside
  * Continue, for a handoff that has gone stale.
  *
- * "enabled" on a typing control (Hand off, Update) means it is safe to type a
- * line into the session's terminal right now -- see turnEnded.
+ * A typing control (Hand off, Update) is in one of three states:
+ *   enabled, override false   the turn has ended: a click types the request
+ *   enabled, override true    the session is not busy but has NOT reported the
+ *                             end of its turn (no state file, no Stop since the
+ *                             last prompt, the spinner came on after the last
+ *                             Stop, or no Stop since the last request typed
+ *                             here): a click asks first (OVERRIDE_CONFIRM)
+ *   disabled                  never typed into: busy, still starting, shown in
+ *                             another window, not running. `title` says which.
+ * busy === true is never overridable.
  */
 function buttonModel(input) {
   const o = input || {};
@@ -147,8 +185,8 @@ function buttonModel(input) {
   const running = !!o.running;
   const model = {
     visible: false,
-    primary: { kind: 'handoff', label: 'Hand off', enabled: false, title: '' },
-    update: { visible: false, enabled: false, title: '' },
+    primary: { kind: 'handoff', label: 'Hand off', enabled: false, override: false, title: '' },
+    update: { visible: false, enabled: false, override: false, title: '' },
     note: null,
   };
   if (o.isTerminal) return model;
@@ -156,7 +194,7 @@ function buttonModel(input) {
   if (request.phase === 'requested') {
     model.visible = true;
     model.primary = {
-      kind: 'writing', label: 'Writing…', enabled: false,
+      kind: 'writing', label: 'Writing…', enabled: false, override: false,
       title: 'Waiting for the session to write the handoff',
     };
     return model;
@@ -166,40 +204,58 @@ function buttonModel(input) {
   // The spinner came on after the last Stop the hook recorded: a turn is
   // running that the state file has not caught up with.
   const busyAfterStop = o.lastBusyAtMs != null && lastStopMs !== null && o.lastBusyAtMs > lastStopMs;
-  const ended = turnEnded(state);
-  const canType = running && !o.ownedElsewhere && !o.pendingRow && o.busy !== true && ended && !busyAfterStop;
+  // The turn marker fails open on the prompt side (a failed userprompt write
+  // leaves the old Stop in place), so a Stop only counts when it is later than
+  // the last line this file typed. atMs survives the request going back to idle.
+  const sentAtMs = typeof request.atMs === 'number' && request.atMs > 0 ? request.atMs : null;
+  const stopAfterSent = sentAtMs === null || (lastStopMs !== null && lastStopMs > sentAtMs);
+  const ended = turnEnded(state) && !busyAfterStop && stopAfterSent;
+  const allowed = running && !o.ownedElsewhere && !o.pendingRow && o.busy !== true;
+  const override = allowed && !ended;
 
   let why = '';
-  if (!canType) {
+  if (!allowed) {
     if (o.ownedElsewhere) why = 'Shown in another window';
     else if (o.pendingRow) why = 'Session is still starting';
-    else if (o.busy === true || busyAfterStop) why = 'Session is working';
-    else if (!ended) why = 'Waiting for the current turn to finish';
+    else if (o.busy === true) why = 'Session is working';
     else why = 'Session is not running';
   }
+  const typingTitle = okTitle => (!allowed ? why : override ? OVERRIDE_TITLE : okTitle);
 
   const info = handoffInfo(state, o.handoffReadable);
   if (info.status === 'written') {
     // Kept for a stopped session too: the handoff outlives the process.
+    const locked = o.continueLocked === true;
     model.visible = true;
     model.primary = {
-      kind: 'continue', label: 'Continue in new session', enabled: true,
-      title: 'Start a new session in the same folder that reads the handoff first',
+      kind: 'continue', label: 'Continue in new session', enabled: !locked, override: false,
+      title: locked
+        ? 'Starting the new session…'
+        : 'Start a new session in the same folder that reads the handoff first',
     };
     model.update = {
       visible: running,
-      enabled: canType,
-      title: canType ? 'Ask this session to write the handoff again' : why,
+      enabled: allowed,
+      override,
+      title: typingTitle('Ask this session to write the handoff again'),
     };
   } else if (running) {
     model.visible = true;
     model.primary = {
-      kind: 'handoff', label: 'Hand off', enabled: canType,
-      title: canType ? 'Ask this session to write its context handoff' : why,
+      kind: 'handoff', label: 'Hand off', enabled: allowed, override,
+      title: typingTitle('Ask this session to write its context handoff'),
     };
   }
   if (request.phase === 'timeout') model.note = request.reason != null ? request.reason : null;
   return model;
+}
+
+// The folder a sibling session starts in: the session's own, else the cwd the
+// hook put in the sidecar (a session this window has no row for).
+function launchFolder(session, sidecar) {
+  if (session && typeof session.projectPath === 'string' && session.projectPath) return session.projectPath;
+  if (sidecar && typeof sidecar.cwd === 'string' && sidecar.cwd) return sidecar.cwd;
+  return null;
 }
 
 // Forward slashes: the path is pasted into a prompt, where a backslash is one
@@ -209,11 +265,20 @@ function continuePrompt(handoffPath) {
 }
 
 /**
- * Where a typed request has got to. The 1 s of slack covers the hook stamping
- * its time a moment before Date.now() was read here.
- *   written      a handoff was written since the request (and none is pending)
- *   not_landed   20 s on, the hook has seen no prompt since the request
- *   not_written  10 minutes on, still no handoff
+ * Where a typed request has got to, by the hook's reader contract
+ * (ctx_handoff.py, "Reader contract"). The hook stamps crossed_at when it sees
+ * the request marker, and every request re-stamps it, so crossed_at is what ties
+ * the state file to THIS request; the 1 s of slack covers the two clocks being
+ * read a moment apart.
+ *   acknowledged   manual and pending are true and crossed_at is not older than
+ *                  the request
+ *   written        pending and manual are false and written_at is later than a
+ *                  crossed_at that is not older than the request. written_at
+ *                  alone proves nothing: it survives from earlier handoffs.
+ *   session_ended  the session stopped running first (`running` false)
+ *   not_landed     20 s on, neither acknowledged nor written
+ *   not_written    10 minutes on, still no handoff
+ * A manual key that is missing counts as its default, false.
  */
 function requestOutcome(input) {
   const o = input || {};
@@ -221,13 +286,16 @@ function requestOutcome(input) {
   if (!request || typeof request.atMs !== 'number') return 'waiting';
   const state = o.state && typeof o.state === 'object' ? o.state : null;
   const nowMs = typeof o.nowMs === 'number' ? o.nowMs : Date.now();
-  const since = request.atMs - 1000;
-  if (state && state.pending !== true && typeof state.written_at === 'number' && state.written_at * 1000 >= since) {
+  const crossedAt = state && typeof state.crossed_at === 'number' && isFinite(state.crossed_at) ? state.crossed_at : null;
+  const forThisRequest = crossedAt !== null && crossedAt * 1000 >= request.atMs - 1000;
+  if (forThisRequest && state.pending === false && (state.manual === false || state.manual === undefined)
+    && typeof state.written_at === 'number' && state.written_at > crossedAt) {
     return 'written';
   }
+  if (o.running === false) return 'session_ended';
+  const acknowledged = forThisRequest && state.manual === true && state.pending === true;
   const elapsed = nowMs - request.atMs;
-  const landed = !!state && typeof state.last_prompt_at === 'number' && state.last_prompt_at * 1000 >= since;
-  if (elapsed > 20000 && !landed) return 'not_landed';
+  if (elapsed > 20000 && !acknowledged) return 'not_landed';
   if (elapsed > 600000) return 'not_written';
   return 'waiting';
 }
@@ -237,20 +305,28 @@ function requestOutcome(input) {
 
 const HANDOFF_NOT_LANDED = 'The request did not reach the session. If the line is sitting in the input box, press Enter there.';
 const HANDOFF_NOT_WRITTEN = 'No handoff was written after 10 minutes.';
+const HANDOFF_SESSION_ENDED = 'The session ended before the handoff was written.';
 // Session ids end up in a file path and in a CSS selector. Real ones are UUIDs.
 const HANDOFF_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+// How often the handoff file itself is read again once it has been checked.
+const HANDOFF_RECHECK_MS = 60000;
+// activePtyIds is refreshed by a 3 s poll (app.js POLL_FAST_MS) and can lag a
+// fork's new id by one round: "not running" has to hold this long to count.
+const HANDOFF_ENDED_AFTER_MS = 6000;
+const HANDOFF_CONTINUE_LOCK_MS = 3000;
+const HANDOFF_MIN_READ_GAP_MS = 500;
 
 const handoffRt = {
-  // sessionId → { id, sidecar, state, handoffReadable, readableFor, request, lastBusyAtMs }
+  // sessionId → see handoffEntry
   cache: new Map(),
   ctxDirPromise: null,
   inflight: new Map(), // sessionId → Promise of the read in progress
+  lastReadAtMs: new Map(), // sessionId → when its last read was started
   els: null,           // header elements, once built
   logged: new Set(),
   started: false,
   primed: false,       // the first read of every running session has been sent
   tickCount: 0,
-  continueLockUntil: 0,
 };
 
 // Once per message: a failure in a 1 s tick must not become a log flood.
@@ -283,9 +359,12 @@ function handoffEntry(id) {
     entry = {
       id, sidecar: null, state: null,
       handoffReadable: false,
-      readableFor: null, // the written_at value handoffReadable was checked for
+      readableFor: null,       // the written_at value handoffReadable was checked for
+      readableCheckedAtMs: 0,  // when that check ran
       request: handoffIdleRequest(),
       lastBusyAtMs: null,
+      notRunningSinceMs: 0,    // first time a request's session was seen not running
+      continueLockUntil: 0,    // Continue ignores clicks until then
     };
     handoffRt.cache.set(id, entry);
   }
@@ -300,8 +379,13 @@ function handoffActiveId() {
 
 // activePtyIds is REPLACED on every poll (app.js pollActiveSessions), so it is
 // looked up each time and never held on to.
+// → true / false, or undefined when app.js cannot be read.
+function handoffRunningState(id) {
+  try { return typeof activePtyIds !== 'undefined' && activePtyIds ? activePtyIds.has(id) : undefined; } catch { return undefined; }
+}
+
 function handoffIsRunning(id) {
-  try { return typeof activePtyIds !== 'undefined' && !!activePtyIds && activePtyIds.has(id); } catch { return false; }
+  return handoffRunningState(id) === true;
 }
 
 function handoffRunningIds() {
@@ -345,6 +429,7 @@ function handoffInputs(id) {
     state: entry ? entry.state : null,
     handoffReadable: entry ? entry.handoffReadable : false,
     request: entry ? entry.request : handoffIdleRequest(),
+    continueLocked: !!entry && Date.now() < entry.continueLockUntil,
     nowMs: Date.now(),
   };
 }
@@ -421,8 +506,9 @@ async function handoffReadPair(id) {
   return { sidecar, state };
 }
 
-// Only when written_at CHANGES, not on every poll: the check reads the whole
-// handoff file across IPC.
+// When written_at CHANGES, and after that at most once a minute -- not on every
+// poll: the check reads the whole handoff file across IPC. The minute is what
+// lets a failed check heal and a deleted handoff stop offering Continue.
 async function handoffCheckReadable(entry) {
   const state = entry.state;
   const writtenAt = state && typeof state.written_at === 'number' ? state.written_at : null;
@@ -430,16 +516,24 @@ async function handoffCheckReadable(entry) {
   if (writtenAt === null || !filePath) {
     entry.handoffReadable = false;
     entry.readableFor = null;
+    entry.readableCheckedAtMs = 0;
     return;
   }
-  if (entry.readableFor === writtenAt) return;
+  const sameHandoff = entry.readableFor === writtenAt;
+  if (sameHandoff && Date.now() - entry.readableCheckedAtMs < HANDOFF_RECHECK_MS) return;
   let readable = false;
+  let gone = false;
   try {
     if (typeof window.api.readFileForPanel === 'function') {
       const res = await window.api.readFileForPanel(filePath);
       readable = !!(res && res.ok);
+      gone = !!res && !res.ok && res.code === 'ENOENT';
     }
   } catch {}
+  entry.readableCheckedAtMs = Date.now();
+  // A handoff that was readable a minute ago and fails once is most likely
+  // being rewritten: only "the file is gone" takes Continue away.
+  if (sameHandoff && entry.handoffReadable && !readable && !gone) return;
   entry.handoffReadable = readable;
   entry.readableFor = writtenAt;
 }
@@ -447,14 +541,29 @@ async function handoffCheckReadable(entry) {
 function handoffApplyOutcome(entry) {
   const request = entry.request;
   if (request.phase !== 'requested' && request.phase !== 'timeout') return;
-  const outcome = requestOutcome({ request, state: entry.state, nowMs: Date.now() });
+  const nowMs = Date.now();
+  let running = handoffRunningState(entry.id);
+  if (running === false) {
+    if (!entry.notRunningSinceMs) entry.notRunningSinceMs = nowMs;
+    if (nowMs - entry.notRunningSinceMs < HANDOFF_ENDED_AFTER_MS) running = undefined;
+  } else {
+    entry.notRunningSinceMs = 0;
+  }
+  const outcome = requestOutcome({ request, state: entry.state, nowMs, running });
   if (outcome === 'written') {
-    // Also clears a timeout note: the handoff turned up after all.
-    entry.request = handoffIdleRequest();
-  } else if (request.phase === 'requested' && outcome === 'not_landed') {
-    entry.request = { phase: 'timeout', atMs: request.atMs, reason: HANDOFF_NOT_LANDED };
-  } else if (request.phase === 'requested' && outcome === 'not_written') {
-    entry.request = { phase: 'timeout', atMs: request.atMs, reason: HANDOFF_NOT_WRITTEN };
+    // Also clears a timeout note: the handoff turned up after all. atMs is
+    // kept: buttonModel wants a Stop later than the last line typed here.
+    entry.request = { phase: 'idle', atMs: request.atMs, reason: '' };
+  } else if (request.phase === 'requested') {
+    let reason = '';
+    if (outcome === 'session_ended') reason = HANDOFF_SESSION_ENDED;
+    else if (outcome === 'not_landed') reason = HANDOFF_NOT_LANDED;
+    else if (outcome === 'not_written') reason = HANDOFF_NOT_WRITTEN;
+    if (reason) entry.request = { phase: 'timeout', atMs: request.atMs, reason };
+  } else if (request.reason === HANDOFF_NOT_LANDED && outcome === 'waiting') {
+    // Acknowledged late (the line sat queued behind a running turn): it did
+    // land, so this is "Writing…" again, with the 10 minutes still counting.
+    entry.request = { phase: 'requested', atMs: request.atMs, reason: '' };
   }
 }
 
@@ -480,6 +589,12 @@ function handoffRefresh(id) {
   if (!handoffRt.started || typeof id !== 'string' || !HANDOFF_ID_RE.test(id)) return Promise.resolve();
   const running = handoffRt.inflight.get(id);
   if (running) return running;
+  // The hook's reader contract: reads of a state file 500 ms apart or slower
+  // (its own write has to get in between). A caller that comes sooner gets
+  // what the cache already holds, which is that fresh.
+  const nowMs = Date.now();
+  if (nowMs - (handoffRt.lastReadAtMs.get(id) || 0) < HANDOFF_MIN_READ_GAP_MS) return Promise.resolve();
+  handoffRt.lastReadAtMs.set(id, nowMs);
   const read = handoffDoRefresh(id)
     .catch(err => handoffLogOnce('read failed', err))
     .then(() => { handoffRt.inflight.delete(id); });
@@ -661,12 +776,13 @@ function handoffRenderHeader() {
     label: model.primary.label,
     enabled: model.primary.enabled,
     title: model.primary.title,
-    extraClass: 'handoff-btn-' + model.primary.kind,
+    extraClass: 'handoff-btn-' + model.primary.kind + (model.primary.override ? ' handoff-btn-override' : ''),
   });
   handoffSetButton(els.update, {
     visible: model.visible && model.update.visible,
     enabled: model.update.enabled,
     title: model.update.title,
+    extraClass: model.update.override ? 'handoff-btn-override' : '',
   });
   const note = model.visible && model.note ? String(model.note) : '';
   handoffShow(els.note, !!note);
@@ -716,10 +832,12 @@ function handoffFindInTree(id) {
 // project/track when one can be found, else by folder only.
 function handoffLaunchTarget(id) {
   const session = handoffSession(id);
-  if (!session || typeof session.projectPath !== 'string' || !session.projectPath) return null;
-  const target = { projectPath: session.projectPath };
-  let projectId = session.projectId || null;
-  let trackId = session.trackId || null;
+  const entry = handoffRt.cache.get(id);
+  const folder = launchFolder(session, entry ? entry.sidecar : null);
+  if (!folder) return null;
+  const target = { projectPath: folder };
+  let projectId = (session && session.projectId) || null;
+  let trackId = (session && session.trackId) || null;
   if (!projectId) {
     let found = null;
     try { found = handoffFindInTree(id); } catch {}
@@ -737,12 +855,16 @@ function handoffLaunchTarget(id) {
 
 // The second click. The old session is left running: nothing here stops it.
 async function handoffContinue(id) {
-  // launchNewSession is not instant; a double click must not start two siblings.
-  if (Date.now() < handoffRt.continueLockUntil) return;
-  handoffRt.continueLockUntil = Date.now() + 3000;
   const entry = handoffRt.cache.get(id);
-  const info = handoffInfo(entry ? entry.state : null, entry ? entry.handoffReadable : false);
+  if (!entry) return;
+  // launchNewSession is not instant; a double click must not start two
+  // siblings. The button shows as disabled meanwhile (buttonModel
+  // continueLocked) and the 1 s tick brings it back.
+  if (Date.now() < entry.continueLockUntil) return;
+  const info = handoffInfo(entry.state, entry.handoffReadable);
   if (info.status !== 'written') return;
+  entry.continueLockUntil = Date.now() + HANDOFF_CONTINUE_LOCK_MS;
+  handoffRenderHeader();
   if (typeof resolveDefaultSessionOptions !== 'function' || typeof launchNewSession !== 'function') {
     handoffLogOnce('Continue: launchNewSession() / resolveDefaultSessionOptions() are missing');
     return;
@@ -760,23 +882,54 @@ async function handoffContinue(id) {
   await launchNewSession(target, options);
 }
 
+// The typing control a click is for, decided NOW and not from what the button
+// looked like a second ago. null when that control is not on offer.
+function handoffTypingControl(id, which) {
+  const model = buttonModel(handoffInputs(id));
+  if (!model.visible) return null;
+  if (which === 'update') return model.update.visible ? model.update : null;
+  return model.primary.kind === 'handoff' ? model.primary : null;
+}
+
+// The app's own confirm dialogs are window.confirm (app.js confirmAndStopSession).
+// Anything but an explicit OK is a no.
+function handoffConfirmOverride() {
+  try { return typeof window.confirm === 'function' && window.confirm(OVERRIDE_CONFIRM) === true; } catch { return false; }
+}
+
+async function handoffTypeRequest(id, which) {
+  let control = handoffTypingControl(id, which);
+  if (!control || !control.enabled) return;
+  if (control.override) {
+    if (!handoffConfirmOverride()) return;
+    // The dialog held this window up: busy events queued behind it and the
+    // state file may have moved on. Read again and decide again. A session
+    // that went busy meanwhile is not typed into; one that is still (or now
+    // properly) clear is, with the question already answered.
+    await handoffRefresh(id);
+    if (handoffActiveId() !== id) return;
+    control = handoffTypingControl(id, which);
+    if (!control || !control.enabled) {
+      handoffRenderHeader();
+      return;
+    }
+  }
+  handoffSendRequest(id);
+}
+
 function handoffOnPrimaryClick() {
   const id = handoffActiveId();
   if (!id) return undefined;
-  // Decided again NOW, not from what the button looked like a second ago.
   const model = buttonModel(handoffInputs(id));
   if (!model.visible || !model.primary.enabled) return undefined;
-  if (model.primary.kind === 'handoff') handoffSendRequest(id);
-  else if (model.primary.kind === 'continue') return handoffContinue(id);
+  if (model.primary.kind === 'continue') return handoffContinue(id);
+  if (model.primary.kind === 'handoff') return handoffTypeRequest(id, 'primary');
   return undefined;
 }
 
 function handoffOnUpdateClick() {
   const id = handoffActiveId();
-  if (!id) return;
-  const model = buttonModel(handoffInputs(id));
-  if (!model.visible || !model.update.visible || !model.update.enabled) return;
-  handoffSendRequest(id);
+  return id ? handoffTypeRequest(id, 'update') : undefined;
 }
 
 // --- Triggers ---
@@ -789,6 +942,9 @@ function handoffOnUpdateClick() {
 function handoffTick() {
   handoffRt.tickCount++;
   const tick = handoffRt.tickCount;
+  // The header was not there at load: the chips run without it, and the meter
+  // and buttons join in if it turns up.
+  if (!handoffRt.els) handoffRt.els = handoffBuildHeader();
   if (tick % 2 === 0) {
     for (const [id, entry] of handoffRt.cache) {
       if (entry.request.phase === 'requested') handoffRefresh(id);
@@ -825,12 +981,12 @@ function handoffInit() {
     handoffLogOnce('window.api is missing — the context meter stays off');
     return;
   }
-  const els = handoffBuildHeader();
-  if (!els) {
-    handoffLogOnce('the terminal header controls are missing — the context meter stays off');
-    return;
+  // No header is not a reason to lose the sidebar chips: they need only the
+  // cache and the reads. handoffRenderHeader does nothing without els.
+  handoffRt.els = handoffBuildHeader();
+  if (!handoffRt.els) {
+    handoffLogOnce('the terminal header controls are missing — the header meter and buttons stay off, the sidebar chips still work');
   }
-  handoffRt.els = els;
   handoffRt.started = true;
 
   // Our own listener, beside app.js's. It is registered first (this script
@@ -876,9 +1032,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    REQUEST_LINE, WARN_AT, DUE_AT,
+    REQUEST_LINE, WARN_AT, DUE_AT, OVERRIDE_CONFIRM,
     fmtTokens, chipLevel, deriveCtxDir, meterModel, turnEnded, handoffInfo,
-    chipState, buttonModel, continuePrompt, requestOutcome,
+    chipState, buttonModel, continuePrompt, requestOutcome, launchFolder,
     handoffChipState, onActiveSessionChanged,
   };
 }
