@@ -465,7 +465,26 @@ function createTerminalEntry(session) {
     theme: TERMINAL_THEME,
     cursorBlink: false,
     scrollback: 10000,
-    convertEol: true,
+    // NOT convertEol. That option turns every bare LF into CR+LF — a
+    // convenience for plain text, and wrong for a TUI. Claude Code draws by
+    // diff: it positions the cursor and moves down a row with a bare \n,
+    // expecting the column to stay put, which is standard VT behaviour. With
+    // convertEol the cursor went back to column 1 instead, so the row was
+    // written two cells left of where the CLI aimed it, and every cell it
+    // skipped with \e[1C ("already correct") showed a stale character from an
+    // older frame. "measurement that separates them needed" came out as
+    // "mxasurementethat separates thom nteded".
+    //
+    // Captured 2026-10-01 by terminal-diagnostics.js: the raw PTY bytes were
+    // correct, the buffer and the screenshot were both wrong in the same way,
+    // and the damaged rows were exactly the ones drawn as \e[N;3H \e[K \n.
+    // Resizing "fixed" it only because SIGWINCH makes the CLI redraw in full.
+    //
+    // Inherited from upstream's first commit with no recorded reason. Nothing
+    // here needs it: our own writes use explicit \r\n, and so does the
+    // serialize addon that replays scrollback on a tear-off. (task-runner.js
+    // keeps it on deliberately — task logs are plain line output.)
+    convertEol: false,
     // Disable xterm's buffer reflow.
     //
     // On a column change xterm re-wraps existing scrollback in place. Claude
