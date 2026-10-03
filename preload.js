@@ -125,6 +125,13 @@ contextBridge.exposeInMainWorld('api', {
   openPath: (target) => ipcRenderer.invoke('open-path', target),
   writeClipboard: (text) => ipcRenderer.invoke('clipboard-write-text', text),
 
+  // Terminal display diagnostics — see public/terminal-diagnostics.js. `report`
+  // is the renderer's account of the xterm buffer; main pairs it with a PNG of
+  // the window so the cells and the pixels can be compared.
+  diagCapture: (report) => ipcRenderer.invoke('diag-capture', report),
+  diagOpenFolder: () => ipcRenderer.invoke('diag-open-folder'),
+  diagDir: () => ipcRenderer.invoke('diag-dir'),
+
   // Send (fire-and-forget)
   sendInput: (id, data) => ipcRenderer.send('terminal-input', id, data),
   resizeTerminal: (id, cols, rows) => ipcRenderer.send('terminal-resize', id, cols, rows),

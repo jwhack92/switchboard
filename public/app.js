@@ -353,6 +353,7 @@ function rekeySessionMaps(oldId, newId) {
     terminalWriteBuffers.delete(oldId);
     terminalWriteBuffers.set(newId, buf);
   }
+  try { window.TermDiag && window.TermDiag.rekeySession(oldId, newId); } catch {}
   if (sessionOwners.has(oldId)) {
     sessionOwners.set(newId, sessionOwners.get(oldId));
     sessionOwners.delete(oldId);

@@ -851,6 +851,75 @@ ipcMain.handle('clipboard-write-text', (_event, text) => {
   if (typeof text === 'string') clipboard.writeText(text);
 });
 
+// --- IPC: terminal display diagnostics ---
+//
+// A capture is a pair: the renderer's own account of what is in the xterm
+// buffer (JSON, from public/terminal-diagnostics.js) and a PNG of the window
+// as it was actually painted. Held apart they each explain nothing; together
+// they say whether garbled text is in the cells or only on the glass, which is
+// the question that otherwise needs DevTools open at the moment of failure.
+//
+// The whole window is captured rather than a rect around the terminal: a rect
+// means mapping CSS pixels through the zoom factor to DIP, and getting that
+// arithmetic wrong silently yields a picture of the wrong thing. The
+// surrounding UI is useful context anyway.
+const DIAG_DIR = path.join(app.getPath('userData'), 'diagnostics');
+const DIAG_KEEP = 40;                      // captures retained, oldest pruned
+
+function pruneDiagnostics() {
+  try {
+    const names = fs.readdirSync(DIAG_DIR).filter(n => n.startsWith('capture-')).sort();
+    // Two files per capture and ISO-prefixed names, so lexical order is age order.
+    const excess = names.length - DIAG_KEEP * 2;
+    for (let i = 0; i < excess; i++) {
+      try { fs.unlinkSync(path.join(DIAG_DIR, names[i])); } catch {}
+    }
+  } catch {}
+}
+
+ipcMain.handle('diag-capture', async (event, report) => {
+  try {
+    fs.mkdirSync(DIAG_DIR, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const sid = (report && report.session && report.session.id) || 'nosession';
+    const base = `capture-${stamp}-${String(sid).slice(0, 8)}`;
+    const jsonPath = path.join(DIAG_DIR, base + '.json');
+    const pngPath = path.join(DIAG_DIR, base + '.png');
+
+    let png = null;
+    try {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      if (win && !win.isDestroyed()) {
+        const image = await win.webContents.capturePage();
+        fs.writeFileSync(pngPath, image.toPNG());
+        png = pngPath;
+      }
+    } catch (e) {
+      log.warn('[diag] screenshot failed', e && e.message);
+    }
+
+    fs.writeFileSync(jsonPath, JSON.stringify({ ...report, png }, null, 2), 'utf8');
+    pruneDiagnostics();
+    log.info('[diag] capture', report && report.reason, jsonPath);
+    return { ok: true, json: jsonPath, png, dir: DIAG_DIR };
+  } catch (e) {
+    log.error('[diag] capture failed', e && e.message);
+    return { ok: false, error: String(e && e.message) };
+  }
+});
+
+ipcMain.handle('diag-open-folder', async () => {
+  try {
+    fs.mkdirSync(DIAG_DIR, { recursive: true });
+    await shell.openPath(DIAG_DIR);
+    return { ok: true, dir: DIAG_DIR };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message) };
+  }
+});
+
+ipcMain.handle('diag-dir', () => DIAG_DIR);
+
 // --- IPC: MCP bridge ---
 ipcMain.on('mcp-diff-response', (_event, sessionId, diffId, action, editedContent) => {
   resolvePendingDiff(sessionId, diffId, action, editedContent);

@@ -54,7 +54,7 @@ function decodeOsc52Payload(payload) {
 }
 
 function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } = {}) {
-  terminal.attachCustomKeyEventHandler((e) => {
+  const handleKey = (e) => {
     // Cmd/Ctrl+F → open terminal search bar
     if (e.key === 'f' && (isMac ? e.metaKey : e.ctrlKey) && !e.shiftKey && !e.altKey) {
       if (e.type === 'keydown' && onFind) onFind();
@@ -135,6 +135,17 @@ function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } 
     }
 
     return true;
+  };
+
+  terminal.attachCustomKeyEventHandler((e) => {
+    const passedToXterm = handleKey(e);
+    // Record what xterm was handed, and what we let through. The document-level
+    // recorder in terminal-diagnostics.js sees every key regardless of focus;
+    // this one only sees keys that reached the terminal. The pair is what
+    // separates "the key never arrived" from "the key arrived and we swallowed
+    // it" — which is the open question behind capital letters going missing.
+    try { window.TermDiag && window.TermDiag.recordKey('xterm', e, { passedToXterm }); } catch {}
+    return passedToXterm;
   });
 
   const textarea = container.querySelector('.xterm-helper-textarea');
@@ -411,6 +422,10 @@ const rawLogs = new Map();           // sessionId -> { text }
 let rawRecording = false;
 
 function recordRaw(sessionId, data) {
+  // The always-on bounded tail (terminal-diagnostics.js) is what a capture
+  // reads. This opt-in recorder below is the older unbounded one, kept for
+  // __rawStart/__find at a console.
+  try { window.TermDiag && window.TermDiag.recordOutput(sessionId, data); } catch {}
   if (!rawRecording) return;
   let log = rawLogs.get(sessionId);
   if (!log) { log = { text: '' }; rawLogs.set(sessionId, log); }
@@ -740,6 +755,7 @@ function createTerminalEntry(session) {
   // Wire up IPC (use entry.session.sessionId so fork re-keying works)
   terminal.onData(data => {
     if (data === '\x1b[I' || data === '\x1b[O') return;
+    try { window.TermDiag && window.TermDiag.recordInput(entry.session.sessionId, data); } catch {}
     window.api.sendInput(entry.session.sessionId, data);
   });
   setupTerminalKeyBindings(terminal, container, () => entry.session.sessionId, { onFind: openSearchBar });
@@ -810,6 +826,10 @@ function teardownSessionView(sessionId, { notifyMain }) {
   try { entry.terminal.dispose(); } catch {}
   entry.element.remove();
   openSessions.delete(sessionId);
+  // Drop this session's recorded PTY tail. It is bounded per session, so
+  // leaving them would not run away, but a window open all day would still
+  // carry a tail for every session it ever showed.
+  try { window.TermDiag && window.TermDiag.forgetSession(sessionId); } catch {}
   updateGridCount();
   return true;
 }
