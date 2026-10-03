@@ -80,6 +80,8 @@ function setActiveSession(id) {
   if (id && typeof activeTaskView !== 'undefined' && activeTaskView) leaveTaskLogView();
   // Update file panel to show this session's open files/diffs
   if (typeof switchPanel === 'function') switchPanel(id);
+  // Context meter + Hand off button in the terminal header (ctx-handoff.js)
+  if (typeof onActiveSessionChanged === 'function') onActiveSessionChanged(id);
 }
 // Persist slug group expand state across reloads
 function getExpandedSlugs() {
@@ -1424,6 +1426,17 @@ for (const entryPoint of ['createProjectTaskButton', 'showTaskPopover', 'hydrate
   if (typeof window.api.getProjectTree !== 'function') missing.push('window.api.getProjectTree');
   if (missing.length) {
     console.error('[projects] the Projects tab is not fully wired up — missing: ' + missing.join(', '));
+  }
+}
+
+// And for the context meter (ctx-handoff.js): its two entry points are called
+// through typeof guards from sidebar.js (the row chip) and setActiveSession
+// above (the header), so a missing script tag would lose the feature without a
+// word. One report at load.
+{
+  const missing = ['handoffChipState', 'onActiveSessionChanged'].filter(fn => typeof window[fn] !== 'function');
+  if (missing.length) {
+    console.error('[handoff] the context meter is not wired up — missing: ' + missing.map(fn => fn + '()').join(', '));
   }
 }
 

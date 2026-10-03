@@ -864,6 +864,23 @@ function buildSessionItem(session) {
   shortIdEl.textContent = session.sessionId.split('-')[0];
   metaEl.append(timeEl, shortIdEl);
 
+  // Context tokens of a running session, e.g. "412K" (ctx-handoff.js). The
+  // span is always created and left empty when there is nothing to show (CSS
+  // hides it), so ctx-handoff.js can fill it in place between renders. Derived
+  // here on every render because morphdom rebuilds this element; guarded and
+  // wrapped because a missing or broken meter must not cost the row.
+  try {
+    const handoffChip = document.createElement('span');
+    handoffChip.className = 'handoff-chip';
+    const chip = typeof handoffChipState === 'function' ? handoffChipState(session.sessionId) : null;
+    if (chip) {
+      handoffChip.textContent = chip.text;
+      if (chip.level) handoffChip.className += ' handoff-' + chip.level;
+      handoffChip.title = chip.title;
+    }
+    metaEl.insertBefore(handoffChip, shortIdEl);
+  } catch {}
+
   // Started by a scheduled task: a clock, with which one and when in its
   // tooltip. Compact, because this row already carries six controls.
   if (session.scheduleId && typeof scheduleChipHtml === 'function') {
