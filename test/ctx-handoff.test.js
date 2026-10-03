@@ -1,12 +1,16 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
 
 // First written blind from the "PURE API" section of the ctx-handoff SPEC,
 // without reading public/ctx-handoff.js; since brought in line with the hook's
 // reader contract (ctx_handoff.py, "Reader contract") and the confirmed
-// override. These pin the pure helpers behind the context meter, the sidebar
-// token chip and the Hand off button. Nothing here touches the DOM: the module
-// has to load under plain Node.
+// override. The first part pins the pure helpers behind the context meter, the
+// sidebar token chip and the Hand off button, and touches no DOM: the module
+// has to load under plain Node. The last part ("browser half") runs the same
+// file in a vm context with a fake DOM to pin the click path.
 
 const MODULE_PATH = '../public/ctx-handoff';
 
@@ -15,16 +19,26 @@ const {
   WARN_AT,
   DUE_AT,
   OVERRIDE_CONFIRM,
+  HANDOFF_NOT_LANDED,
+  HANDOFF_NOT_WRITTEN,
+  HANDOFF_SESSION_ENDED,
+  REQUEST_EXPIRY_MS,
+  POLL_EVERY_TICKS,
   fmtTokens,
   chipLevel,
   deriveCtxDir,
   meterModel,
+  meterWidth,
   turnEnded,
   handoffInfo,
+  canContinue,
   chipState,
   buttonModel,
   continuePrompt,
   requestOutcome,
+  nextRequest,
+  parseStoredRequest,
+  pollDue,
   launchFolder,
 } = require(MODULE_PATH);
 
@@ -126,12 +140,18 @@ test('the module loads under plain Node with no window or document', () => {
 
 test('every name in the pure API is exported with the right type', () => {
   const mod = require(MODULE_PATH);
-  for (const name of ['REQUEST_LINE', 'OVERRIDE_CONFIRM']) assert.equal(typeof mod[name], 'string', name);
-  for (const name of ['WARN_AT', 'DUE_AT']) assert.equal(typeof mod[name], 'number', name);
   for (const name of [
-    'fmtTokens', 'chipLevel', 'deriveCtxDir', 'meterModel', 'turnEnded',
-    'handoffInfo', 'chipState', 'buttonModel', 'continuePrompt', 'requestOutcome',
-    'launchFolder',
+    'REQUEST_LINE', 'OVERRIDE_CONFIRM', 'HANDOFF_NOT_LANDED', 'HANDOFF_NOT_WRITTEN', 'HANDOFF_SESSION_ENDED',
+  ]) {
+    assert.equal(typeof mod[name], 'string', name);
+  }
+  for (const name of ['WARN_AT', 'DUE_AT', 'REQUEST_EXPIRY_MS', 'POLL_EVERY_TICKS']) {
+    assert.equal(typeof mod[name], 'number', name);
+  }
+  for (const name of [
+    'fmtTokens', 'chipLevel', 'deriveCtxDir', 'meterModel', 'meterWidth', 'turnEnded',
+    'handoffInfo', 'canContinue', 'chipState', 'buttonModel', 'continuePrompt', 'requestOutcome',
+    'nextRequest', 'parseStoredRequest', 'pollDue', 'launchFolder',
   ]) {
     assert.equal(typeof mod[name], 'function', name);
   }
@@ -798,7 +818,9 @@ test('buttonModel: rule 4, an unreadable written handoff falls back to Hand off'
 });
 
 test('buttonModel: busy only blocks when it is exactly true', () => {
-  for (const busy of [false, undefined, null]) {
+  // 1 and 'true' are truthy and still do not block: the caller hands over a
+  // real boolean, and anything else is not "busy".
+  for (const busy of [false, undefined, null, 0, 1, 'true', {}]) {
     const m = buttonModel(buttonArgs({ busy }));
     assert.equal(m.primary.enabled, true, `busy ${String(busy)}`);
     assert.equal(m.primary.override, false, `busy ${String(busy)}`);
@@ -1041,6 +1063,90 @@ test('buttonModel: rule 6, the "session ended" note shows beside Continue on a s
   assert.equal(m.primary.kind, 'continue');
   assert.equal(m.update.visible, false);
   assert.equal(m.note, reason);
+});
+
+// What the hook really leaves behind when a session exits with a request (or
+// an automatic crossing) outstanding: pending stays true, because only an
+// event clears it and a session that has exited sends none.
+test('buttonModel: a stopped session keeps Continue for an older readable handoff although a newer one is due', () => {
+  const plainTitle = buttonModel(buttonArgs({ running: false, state: writtenState(), handoffReadable: true })).primary.title;
+  for (const manual of [true, false]) {
+    const m = buttonModel(buttonArgs({
+      running: false,
+      state: writtenState({ pending: true, manual, crossed_at: 1900, crossed_tokens: 455000 }),
+      handoffReadable: true,
+      request: { phase: 'timeout', atMs: 1899000, reason: HANDOFF_SESSION_ENDED },
+    }));
+    assert.equal(m.visible, true, `manual ${manual}`);
+    assert.equal(m.primary.kind, 'continue', `manual ${manual}`);
+    assert.equal(m.primary.label, 'Continue in new session', `manual ${manual}`);
+    assert.equal(m.primary.enabled, true, `manual ${manual}`);
+    assert.equal(m.primary.override, false, `manual ${manual}`);
+    assert.equal(m.update.visible, false, `manual ${manual}`);
+    assert.equal(m.note, HANDOFF_SESSION_ENDED, `manual ${manual}`);
+    assert.notEqual(m.primary.title, plainTitle, 'the tooltip says the handoff is not the newest one asked for');
+  }
+});
+
+test('buttonModel: a RUNNING session with a newer handoff due is still Hand off, not Continue', () => {
+  const m = buttonModel(buttonArgs({
+    running: true, state: writtenState({ pending: true, manual: true, crossed_at: 1900 }), handoffReadable: true,
+  }));
+  assert.equal(m.primary.kind, 'handoff');
+  assert.equal(m.update.visible, false);
+});
+
+test('buttonModel: a stopped session with a handoff due and nothing readable shows no button, but keeps its note', () => {
+  for (const [name, over] of [
+    ['never written', { state: hookState({ pending: true, manual: true }) }],
+    ['written, file not readable', { state: writtenState({ pending: true }), handoffReadable: false }],
+    ['path only, no written_at', { state: writtenState({ pending: true, written_at: null }), handoffReadable: true }],
+    ['written_at only, no path', { state: writtenState({ pending: true, handoff_path: null }), handoffReadable: true }],
+  ]) {
+    const m = buttonModel(buttonArgs({
+      running: false, ...over, request: { phase: 'timeout', atMs: 1899000, reason: HANDOFF_SESSION_ENDED },
+    }));
+    assert.equal(m.visible, false, name);
+    assert.equal(m.primary.enabled, false, name);
+    assert.equal(m.note, HANDOFF_SESSION_ENDED, name);
+  }
+});
+
+test('canContinue: table', () => {
+  const cases = [
+    ['no state', null, true, true, false],
+    ['nothing written', hookState(), true, true, false],
+    ['written, readable, running', writtenState(), true, true, true],
+    ['written, readable, stopped', writtenState(), true, false, true],
+    ['written, not readable', writtenState(), false, false, false],
+    ['due over an older handoff, running', writtenState({ pending: true }), true, true, false],
+    ['due over an older handoff, stopped', writtenState({ pending: true }), true, false, true],
+    ['due over an older handoff, stopped, not readable', writtenState({ pending: true }), false, false, false],
+    ['due, never written, stopped', hookState({ pending: true }), true, false, false],
+    ['due, path without written_at, stopped', writtenState({ pending: true, written_at: null }), true, false, false],
+  ];
+  for (const [name, state, readable, running, want] of cases) {
+    assert.equal(canContinue(state, readable, running), want, name);
+  }
+});
+
+test('buttonModel: a failed Continue is the note, beside the button, and wins over an older timeout note', () => {
+  const failed = 'The new session could not be started.';
+  const m = buttonModel(buttonArgs({ state: writtenState(), handoffReadable: true, continueError: failed }));
+  assert.equal(m.primary.kind, 'continue');
+  assert.equal(m.primary.enabled, true);
+  assert.equal(m.note, failed);
+
+  const both = buttonModel(buttonArgs({
+    state: writtenState(), handoffReadable: true, continueError: failed,
+    request: { phase: 'timeout', atMs: 1300000, reason: HANDOFF_NOT_WRITTEN },
+  }));
+  assert.equal(both.note, failed);
+
+  for (const continueError of ['', null, undefined, 42, {}]) {
+    const none = buttonModel(buttonArgs({ state: writtenState(), handoffReadable: true, continueError }));
+    assert.ok(!none.note, `continueError ${String(continueError)}`);
+  }
 });
 
 test('buttonModel: every visible result has the documented shape', () => {
@@ -1347,4 +1453,794 @@ test('requestOutcome: only ever returns one of the five outcomes', () => {
       }
     }
   }
+});
+
+// ── the notes ───────────────────────────────────────────────────────────────
+
+test('the 20 s note does not claim the request was lost: it may be queued behind a turn', () => {
+  assert.ok(!/did not reach/i.test(HANDOFF_NOT_LANDED), HANDOFF_NOT_LANDED);
+  assert.ok(/queued/i.test(HANDOFF_NOT_LANDED), HANDOFF_NOT_LANDED);
+  assert.ok(/press Enter/i.test(HANDOFF_NOT_LANDED), HANDOFF_NOT_LANDED);
+  for (const note of [HANDOFF_NOT_LANDED, HANDOFF_NOT_WRITTEN, HANDOFF_SESSION_ENDED]) {
+    assert.ok(note.length > 0 && !/[\r\n]/.test(note), note);
+  }
+  assert.equal(new Set([HANDOFF_NOT_LANDED, HANDOFF_NOT_WRITTEN, HANDOFF_SESSION_ENDED]).size, 3);
+});
+
+// ── nextRequest ─────────────────────────────────────────────────────────────
+
+function step(request, state, afterMs, running) {
+  return nextRequest({ request, state, nowMs: AT_MS + afterMs, running });
+}
+
+const TIMEOUT = (reason) => ({ phase: 'timeout', atMs: AT_MS, reason });
+const IDLE_KEPT = { phase: 'idle', atMs: AT_MS, reason: '' };
+
+test('nextRequest: anything that is not an outstanding request comes back untouched', () => {
+  for (const request of [
+    null, undefined, { phase: 'idle', atMs: 0, reason: '' }, { phase: 'idle', atMs: AT_MS, reason: '' },
+    { phase: 'requested' }, { phase: 'timeout', reason: 'x' }, { phase: 'other', atMs: AT_MS },
+  ]) {
+    assert.equal(step(request, doneState(), 4000000, false), request, JSON.stringify(request));
+  }
+});
+
+test('nextRequest: a request still waiting is the same object', () => {
+  assert.equal(step(REQ, null, 0), REQ);
+  assert.equal(step(REQ, hookState(), 19999), REQ);
+  assert.equal(step(REQ, ackState(), 300000), REQ);
+  assert.equal(step(REQ, ackState(), 300000, true), REQ);
+});
+
+test('nextRequest: written goes back to idle and KEEPS the time of the typed line', () => {
+  for (const request of [REQ, TIMEOUT(HANDOFF_NOT_LANDED), TIMEOUT(HANDOFF_NOT_WRITTEN), TIMEOUT(HANDOFF_SESSION_ENDED)]) {
+    assert.deepEqual(step(request, doneState(), 46000, true), IDLE_KEPT, JSON.stringify(request));
+    assert.deepEqual(step(request, doneState(), 46000, false), IDLE_KEPT, JSON.stringify(request));
+  }
+  // ...which is what makes buttonModel want a Stop later than that line.
+  const next = step(REQ, doneState(), 46000, true);
+  const stopBefore = buttonModel(buttonArgs({
+    state: doneState({ last_prompt_at: AT_S - 300, last_stop_at: AT_S - 200 }), request: next,
+  }));
+  assert.equal(stopBefore.primary.override, true, 'no Stop since the typed line: asks first');
+  const stopAfter = buttonModel(buttonArgs({ state: doneState(), request: next }));
+  assert.equal(stopAfter.primary.enabled, true);
+  assert.equal(stopAfter.primary.override, false, 'a Stop 45 s after the typed line');
+});
+
+test('nextRequest: a requested request times out with the note for its outcome', () => {
+  assert.deepEqual(step(REQ, hookState(), 20001), TIMEOUT(HANDOFF_NOT_LANDED));
+  assert.deepEqual(step(REQ, null, 20001), TIMEOUT(HANDOFF_NOT_LANDED));
+  assert.deepEqual(step(REQ, ackState(), 600001), TIMEOUT(HANDOFF_NOT_WRITTEN));
+  assert.deepEqual(step(REQ, ackState(), 2000, false), TIMEOUT(HANDOFF_SESSION_ENDED));
+  assert.deepEqual(step(REQ, null, 0, false), TIMEOUT(HANDOFF_SESSION_ENDED));
+});
+
+test('nextRequest: acknowledged late, inside 10 minutes, is "Writing…" again with the same click time', () => {
+  const landed = TIMEOUT(HANDOFF_NOT_LANDED);
+  assert.deepEqual(step(landed, ackState(), 22000), { phase: 'requested', atMs: AT_MS, reason: '' });
+  assert.deepEqual(step(landed, ackState({ crossed_at: AT_S + 300 }), 301000), { phase: 'requested', atMs: AT_MS, reason: '' });
+  // Not acknowledged: nothing changes.
+  assert.equal(step(landed, hookState(), 22000), landed);
+  assert.equal(step(landed, null, 500000), landed);
+});
+
+test('nextRequest: acknowledged later than 10 minutes changes the note to "not written"', () => {
+  const landed = TIMEOUT(HANDOFF_NOT_LANDED);
+  assert.deepEqual(step(landed, ackState({ crossed_at: AT_S + 650 }), 660000), TIMEOUT(HANDOFF_NOT_WRITTEN));
+  // Never acknowledged: still "not picked up".
+  assert.equal(step(landed, hookState(), 660000), landed);
+  // Only the "not picked up" note is swapped.
+  const notWritten = TIMEOUT(HANDOFF_NOT_WRITTEN);
+  assert.equal(step(notWritten, ackState(), 660000), notWritten);
+  assert.equal(step(notWritten, ackState(), 300000), notWritten);
+});
+
+test('nextRequest: the "session ended" note goes when the session is seen running again', () => {
+  const ended = TIMEOUT(HANDOFF_SESSION_ENDED);
+  assert.deepEqual(step(ended, ackState(), 60000, true), IDLE_KEPT);
+  assert.deepEqual(step(ended, null, 60000, true), IDLE_KEPT);
+  assert.equal(step(ended, ackState(), 60000, false), ended, 'still stopped');
+  assert.equal(step(ended, ackState(), 60000, undefined), ended, 'not known');
+  // The other notes are about the request, not the process: running says nothing.
+  for (const reason of [HANDOFF_NOT_LANDED, HANDOFF_NOT_WRITTEN]) {
+    const other = TIMEOUT(reason);
+    assert.equal(step(other, hookState(), 700000, true), other, reason);
+  }
+});
+
+test('nextRequest: a request the hook dropped (crossed for this request, pending false, nothing written) clears the note', () => {
+  const expired = ackState({ manual: false, manual_blocked: false, pending: false });
+  for (const reason of [HANDOFF_NOT_LANDED, HANDOFF_NOT_WRITTEN, HANDOFF_SESSION_ENDED]) {
+    assert.deepEqual(step(TIMEOUT(reason), expired, 1500000, true), IDLE_KEPT, reason);
+  }
+  // An older handoff on file does not make it "written", and does not stop it clearing.
+  const older = ackState({ manual: false, pending: false, written_at: AT_S - 3600 });
+  assert.deepEqual(step(TIMEOUT(HANDOFF_NOT_WRITTEN), older, 1500000, true), IDLE_KEPT);
+  // crossed_at from before the request says nothing about this request.
+  const earlier = hookState({ pending: false, crossed_at: AT_S - 300 });
+  const note = TIMEOUT(HANDOFF_NOT_LANDED);
+  assert.equal(step(note, earlier, 1500000, true), note);
+});
+
+test('nextRequest: 30 minutes after the click every outstanding request is over', () => {
+  assert.equal(REQUEST_EXPIRY_MS, 1800000);
+  const notWritten = TIMEOUT(HANDOFF_NOT_WRITTEN);
+  assert.equal(step(notWritten, ackState(), REQUEST_EXPIRY_MS), notWritten, 'exactly 30 minutes is not yet over');
+  for (const request of [REQ, TIMEOUT(HANDOFF_NOT_LANDED), notWritten, TIMEOUT(HANDOFF_SESSION_ENDED)]) {
+    for (const state of [null, hookState(), ackState()]) {
+      for (const running of [true, false, undefined]) {
+        assert.deepEqual(step(request, state, REQUEST_EXPIRY_MS + 1, running), IDLE_KEPT, JSON.stringify(request));
+      }
+    }
+  }
+});
+
+test('nextRequest: only ever returns idle, requested or timeout, with the click time unchanged', () => {
+  const states = [null, hookState(), ackState(), doneState(), ackState({ manual: false, pending: false })];
+  const requests = [REQ, TIMEOUT(HANDOFF_NOT_LANDED), TIMEOUT(HANDOFF_NOT_WRITTEN), TIMEOUT(HANDOFF_SESSION_ENDED)];
+  for (const request of requests) {
+    for (const state of states) {
+      for (const running of [true, false, undefined]) {
+        for (const after of [0, 20001, 600001, 1800001]) {
+          const got = step(request, state, after, running);
+          assert.ok(['idle', 'requested', 'timeout'].includes(got.phase), got.phase);
+          assert.equal(got.atMs, AT_MS);
+          if (got.phase === 'timeout') assert.ok(got.reason.length > 0);
+        }
+      }
+    }
+  }
+});
+
+// ── meterWidth ──────────────────────────────────────────────────────────────
+
+test('meterWidth: one decimal at most, written the way the browser hands it back', () => {
+  const cases = [
+    [41, '41%'],
+    [41.2, '41.2%'],
+    [41.25, '41.3%'],
+    [33.3333, '33.3%'],
+    [0, '0%'],
+    [0.04, '0%'],
+    [100, '100%'],
+    [99.96, '100%'],
+    [150, '100%'],
+    [-5, '0%'],
+    [null, '0%'],
+    [NaN, '0%'],
+    ['41', '0%'],
+  ];
+  for (const [pct, want] of cases) assert.equal(meterWidth(pct), want, `meterWidth(${String(pct)})`);
+  for (let tenth = 0; tenth <= 1000; tenth++) {
+    assert.ok(/^\d+(\.\d)?%$/.test(meterWidth(tenth / 10)), `meterWidth(${tenth / 10})`);
+    assert.ok(!meterWidth(tenth / 10).endsWith('.0%'));
+  }
+});
+
+// ── pollDue ─────────────────────────────────────────────────────────────────
+
+test('pollDue: every running session is read once per round, never all in one tick', () => {
+  assert.equal(POLL_EVERY_TICKS, 15);
+  for (const count of [1, 3, 10, 15, 16, 40]) {
+    const ids = Array.from({ length: count }, (_, i) => `sess-${String(i).padStart(3, '0')}`);
+    const seen = new Map();
+    for (let tick = 31; tick < 31 + POLL_EVERY_TICKS; tick++) {
+      const due = pollDue(tick, ids);
+      assert.ok(due.length <= Math.ceil(count / POLL_EVERY_TICKS), `${count} sessions, tick ${tick}: ${due.length}`);
+      for (const id of due) seen.set(id, (seen.get(id) || 0) + 1);
+    }
+    assert.equal(seen.size, count, `${count} sessions: each one read`);
+    for (const [id, times] of seen) assert.equal(times, 1, `${id} read ${times} times`);
+  }
+});
+
+test('pollDue: the slot does not depend on the order the ids arrive in', () => {
+  const ids = ['c', 'a', 'd', 'b'];
+  for (let tick = 1; tick <= 30; tick++) {
+    assert.deepEqual(pollDue(tick, ids), pollDue(tick, [...ids].reverse()), `tick ${tick}`);
+  }
+  assert.deepEqual(pollDue(15, ids), ['a']);
+  assert.deepEqual(pollDue(14, ids), ['b']);
+  assert.deepEqual(ids, ['c', 'a', 'd', 'b'], 'the input is not sorted in place');
+});
+
+test('pollDue: nothing for no sessions or a non-array', () => {
+  for (const ids of [[], null, undefined, 'abc', new Set(['a'])]) {
+    for (let tick = 0; tick < 16; tick++) assert.deepEqual(pollDue(tick, ids), []);
+  }
+});
+
+// ── parseStoredRequest ──────────────────────────────────────────────────────
+
+test('parseStoredRequest: a stored record comes back as written', () => {
+  assert.deepEqual(
+    parseStoredRequest(JSON.stringify({ phase: 'requested', atMs: AT_MS, reason: '' }), AT_MS + 5000),
+    { phase: 'requested', atMs: AT_MS, reason: '' }
+  );
+  assert.deepEqual(
+    parseStoredRequest(JSON.stringify({ phase: 'timeout', atMs: AT_MS, reason: HANDOFF_NOT_WRITTEN }), AT_MS + 700000),
+    { phase: 'timeout', atMs: AT_MS, reason: HANDOFF_NOT_WRITTEN }
+  );
+  assert.deepEqual(
+    parseStoredRequest(JSON.stringify({ phase: 'idle', atMs: AT_MS, reason: 'ignored' }), AT_MS + 5000),
+    { phase: 'idle', atMs: AT_MS, reason: '' }
+  );
+  // No clock given: the time is not checked.
+  assert.deepEqual(parseStoredRequest(JSON.stringify({ phase: 'idle', atMs: AT_MS })), { phase: 'idle', atMs: AT_MS, reason: '' });
+});
+
+test('parseStoredRequest: null for anything that is not a record this file wrote', () => {
+  const bad = [
+    null, undefined, '', 42, {}, 'not json', '[]', 'null', '"requested"',
+    JSON.stringify({ phase: 'writing', atMs: AT_MS }),
+    JSON.stringify({ phase: 'requested' }),
+    JSON.stringify({ phase: 'requested', atMs: String(AT_MS) }),
+    JSON.stringify({ phase: 'requested', atMs: 0 }),
+    JSON.stringify({ phase: 'requested', atMs: -5 }),
+    JSON.stringify({ phase: 'requested', atMs: null }),
+  ];
+  for (const text of bad) assert.equal(parseStoredRequest(text, AT_MS + 5000), null, String(text));
+});
+
+test('parseStoredRequest: a time in the future is refused (no Stop could ever be later than it)', () => {
+  const text = JSON.stringify({ phase: 'idle', atMs: AT_MS });
+  assert.notEqual(parseStoredRequest(text, AT_MS), null);
+  assert.notEqual(parseStoredRequest(text, AT_MS - 1000), null, 'one second of slack');
+  assert.equal(parseStoredRequest(text, AT_MS - 1001), null);
+  assert.equal(parseStoredRequest(text, AT_MS - 3600000), null);
+});
+
+// ── browser half ────────────────────────────────────────────────────────────
+//
+// The real public/ctx-handoff.js, browser side included, in a vm context with
+// a fake DOM, a fake window.api, the app globals it reads, and a clock and
+// timers this file controls. As in the app, the script is evaluated BEFORE the
+// globals exist.
+
+const SOURCE = fs.readFileSync(path.join(__dirname, '..', 'public', 'ctx-handoff.js'), 'utf8');
+const SID = 'aaaaaaaa-1111-2222-3333-444444444444';
+const VM_DIR = 'C:\\Users\\x\\AppData\\Local\\claude-ctx';
+const VM_HANDOFF = 'C:\\h\\handoff.md';
+const VM_SIDECAR = { total_input_tokens: 412345, context_window_size: 1000000, used_percentage: 41, ts: 1999990, cwd: 'C:\\proj' };
+
+const flush = () => new Promise(resolve => setImmediate(resolve));
+
+function fakeElement(tag, byId) {
+  const attrs = {};
+  let id = '';
+  return {
+    tag, className: '', textContent: '', type: '', style: { display: '', width: '' },
+    children: [], parentNode: null, listeners: {},
+    get id() { return id; },
+    set id(value) { id = value; byId[value] = this; },
+    get nextSibling() {
+      const parent = this.parentNode;
+      return parent ? parent.children[parent.children.indexOf(this) + 1] || null : null;
+    },
+    appendChild(child) { child.parentNode = this; this.children.push(child); return child; },
+    append(...kids) { kids.forEach(child => this.appendChild(child)); },
+    insertBefore(child, ref) {
+      child.parentNode = this;
+      const index = ref ? this.children.indexOf(ref) : -1;
+      if (index < 0) this.children.push(child); else this.children.splice(index, 0, child);
+      return child;
+    },
+    addEventListener(name, fn) { this.listeners[name] = fn; },
+    getAttribute(name) { return name in attrs ? attrs[name] : null; },
+    setAttribute(name, value) { attrs[name] = String(value); },
+    hasAttribute(name) { return name in attrs; },
+    removeAttribute(name) { delete attrs[name]; },
+  };
+}
+
+// opts: globals 'app' (default) | 'none' | 'tdz'; diagDir; storage (a Map
+// shared between two boots = a reload of one window); startMs.
+function boot(opts = {}) {
+  let now = opts.startMs || 2000000000;
+  const files = new Map();
+  const sent = [];
+  const confirms = [];
+  const errors = [];
+  const launches = [];
+  const reads = [];
+  const timers = [];
+  const listeners = {};
+  const byId = {};
+  const storage = opts.storage || new Map();
+  const knobs = {
+    confirmAnswer: true,
+    rejectReads: false,
+    resolveOptions: async () => ({ model: 'm', worktree: true, worktreeName: 'wt' }),
+    launch: async () => {},
+  };
+
+  const controls = fakeElement('div', byId); controls.id = 'terminal-header-controls';
+  const status = fakeElement('span', byId); status.id = 'terminal-header-status';
+  const stopBtn = fakeElement('button', byId); stopBtn.id = 'terminal-stop-btn';
+  controls.append(status, stopBtn);
+
+  const api = {
+    diagDir: async () => opts.diagDir || 'C:\\Users\\x\\AppData\\Roaming\\switchboard\\diagnostics',
+    readFileForPanel: async (filePath) => {
+      reads.push(filePath);
+      if (knobs.rejectReads) throw new Error('read refused');
+      if (!files.has(filePath)) return { ok: false, error: 'ENOENT', code: 'ENOENT' };
+      return { ok: true, content: files.get(filePath) };
+    },
+    sendInput: (id, data) => { sent.push([id, data]); },
+    onCliBusyState: (cb) => { listeners.busy = cb; },
+    onProcessExited: (cb) => { listeners.exit = cb; },
+    onSessionForked: (cb) => { listeners.fork = cb; },
+  };
+  class FakeDate extends Date {
+    constructor(...args) { if (args.length) super(...args); else super(now); }
+    static now() { return now; }
+  }
+  const context = vm.createContext({
+    window: { api, confirm: (message) => { confirms.push(message); return knobs.confirmAnswer; } },
+    document: {
+      getElementById: (id) => byId[id] || null,
+      createElement: (tag) => fakeElement(tag, byId),
+      querySelectorAll: () => [],
+    },
+    console: { error: (...args) => { errors.push(args.map(String).join(' ')); } },
+    sessionStorage: {
+      getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+      setItem: (key, value) => { storage.set(key, String(value)); },
+      removeItem: (key) => { storage.delete(key); },
+    },
+    Date: FakeDate,
+    setTimeout: (fn, ms) => { timers.push({ at: now + (ms || 0), fn, done: false }); return timers.length; },
+    setInterval: () => 0,
+    __knobs: knobs,
+    __launches: launches,
+  });
+  const run = (js) => vm.runInContext(js, context);
+
+  run(SOURCE);
+  const globals = opts.globals || 'app';
+  if (globals === 'app') {
+    run(`
+      let activeSessionId = '${SID}';
+      let activePtyIds = new Set(['${SID}']);
+      let gridViewActive = false;
+      let activeTaskView = null;
+      const pendingSessions = new Map();
+      const sessionBusyState = new Map();
+      const sessionMap = new Map([['${SID}', { sessionId: '${SID}', projectPath: 'C:\\\\proj', type: 'claude' }]]);
+      window._isOwnedElsewhere = () => false;
+      async function resolveDefaultSessionOptions(target) { return __knobs.resolveOptions(target); }
+      async function launchNewSession(target, options) {
+        __launches.push(JSON.stringify({ target, options }));
+        return __knobs.launch(target, options);
+      }
+    `);
+  } else if (globals === 'tdz') {
+    // app.js died before its declarations ran: the bindings exist and throw.
+    try {
+      run(`throw new Error('app.js died'); let activeSessionId; let activePtyIds; let gridViewActive;
+        const pendingSessions = 0; const sessionBusyState = 0; const sessionMap = 0;`);
+    } catch {}
+  }
+
+  const visible = (el) => !!el && el.style.display !== 'none';
+  const h = {
+    files, sent, confirms, errors, launches, reads, storage, knobs, listeners, byId, run,
+    get now() { return now; },
+    get sec() { return now / 1000; },
+    // Moves the clock on, running every timer that falls due on the way.
+    async advance(ms) {
+      const end = now + ms;
+      for (;;) {
+        const next = timers.filter(t => !t.done && t.at <= end).sort((a, b) => a.at - b.at)[0];
+        if (!next) break;
+        now = Math.max(now, next.at);
+        next.done = true;
+        next.fn();
+        await flush();
+      }
+      now = end;
+      await flush();
+    },
+    setState(state) {
+      const file = VM_DIR + '\\' + SID + '.state.json';
+      if (state === null) files.delete(file); else files.set(file, JSON.stringify(state));
+    },
+    setSidecar(sidecarValue) { files.set(VM_DIR + '\\' + SID + '.json', JSON.stringify(sidecarValue)); },
+    setHandoffFile(present) { if (present) files.set(VM_HANDOFF, '# handoff'); else files.delete(VM_HANDOFF); },
+    setBusy(on) { run(`sessionBusyState.set('${SID}', ${on ? 'true' : 'false'})`); },
+    // A read the 500 ms rule lets through, then the tick's repaint.
+    async refresh() {
+      await h.advance(600);
+      await run(`handoffRefresh('${SID}')`);
+      await flush();
+      run('handoffRenderHeader()');
+    },
+    async tick() { run('handoffTick()'); await flush(); },
+    async ticks(count) {
+      for (let i = 0; i < count; i++) { await h.advance(1000); await h.tick(); }
+    },
+    async click(which) {
+      byId[which === 'update' ? 'handoff-update-btn' : 'handoff-primary-btn'].listeners.click();
+      await flush();
+    },
+    request() { return JSON.parse(run(`JSON.stringify((handoffRt.cache.get('${SID}') || {}).request || null)`)); },
+    inputs() { return JSON.parse(run(`JSON.stringify(handoffInputs('${SID}'))`)); },
+    header() {
+      const primary = byId['handoff-primary-btn'];
+      const update = byId['handoff-update-btn'];
+      const note = byId['handoff-note'];
+      const meter = byId['handoff-meter'];
+      return {
+        meter: visible(meter),
+        primary: visible(primary) ? primary.textContent : null,
+        primaryEnabled: visible(primary) && primary.getAttribute('aria-disabled') === 'false',
+        primaryOverride: visible(primary) && primary.className.includes('handoff-btn-override'),
+        update: visible(update),
+        note: visible(note) ? note.textContent : null,
+      };
+    },
+  };
+  return h;
+}
+
+// A turn ran and stopped well before "now"; nothing due, nothing written.
+function endedState(h, over = {}) {
+  return { pending: false, manual: false, crossed_at: null, written_at: null, handoff_path: null,
+    last_prompt_at: h.sec - 950, last_stop_at: h.sec - 700, ...over };
+}
+
+function writtenVmState(h, over = {}) {
+  return endedState(h, {
+    crossed_at: h.sec - 900, written_at: h.sec - 800, written_tokens: 400000, handoff_path: VM_HANDOFF, ...over,
+  });
+}
+
+async function bootEnded(opts) {
+  const h = boot(opts);
+  h.setSidecar(VM_SIDECAR);
+  h.setState(endedState(h));
+  await h.refresh();
+  return h;
+}
+
+test('browser: the header shows the meter and a plain Hand off for a session whose turn has ended', async () => {
+  const h = await bootEnded();
+  const header = h.header();
+  assert.equal(header.meter, true);
+  assert.equal(header.primary, 'Hand off');
+  assert.equal(header.primaryEnabled, true);
+  assert.equal(header.primaryOverride, false);
+  assert.equal(header.update, false);
+  assert.equal(header.note, null);
+  assert.equal(h.byId['handoff-meter'].children[1].children[0].style.width, '41%');
+});
+
+test('browser: a plain click types the line, then Enter as a separate write, and asks nothing', async () => {
+  const h = await bootEnded();
+  await h.click('primary');
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+  assert.equal(h.confirms.length, 0);
+  assert.equal(h.header().primary, `Writing${ELLIPSIS}`);
+  assert.equal(h.header().primaryEnabled, false);
+  await h.advance(249);
+  assert.equal(h.sent.length, 1, 'Enter is not in the same write, nor straight after it');
+  await h.advance(1);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+  assert.deepEqual(h.request(), { phase: 'requested', atMs: h.now - 250, reason: '' });
+  // A click on "Writing…" does nothing.
+  await h.click('primary');
+  await h.advance(1000);
+  assert.equal(h.sent.length, 2);
+});
+
+test('browser: a click on a disabled button types nothing', async () => {
+  const h = await bootEnded();
+  h.setBusy(true);
+  await h.tick();
+  assert.equal(h.header().primaryEnabled, false);
+  await h.click('primary');
+  await h.advance(2000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.confirms.length, 0);
+});
+
+test('browser: an override asks first, and "no" types nothing', async () => {
+  const h = boot();
+  h.setSidecar(VM_SIDECAR);
+  await h.refresh(); // no state file: the turn has not been reported as ended
+  assert.equal(h.header().primary, 'Hand off');
+  assert.equal(h.header().primaryOverride, true);
+  h.knobs.confirmAnswer = false;
+  await h.click('primary');
+  await h.advance(5000);
+  assert.deepEqual(h.confirms, [OVERRIDE_CONFIRM]);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.header().primary, 'Hand off');
+});
+
+test('browser: an override answered OK waits, reads again, then types', async () => {
+  const h = boot();
+  h.setSidecar(VM_SIDECAR);
+  await h.refresh();
+  await h.click('primary');
+  assert.equal(h.confirms.length, 1);
+  assert.deepEqual(h.sent, [], 'nothing is typed in the same task as the OK');
+  await h.advance(499);
+  assert.deepEqual(h.sent, []);
+  await h.advance(1);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+  await h.advance(250);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+});
+
+test('browser: a session that went busy while the question was open is not typed into', async () => {
+  const h = boot();
+  h.setSidecar(VM_SIDECAR);
+  await h.refresh();
+  // OK straight after a read (inside the 500 ms rule), which is when the
+  // second decision used to be taken before the queued busy event had run.
+  await h.click('primary');
+  assert.equal(h.confirms.length, 1);
+  h.setBusy(true); // the busy event that was queued behind the dialog
+  await h.advance(5000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.header().primary, 'Hand off');
+  assert.equal(h.header().primaryEnabled, false);
+});
+
+test('browser: a session shown in another window by the time of the OK is not typed into', async () => {
+  const h = boot();
+  h.setSidecar(VM_SIDECAR);
+  await h.refresh();
+  await h.click('primary');
+  h.run('window._isOwnedElsewhere = () => true');
+  await h.advance(5000);
+  assert.deepEqual(h.sent, []);
+});
+
+test('browser: the three flags that forbid typing fail closed when app.js cannot be read', async () => {
+  for (const globals of ['none', 'tdz']) {
+    const h = boot({ globals });
+    const input = h.inputs();
+    assert.equal(input.busy, true, `${globals}: busy`);
+    assert.equal(input.pendingRow, true, `${globals}: pendingRow`);
+    assert.equal(input.ownedElsewhere, true, `${globals}: ownedElsewhere`);
+    assert.equal(input.running, false, `${globals}: running`);
+  }
+  const app = (await bootEnded()).inputs();
+  assert.equal(app.busy, false);
+  assert.equal(app.pendingRow, false);
+  assert.equal(app.ownedElsewhere, false);
+  assert.equal(app.running, true);
+});
+
+test('browser: grid view shows nothing of ours in the header, and a click there does nothing', async () => {
+  const h = await bootEnded();
+  assert.equal(h.header().primary, 'Hand off');
+  h.run('gridViewActive = true');
+  await h.tick();
+  assert.deepEqual(h.header(), { meter: false, primary: null, primaryEnabled: false, primaryOverride: false, update: false, note: null });
+  await h.click('primary');
+  await h.click('update');
+  await h.advance(2000);
+  assert.deepEqual(h.sent, []);
+  h.run('gridViewActive = false');
+  await h.tick();
+  assert.equal(h.header().primary, 'Hand off');
+});
+
+test('browser: an instance whose hook folder cannot be found shows nothing and types nothing', async () => {
+  const h = boot({ diagDir: 'D:\\sb-data\\diagnostics' });
+  await h.refresh();
+  await h.tick();
+  assert.deepEqual(h.header(), { meter: false, primary: null, primaryEnabled: false, primaryOverride: false, update: false, note: null });
+  await h.click('primary');
+  await h.advance(2000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.confirms.length, 0);
+});
+
+test('browser: a request whose files can no longer be read stops saying "Writing…"', async () => {
+  const h = await bootEnded();
+  await h.click('primary');
+  await h.advance(250);
+  assert.equal(h.sent.length, 2);
+  const atMs = h.request().atMs;
+  h.knobs.rejectReads = true;
+  await h.ticks(19);
+  assert.equal(h.request().phase, 'requested');
+  await h.ticks(3);
+  assert.deepEqual(h.request(), { phase: 'timeout', atMs, reason: HANDOFF_NOT_LANDED });
+  assert.equal(h.header().primary, null, 'no button while the files cannot be read');
+  // Readable again: the note is there, and asking again is an override.
+  h.knobs.rejectReads = false;
+  await h.refresh();
+  assert.equal(h.header().note, HANDOFF_NOT_LANDED);
+  assert.equal(h.header().primary, 'Hand off');
+  assert.equal(h.header().primaryOverride, true, 'no Stop since the typed line');
+  // Half an hour after the click it is over, with the click time kept.
+  await h.advance(REQUEST_EXPIRY_MS);
+  await h.tick();
+  assert.deepEqual(h.request(), { phase: 'idle', atMs, reason: '' });
+  assert.equal(h.header().note, null);
+});
+
+test('browser: the request record survives a reload of the window', async () => {
+  const storage = new Map();
+  const first = await bootEnded({ storage });
+  await first.click('primary');
+  await first.advance(250);
+  const atMs = first.request().atMs;
+  assert.equal(storage.size, 1);
+
+  // The same window again: new memory, same sessionStorage, same files.
+  const second = boot({ storage, startMs: first.now + 1000 });
+  second.setSidecar(VM_SIDECAR);
+  second.setState(endedState(first));
+  await second.refresh();
+  assert.equal(second.header().primary, `Writing${ELLIPSIS}`);
+  assert.deepEqual(second.request(), { phase: 'requested', atMs, reason: '' });
+  await second.click('primary');
+  await second.advance(1000);
+  assert.deepEqual(second.sent, [], 'no second request');
+
+  // Written: back to idle, and the typed line's time is still there for the
+  // "Stop later than the last typed line" rule after another reload.
+  const clickS = atMs / 1000;
+  second.setHandoffFile(true);
+  second.setState(endedState(second, {
+    crossed_at: clickS + 0.2, written_at: clickS + 40, handoff_path: VM_HANDOFF,
+    last_prompt_at: clickS + 0.2, last_stop_at: clickS + 45,
+  }));
+  await second.advance(60000);
+  await second.refresh();
+  assert.deepEqual(second.request(), { phase: 'idle', atMs, reason: '' });
+  assert.equal(second.header().primary, 'Continue in new session');
+  const third = boot({ storage, startMs: second.now + 1000 });
+  third.setSidecar(VM_SIDECAR);
+  third.setState(endedState(third, { last_prompt_at: clickS - 300, last_stop_at: clickS - 200 }));
+  await third.refresh();
+  assert.deepEqual(third.request(), { phase: 'idle', atMs, reason: '' });
+  assert.equal(third.header().primaryOverride, true, 'the only Stop on file is older than the typed line');
+});
+
+test('browser: the "session ended" note goes when the session is running again', async () => {
+  const h = await bootEnded();
+  await h.click('primary');
+  await h.advance(250);
+  h.run('activePtyIds = new Set()');
+  await h.ticks(8);
+  assert.equal(h.request().reason, HANDOFF_SESSION_ENDED);
+  assert.equal(h.header().primary, null);
+  assert.equal(h.header().note, HANDOFF_SESSION_ENDED, 'shown with no button beside it');
+  h.run(`activePtyIds = new Set(['${SID}'])`);
+  await h.ticks(2);
+  assert.equal(h.request().phase, 'idle');
+  assert.equal(h.header().note, null);
+  assert.equal(h.header().primary, 'Hand off');
+});
+
+async function bootWritten() {
+  const h = boot();
+  h.setSidecar(VM_SIDECAR);
+  h.setHandoffFile(true);
+  h.setState(writtenVmState(h));
+  await h.refresh();
+  return h;
+}
+
+test('browser: Continue starts one sibling in the same folder, no worktree, told to read the handoff', async () => {
+  const h = await bootWritten();
+  assert.equal(h.header().primary, 'Continue in new session');
+  assert.equal(h.header().update, true);
+  await h.click('primary');
+  assert.equal(h.launches.length, 1);
+  assert.deepEqual(JSON.parse(h.launches[0]), {
+    target: { projectPath: 'C:\\proj' },
+    options: { model: 'm', initialPrompt: 'Read C:/h/handoff.md in full before doing anything else, then continue' },
+  });
+  assert.deepEqual(h.sent, [], 'Continue types nothing into the old session');
+  assert.equal(h.confirms.length, 0);
+});
+
+test('browser: Continue stays locked until the launch has settled, however long that takes', async () => {
+  const h = await bootWritten();
+  let finish;
+  h.knobs.launch = () => new Promise(resolve => { finish = resolve; });
+  await h.click('primary');
+  assert.equal(h.launches.length, 1);
+  assert.equal(h.header().primaryEnabled, false);
+  await h.click('primary');
+  assert.equal(h.launches.length, 1, 'a double click');
+  await h.ticks(10); // far past the 3 s floor, the launch still out
+  assert.equal(h.header().primaryEnabled, false);
+  await h.click('primary');
+  assert.equal(h.launches.length, 1, 'a click while the launch is still out');
+  finish();
+  await flush();
+  await h.tick();
+  assert.equal(h.header().primaryEnabled, true);
+});
+
+test('browser: a quick launch still holds the lock for 3 s', async () => {
+  const h = await bootWritten();
+  await h.click('primary');
+  await h.advance(2000);
+  await h.click('primary');
+  assert.equal(h.launches.length, 1);
+  await h.advance(1001);
+  await h.click('primary');
+  assert.equal(h.launches.length, 2);
+});
+
+test('browser: a Continue that fails says so in the header and logs every failure', async () => {
+  const h = await bootWritten();
+  h.knobs.resolveOptions = async () => { throw new Error('settings unreadable'); };
+  await h.click('primary');
+  assert.equal(h.launches.length, 0);
+  assert.equal(h.header().note, 'The new session could not be started.');
+  assert.equal(h.header().primary, 'Continue in new session');
+  assert.equal(h.errors.filter(line => line.includes('Continue failed')).length, 1);
+  await h.advance(3001);
+  await h.click('primary');
+  assert.equal(h.errors.filter(line => line.includes('Continue failed')).length, 2, 'not logged once only');
+  // The next attempt clears it; so does a minute.
+  h.knobs.resolveOptions = async () => ({});
+  await h.advance(3001);
+  await h.click('primary');
+  assert.equal(h.launches.length, 1);
+  assert.equal(h.header().note, null);
+  h.knobs.launch = async () => { throw new Error('spawn failed'); };
+  await h.advance(3001);
+  await h.click('primary');
+  assert.equal(h.header().note, 'The new session could not be started.');
+  await h.advance(60001);
+  await h.tick();
+  assert.equal(h.header().note, null);
+});
+
+test('browser: a stopped session with a newer handoff due still offers Continue for the one it wrote', async () => {
+  const h = boot();
+  h.setSidecar(VM_SIDECAR);
+  h.setHandoffFile(true);
+  h.setState(writtenVmState(h, { pending: true, manual: true, crossed_at: h.sec - 100 }));
+  h.run('activePtyIds = new Set()');
+  await h.refresh();
+  assert.equal(h.header().primary, 'Continue in new session');
+  assert.equal(h.header().update, false);
+  await h.click('primary');
+  assert.equal(h.launches.length, 1);
+});
+
+test('browser: after the first round the 15 s poll reads one running session per tick, each once a round', async () => {
+  const h = boot();
+  const ids = ['sess-a', 'sess-b', 'sess-c', SID];
+  h.run(`activePtyIds = new Set(${JSON.stringify(ids)})`);
+  const sessionsRead = () => new Set(h.reads.splice(0).map(file => path.win32.basename(file).split('.')[0]));
+  await h.ticks(1);
+  assert.equal(sessionsRead().size, ids.length, 'the first round reads them all, so the chips are not blank');
+  const seen = new Map();
+  for (let i = 0; i < POLL_EVERY_TICKS; i++) {
+    await h.ticks(1);
+    const now = sessionsRead();
+    assert.ok(now.size <= 1, `tick ${i}: ${[...now].join(', ')}`);
+    for (const id of now) seen.set(id, (seen.get(id) || 0) + 1);
+  }
+  assert.deepEqual([...seen.keys()].sort(), [...ids].sort());
+  for (const [id, times] of seen) assert.equal(times, 1, id);
+});
+
+test('browser: entries for sessions that are gone are dropped; the active and the running ones stay', async () => {
+  const h = await bootEnded();
+  for (let i = 0; i < 5; i++) h.listeners.busy(`gone-session-${i}`, true);
+  await flush();
+  assert.equal(h.run('handoffRt.cache.size'), 6);
+  await h.ticks(60);
+  assert.equal(h.run('handoffRt.cache.size'), 6, 'one pass only marks them');
+  await h.ticks(60);
+  assert.equal(h.run('handoffRt.cache.size'), 1);
+  assert.equal(h.run(`handoffRt.cache.has('${SID}')`), true);
+  assert.ok(h.run('handoffRt.lastReadAtMs.size') <= 1);
 });
