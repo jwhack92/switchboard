@@ -276,10 +276,14 @@ function fitAndScroll(entry) {
 //
 // The WebGL renderer can leave a row showing stale content after a burst of
 // output: the line is drawn twice, or an old line persists under a new one.
-// The buffer itself is correct — resizing the window fixes the display, and a
-// resize's only effect here is to force every row to be repainted, which is
-// what identifies this as a renderer-damage problem rather than a parser or
-// PTY one.
+//
+// This section used to say the buffer was known to be correct, because
+// resizing the window fixed the display. That inference does not hold: a
+// resize also sends SIGWINCH, and the CLI answers by redrawing everything,
+// which repairs a wrong *buffer* just as well as a stale renderer. The first
+// real capture (2026-10-01) was in fact buffer damage — see convertEol below.
+// The repaint stays because it is cheap and harmless, not because renderer
+// damage has been shown to be the cause of anything.
 //
 // Claude Code redraws its entire UI inside synchronized-update wrappers
 // (DECSET 2026, buffered above), so one flush can dirty far more rows at once
@@ -290,6 +294,18 @@ function fitAndScroll(entry) {
 // pays nothing; a settled one pays a single full repaint.
 const SETTLE_REPAINT_MS = 120;
 
+// ...but "shortly after output stops" is not good enough on its own, because a
+// plain debounce can be starved. Every flush pushed the timer out, so a session
+// that keeps producing output inside the settle window — a subagent panel
+// redrawing itself, which is exactly when the stale rows appear — never settles
+// and never repaints at all. The repair was unreachable in the case it was
+// written for.
+//
+// So the wait is now bounded: still debounced, but never deferred past
+// MAX_REPAINT_WAIT_MS from the first flush of a burst. A quiet session is
+// unaffected; a continuously busy one pays one full repaint per second.
+const MAX_REPAINT_WAIT_MS = 1000;
+
 function forceRepaint(entry) {
   if (!entry || entry.closed || !entry.terminal) return;
   try { entry.terminal.refresh(0, entry.terminal.rows - 1); } catch {}
@@ -297,11 +313,14 @@ function forceRepaint(entry) {
 
 function scheduleSettledRepaint(entry) {
   if (!entry || entry.closed) return;
+  const now = Date.now();
+  if (!entry._repaintDeadline) entry._repaintDeadline = now + MAX_REPAINT_WAIT_MS;
   clearTimeout(entry._repaintTimer);
   entry._repaintTimer = setTimeout(() => {
     entry._repaintTimer = 0;
+    entry._repaintDeadline = 0;
     forceRepaint(entry);
-  }, SETTLE_REPAINT_MS);
+  }, Math.max(0, Math.min(SETTLE_REPAINT_MS, entry._repaintDeadline - now)));
 }
 
 // --- Terminal write buffering ---
@@ -309,7 +328,44 @@ function scheduleSettledRepaint(entry) {
 const ESC_SYNC_START = '\x1b[?2026h';
 const ESC_SYNC_END = '\x1b[?2026l';
 const SYNC_BUFFER_TIMEOUT = 500; // max ms to hold data waiting for sync end
-const terminalWriteBuffers = new Map(); // sessionId → { chunks, syncDepth, rafId, timerId }
+const terminalWriteBuffers = new Map(); // sessionId → { chunks, syncDepth, syncCarry, rafId, timerId }
+
+// Track DECSET 2026 nesting across a stream of IPC chunks.
+//
+// This was `if (data.includes(START)) depth++; if (data.includes(END)) depth--`,
+// which is wrong three ways, and every one of them ends the same: the buffer
+// flushes in the middle of a frame the CLI asked us to draw atomically, and the
+// display tears.
+//
+//   - `includes` is a boolean. Two frames in one chunk counted as one.
+//   - A chunk holding END then START computed 0 when the true depth is 1.
+//   - A marker split across two IPC chunks was seen by neither.
+//
+// So: walk the markers in the order they actually appear, and carry the tail of
+// each chunk into the next scan. The tail is one character shorter than a
+// marker, so no whole marker can sit inside it and nothing is counted twice.
+const SYNC_MARKER_TAIL = Math.max(ESC_SYNC_START.length, ESC_SYNC_END.length) - 1;
+
+function applySyncMarkers(buf, data) {
+  const scan = (buf.syncCarry || '') + data;
+  let i = 0;
+  for (;;) {
+    const start = scan.indexOf(ESC_SYNC_START, i);
+    const end = scan.indexOf(ESC_SYNC_END, i);
+    if (start === -1 && end === -1) break;
+    if (end === -1 || (start !== -1 && start < end)) {
+      buf.syncDepth++;
+      i = start + ESC_SYNC_START.length;
+    } else {
+      // Clamped: an END with no matching START is malformed output, and the
+      // alternative — a negative depth — would wedge the buffer shut.
+      buf.syncDepth = Math.max(0, buf.syncDepth - 1);
+      i = end + ESC_SYNC_END.length;
+    }
+  }
+  buf.syncCarry = scan.slice(-SYNC_MARKER_TAIL);
+  return buf.syncDepth;
+}
 
 function flushTerminalBuffer(sessionId) {
   const buf = terminalWriteBuffers.get(sessionId);
@@ -895,7 +951,8 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = { wasIntentionalExit,
     isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload,
     safeFit, rowsThatActuallyFit, visibleEscapes,
-    forceRepaint, scheduleSettledRepaint, SETTLE_REPAINT_MS };
+    forceRepaint, scheduleSettledRepaint, SETTLE_REPAINT_MS, MAX_REPAINT_WAIT_MS,
+    applySyncMarkers, ESC_SYNC_START, ESC_SYNC_END };
 }
 
 // Console handles for the raw recorder. Deliberately short — they get typed by

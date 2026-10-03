@@ -5,6 +5,7 @@ const {
   forceRepaint,
   scheduleSettledRepaint,
   SETTLE_REPAINT_MS,
+  MAX_REPAINT_WAIT_MS,
 } = require('../public/terminal-manager');
 
 // The WebGL renderer can leave a row painted with stale content after a burst
@@ -75,6 +76,39 @@ test('a later burst repaints again', async () => {
   scheduleSettledRepaint(entry);
   await new Promise(r => setTimeout(r, SETTLE_REPAINT_MS * 2));
   assert.equal(entry.calls.length, 2, 'each settled burst gets its own repaint');
+});
+
+test('output that never settles still gets repainted', async () => {
+  // The bug this pins: a plain debounce is starvable. Every flush pushed the
+  // timer out, so a pane that keeps redrawing inside the settle window — a
+  // subagent panel, which is exactly when the stale rows appear — never
+  // settled and never repainted at all. The repair was unreachable in the one
+  // case it was written for.
+  const entry = makeEntry();
+
+  const started = Date.now();
+  while (Date.now() - started < MAX_REPAINT_WAIT_MS * 1.5) {
+    scheduleSettledRepaint(entry);
+    await new Promise(r => setTimeout(r, SETTLE_REPAINT_MS / 3));
+  }
+
+  assert.ok(entry.calls.length >= 1,
+    `continuous output repainted ${entry.calls.length} times; a starved debounce would be 0`);
+  assert.ok(entry.calls.length <= 3,
+    `and not once per flush — got ${entry.calls.length}`);
+});
+
+test('the deadline resets, so a later burst is debounced from scratch', async () => {
+  const entry = makeEntry();
+  scheduleSettledRepaint(entry);
+  await new Promise(r => setTimeout(r, SETTLE_REPAINT_MS * 2));
+  assert.equal(entry.calls.length, 1);
+  assert.ok(!entry._repaintDeadline, 'the deadline is cleared when the repaint fires');
+
+  scheduleSettledRepaint(entry);
+  assert.ok(entry._repaintDeadline > Date.now(), 'a fresh burst gets a fresh deadline');
+  await new Promise(r => setTimeout(r, SETTLE_REPAINT_MS * 2));
+  assert.equal(entry.calls.length, 2);
 });
 
 test('the scheduled repaint clears its own timer handle when it fires', async () => {

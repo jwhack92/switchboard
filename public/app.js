@@ -310,15 +310,15 @@ window.api.onTerminalData((sessionId, data) => {
   if (entry) {
     let buf = terminalWriteBuffers.get(sessionId);
     if (!buf) {
-      buf = { chunks: [], syncDepth: 0, rafId: 0, timerId: 0 };
+      buf = { chunks: [], syncDepth: 0, syncCarry: '', rafId: 0, timerId: 0 };
       terminalWriteBuffers.set(sessionId, buf);
     }
     buf.chunks.push(data);
-    recordRaw(sessionId, data);   // no-op unless __rawStart() was called
+    recordRaw(sessionId, data);
 
-    // Track sync start/end nesting
-    if (data.includes(ESC_SYNC_START)) buf.syncDepth++;
-    if (data.includes(ESC_SYNC_END)) buf.syncDepth = Math.max(0, buf.syncDepth - 1);
+    // Track sync start/end nesting — see applySyncMarkers in terminal-manager.js
+    // for why this is not an `includes` check.
+    applySyncMarkers(buf, data);
 
     if (buf.syncDepth > 0) {
       // Inside a synchronized update — keep buffering.
