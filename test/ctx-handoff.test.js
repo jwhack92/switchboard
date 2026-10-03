@@ -19,6 +19,8 @@ const {
   WARN_AT,
   DUE_AT,
   OVERRIDE_CONFIRM,
+  OVERRIDE_TITLE,
+  OVERRIDE_TITLE_UNSEEN,
   HANDOFF_NOT_LANDED,
   HANDOFF_NOT_WRITTEN,
   HANDOFF_SESSION_ENDED,
@@ -116,6 +118,9 @@ function buttonArgs(over = {}) {
     ownedElsewhere: false,
     pendingRow: false,
     busy: false,
+    // This window has been told whether the session is busy (an event since
+    // it loaded, or main's own flag). Without it every click asks first.
+    busyKnown: true,
     lastBusyAtMs: null,
     state: hookState(),
     handoffReadable: false,
@@ -141,7 +146,7 @@ test('the module loads under plain Node with no window or document', () => {
 test('every name in the pure API is exported with the right type', () => {
   const mod = require(MODULE_PATH);
   for (const name of [
-    'REQUEST_LINE', 'OVERRIDE_CONFIRM', 'HANDOFF_NOT_LANDED', 'HANDOFF_NOT_WRITTEN', 'HANDOFF_SESSION_ENDED',
+    'REQUEST_LINE', 'OVERRIDE_CONFIRM', 'OVERRIDE_TITLE', 'OVERRIDE_TITLE_UNSEEN', 'HANDOFF_NOT_LANDED', 'HANDOFF_NOT_WRITTEN', 'HANDOFF_SESSION_ENDED',
   ]) {
     assert.equal(typeof mod[name], 'string', name);
   }
@@ -571,11 +576,30 @@ test('chipState: plain token chip takes its level from the thresholds', () => {
   }
 });
 
-test('chipState: a due handoff', () => {
+test('chipState: a due handoff is the token count alone, in the due colour; the tooltip says "due"', () => {
   const chip = chipState(chipArgs({ state: hookState({ pending: true }) }));
   assert.equal(chip.level, 'due');
-  assert.equal(chip.text, '412K due');
+  assert.equal(chip.text, '412K');
+  assert.ok(/handoff due/.test(chip.title), chip.title);
   assertOneLineTitle(chip);
+});
+
+test('chipState: the word "due" never appears in the chip text, whatever the state', () => {
+  const states = [
+    null, hookState(), oldHookState(), hookState({ pending: true }),
+    hookState({ pending: true, manual: true }), writtenState(), writtenState({ pending: true }),
+  ];
+  for (const tokens of [120000, 300000, 412345, 1500000]) {
+    for (const state of states) {
+      for (const handoffReadable of [true, false]) {
+        const chip = chipState(chipArgs({ sidecar: sidecar({ total_input_tokens: tokens }), state, handoffReadable }));
+        assert.ok(!/due/i.test(chip.text), chip.text);
+        // Tokens only, plus the tick for a written handoff.
+        const want = fmtTokens(tokens) + (chip.level === 'written' ? ` ${TICK}` : '');
+        assert.equal(chip.text, want, `tokens ${tokens}`);
+      }
+    }
+  }
 });
 
 test('chipState: due overrides the token level even below the warn threshold', () => {
@@ -584,13 +608,13 @@ test('chipState: due overrides the token level even below the warn threshold', (
     state: hookState({ pending: true }),
   }));
   assert.equal(chip.level, 'due');
-  assert.equal(chip.text, '120K due');
+  assert.equal(chip.text, '120K');
 });
 
 test('chipState: due wins over an older written handoff', () => {
   const chip = chipState(chipArgs({ state: writtenState({ pending: true }), handoffReadable: true }));
   assert.equal(chip.level, 'due');
-  assert.equal(chip.text, '412K due');
+  assert.equal(chip.text, '412K');
 });
 
 test('chipState: a written, readable handoff shows the green tick', () => {
@@ -1109,6 +1133,86 @@ test('buttonModel: a stopped session with a handoff due and nothing readable sho
     assert.equal(m.visible, false, name);
     assert.equal(m.primary.enabled, false, name);
     assert.equal(m.note, HANDOFF_SESSION_ENDED, name);
+  }
+});
+
+// After a reload this window's busy map is empty: main only sends an event when
+// a session changes between busy and idle. Jason: "Ask first until step 4".
+test('buttonModel: busyKnown, a control that would be plainly enabled asks first until the window has been told', () => {
+  for (const busyKnown of [false, undefined, null, 0, 1, 'true', {}]) {
+    const m = buttonModel(buttonArgs({ busyKnown }));
+    assert.equal(m.visible, true, `busyKnown ${String(busyKnown)}`);
+    assert.equal(m.primary.kind, 'handoff', `busyKnown ${String(busyKnown)}`);
+    assert.equal(m.primary.enabled, true, `busyKnown ${String(busyKnown)}`);
+    assert.equal(m.primary.override, true, `busyKnown ${String(busyKnown)}`);
+    assert.equal(m.primary.title, OVERRIDE_TITLE_UNSEEN, `busyKnown ${String(busyKnown)}`);
+  }
+  const missing = buttonArgs();
+  delete missing.busyKnown;
+  assert.equal(buttonModel(missing).primary.override, true, 'a caller that does not pass it at all');
+
+  const told = buttonModel(buttonArgs({ busyKnown: true }));
+  assert.equal(told.primary.enabled, true);
+  assert.equal(told.primary.override, false);
+  assert.notEqual(told.primary.title, OVERRIDE_TITLE_UNSEEN);
+  assert.notEqual(told.primary.title, OVERRIDE_TITLE);
+});
+
+test('buttonModel: busyKnown also gates Update, and never Continue or "Writing…"', () => {
+  const m = buttonModel(buttonArgs({ state: writtenState(), handoffReadable: true, busyKnown: false }));
+  assert.equal(m.primary.kind, 'continue');
+  assert.equal(m.primary.enabled, true);
+  assert.equal(m.primary.override, false, 'Continue types nothing, so it never asks');
+  assert.equal(m.update.visible, true);
+  assert.equal(m.update.enabled, true);
+  assert.equal(m.update.override, true);
+  assert.equal(m.update.title, OVERRIDE_TITLE_UNSEEN);
+
+  const stopped = buttonModel(buttonArgs({ running: false, state: writtenState(), handoffReadable: true, busyKnown: false }));
+  assert.equal(stopped.primary.kind, 'continue');
+  assert.equal(stopped.primary.enabled, true);
+  assert.equal(stopped.update.visible, false);
+  assert.equal(stopped.update.override, false);
+
+  const writing = buttonModel(buttonArgs({ busyKnown: false, request: { phase: 'requested', atMs: 1990000 } }));
+  assert.equal(writing.primary.kind, 'writing');
+  assert.equal(writing.primary.enabled, false);
+  assert.equal(writing.primary.override, false);
+});
+
+test('buttonModel: busyKnown never turns a disabled control into an override', () => {
+  const cases = [
+    ['owned elsewhere', { ownedElsewhere: true }, WHY_OWNED],
+    ['pending row', { pendingRow: true }, WHY_PENDING],
+    ['busy', { busy: true }, WHY_BUSY],
+  ];
+  for (const [name, over, why] of cases) {
+    const m = buttonModel(buttonArgs({ ...over, busyKnown: false }));
+    assert.equal(m.primary.enabled, false, name);
+    assert.equal(m.primary.override, false, name);
+    assert.equal(m.primary.title, why, name);
+    const u = buttonModel(buttonArgs({ ...over, busyKnown: false, state: writtenState(), handoffReadable: true })).update;
+    assert.equal(u.enabled, false, name);
+    assert.equal(u.override, false, name);
+    assert.equal(u.title, why, name);
+  }
+  assert.equal(buttonModel(buttonArgs({ running: false, busyKnown: false })).visible, false);
+  assert.equal(buttonModel(buttonArgs({ isTerminal: true, busyKnown: false })).visible, false);
+});
+
+test('buttonModel: busyKnown, a turn that has not ended is the reason named when both apply', () => {
+  for (const [name, over] of NOT_ENDED) {
+    for (const busyKnown of [true, false]) {
+      const m = buttonModel(buttonArgs({ ...over, busyKnown }));
+      assert.equal(m.primary.enabled, true, `${name} / ${busyKnown}`);
+      assert.equal(m.primary.override, true, `${name} / ${busyKnown}`);
+      assert.equal(m.primary.title, OVERRIDE_TITLE, `${name} / ${busyKnown}`);
+    }
+  }
+  assert.notEqual(OVERRIDE_TITLE, OVERRIDE_TITLE_UNSEEN);
+  for (const title of [OVERRIDE_TITLE, OVERRIDE_TITLE_UNSEEN]) {
+    assert.ok(/asks first/.test(title), title);
+    assert.ok(!/[\r\n]/.test(title), title);
   }
 });
 
@@ -1735,7 +1839,8 @@ function fakeElement(tag, byId) {
 }
 
 // opts: globals 'app' (default) | 'none' | 'tdz'; diagDir; storage (a Map
-// shared between two boots = a reload of one window); startMs.
+// shared between two boots = a reload of one window); startMs; readCtxState
+// (true = window.api has the main-process call, answered by knobs.ctxReply).
 function boot(opts = {}) {
   let now = opts.startMs || 2000000000;
   const files = new Map();
@@ -1753,6 +1858,8 @@ function boot(opts = {}) {
     rejectReads: false,
     resolveOptions: async () => ({ model: 'm', worktree: true, worktreeName: 'wt' }),
     launch: async () => {},
+    // What main's readCtxState answers (opts.readCtxState only).
+    ctxReply: () => null,
   };
 
   const controls = fakeElement('div', byId); controls.id = 'terminal-header-controls';
@@ -1773,6 +1880,10 @@ function boot(opts = {}) {
     onProcessExited: (cb) => { listeners.exit = cb; },
     onSessionForked: (cb) => { listeners.fork = cb; },
   };
+  // The later main-process step: one call for both files, and main's busy flag.
+  if (opts.readCtxState) {
+    api.readCtxState = async (id) => { reads.push('readCtxState:' + id); return knobs.ctxReply(id); };
+  }
   class FakeDate extends Date {
     constructor(...args) { if (args.length) super(...args); else super(now); }
     static now() { return now; }
@@ -1850,6 +1961,9 @@ function boot(opts = {}) {
     setSidecar(sidecarValue) { files.set(VM_DIR + '\\' + SID + '.json', JSON.stringify(sidecarValue)); },
     setHandoffFile(present) { if (present) files.set(VM_HANDOFF, '# handoff'); else files.delete(VM_HANDOFF); },
     setBusy(on) { run(`sessionBusyState.set('${SID}', ${on ? 'true' : 'false'})`); },
+    // A cli-busy-state event from main, as both listeners get it: ours (which
+    // is registered first) and then app.js's, which fills sessionBusyState.
+    busyEvent(on) { listeners.busy(SID, !!on); h.setBusy(on); },
     // A read the 500 ms rule lets through, then the tick's repaint.
     async refresh() {
       await h.advance(600);
@@ -1897,7 +2011,19 @@ function writtenVmState(h, over = {}) {
   });
 }
 
+// ...and this window saw it end: an idle event has arrived since it loaded, so
+// "not busy" is something it was told. Without that a click asks first.
 async function bootEnded(opts) {
+  const h = boot(opts);
+  h.setSidecar(VM_SIDECAR);
+  h.setState(endedState(h));
+  h.busyEvent(false);
+  await h.refresh();
+  return h;
+}
+
+// The same files in a window that has only just loaded: no event yet.
+async function bootReloaded(opts) {
   const h = boot(opts);
   h.setSidecar(VM_SIDECAR);
   h.setState(endedState(h));
@@ -1998,6 +2124,163 @@ test('browser: a session shown in another window by the time of the OK is not ty
   h.run('window._isOwnedElsewhere = () => true');
   await h.advance(5000);
   assert.deepEqual(h.sent, []);
+});
+
+test('browser: after a reload, with no busy or idle event seen yet, the click asks first', async () => {
+  const h = await bootReloaded();
+  assert.equal(h.inputs().busyKnown, false);
+  const header = h.header();
+  assert.equal(header.primary, 'Hand off');
+  assert.equal(header.primaryEnabled, true);
+  assert.equal(header.primaryOverride, true);
+  assert.equal(h.byId['handoff-primary-btn'].getAttribute('title'), OVERRIDE_TITLE_UNSEEN);
+
+  // No: nothing typed.
+  h.knobs.confirmAnswer = false;
+  await h.click('primary');
+  await h.advance(5000);
+  assert.deepEqual(h.confirms, [OVERRIDE_CONFIRM]);
+  assert.deepEqual(h.sent, []);
+
+  // OK: the same wait and re-read as any override, then the line.
+  h.knobs.confirmAnswer = true;
+  await h.click('primary');
+  assert.equal(h.confirms.length, 2);
+  assert.deepEqual(h.sent, [], 'nothing is typed in the same task as the OK');
+  await h.advance(499);
+  assert.deepEqual(h.sent, []);
+  await h.advance(1);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+  await h.advance(250);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+});
+
+test('browser: after a reload, a turn that was already running is caught by the busy event behind the dialog', async () => {
+  const h = await bootReloaded();
+  await h.click('primary');
+  assert.equal(h.confirms.length, 1);
+  h.busyEvent(true); // queued behind the dialog
+  await h.advance(5000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.header().primaryEnabled, false);
+});
+
+test('browser: a busy or idle event seen since load brings back the plain click', async () => {
+  for (const first of [false, true]) {
+    const h = await bootReloaded();
+    assert.equal(h.header().primaryOverride, true);
+    h.busyEvent(first);
+    await h.advance(0);
+    assert.equal(h.inputs().busyKnown, true, `event ${first}`);
+    if (first) {
+      // Busy: disabled, not an override. Then the turn ends and the hook says so.
+      await h.tick();
+      assert.equal(h.header().primaryEnabled, false);
+      assert.equal(h.header().primaryOverride, false);
+      await h.advance(5000);
+      h.setState(endedState(h, { last_prompt_at: h.sec - 4, last_stop_at: h.sec }));
+      h.busyEvent(false);
+    }
+    await h.refresh();
+    const header = h.header();
+    assert.equal(header.primary, 'Hand off', `event ${first}`);
+    assert.equal(header.primaryEnabled, true, `event ${first}`);
+    assert.equal(header.primaryOverride, false, `event ${first}`);
+    await h.click('primary');
+    assert.equal(h.confirms.length, 0, `event ${first}`);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]], `event ${first}`);
+  }
+});
+
+test('browser: an event for another session says nothing about this one', async () => {
+  const h = await bootReloaded();
+  h.listeners.busy('bbbbbbbb-1111-2222-3333-444444444444', false);
+  await h.refresh();
+  assert.equal(h.inputs().busyKnown, false);
+  assert.equal(h.header().primaryOverride, true);
+});
+
+test('browser: a reload forgets the events the window had seen', async () => {
+  const storage = new Map();
+  const first = await bootEnded({ storage });
+  assert.equal(first.header().primaryOverride, false);
+  const second = boot({ storage, startMs: first.now + 1000 });
+  second.setSidecar(VM_SIDECAR);
+  second.setState(endedState(first));
+  await second.refresh();
+  assert.equal(second.header().primary, 'Hand off');
+  assert.equal(second.header().primaryOverride, true);
+});
+
+// The later main-process step: readCtxState answers with main's own busy flag.
+function ctxReply(h, over = {}) {
+  return { sidecar: VM_SIDECAR, state: endedState(h), ...over };
+}
+
+test('browser: readCtxState with a boolean busy replaces the ask-first rule', async () => {
+  const h = boot({ readCtxState: true });
+  h.knobs.ctxReply = () => ctxReply(h, { busy: false });
+  await h.refresh();
+  assert.equal(h.inputs().busyKnown, true, 'no event seen, but main said');
+  assert.equal(h.inputs().busy, false);
+  assert.equal(h.header().primary, 'Hand off');
+  assert.equal(h.header().primaryEnabled, true);
+  assert.equal(h.header().primaryOverride, false);
+  await h.click('primary');
+  assert.equal(h.confirms.length, 0);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+});
+
+test('browser: readCtxState saying busy disables typing although this window has no busy flag of its own', async () => {
+  const h = boot({ readCtxState: true });
+  h.knobs.ctxReply = () => ctxReply(h, { busy: true });
+  await h.refresh();
+  assert.equal(h.run(`!!sessionBusyState.get('${SID}')`), false, 'the app map is empty after a load');
+  assert.equal(h.inputs().busy, true);
+  assert.equal(h.header().primary, 'Hand off');
+  assert.equal(h.header().primaryEnabled, false);
+  assert.equal(h.header().primaryOverride, false);
+  assert.equal(h.byId['handoff-primary-btn'].getAttribute('title'), WHY_BUSY);
+  await h.click('primary');
+  await h.advance(2000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.confirms.length, 0);
+});
+
+test('browser: the app\'s own busy flag still counts when main\'s last answer said idle', async () => {
+  const h = boot({ readCtxState: true });
+  h.knobs.ctxReply = () => ctxReply(h, { busy: false });
+  await h.refresh();
+  assert.equal(h.header().primaryEnabled, true);
+  h.busyEvent(true); // a turn started after that read
+  await h.tick();
+  assert.equal(h.inputs().busy, true);
+  assert.equal(h.header().primaryEnabled, false);
+  await h.click('primary');
+  await h.advance(2000);
+  assert.deepEqual(h.sent, []);
+});
+
+test('browser: readCtxState without a boolean busy keeps the ask-first rule', async () => {
+  for (const busy of [undefined, null, 0, 1, 'false', {}]) {
+    const h = boot({ readCtxState: true });
+    h.knobs.ctxReply = () => ctxReply(h, busy === undefined ? {} : { busy });
+    await h.refresh();
+    assert.equal(h.inputs().busyKnown, false, `busy ${String(busy)}`);
+    assert.equal(h.inputs().busy, false, `busy ${String(busy)}`);
+    assert.equal(h.header().primaryEnabled, true, `busy ${String(busy)}`);
+    assert.equal(h.header().primaryOverride, true, `busy ${String(busy)}`);
+  }
+  // A later reply that drops the flag is "not told" again, not the old answer.
+  const h = boot({ readCtxState: true });
+  let reply = ctxReply(h, { busy: false });
+  h.knobs.ctxReply = () => reply;
+  await h.refresh();
+  assert.equal(h.header().primaryOverride, false);
+  reply = ctxReply(h);
+  await h.refresh();
+  assert.equal(h.inputs().busyKnown, false);
+  assert.equal(h.header().primaryOverride, true);
 });
 
 test('browser: the three flags that forbid typing fail closed when app.js cannot be read', async () => {

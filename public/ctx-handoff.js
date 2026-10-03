@@ -9,8 +9,10 @@
 // sidebar row, a meter in the terminal header) and offers two actions in the
 // header: ask the session to write its handoff, and start a sibling session
 // that reads it. Nothing launches by itself, and the only thing that pops up is
-// the question a click gets when the session has not reported the end of its
-// turn (OVERRIDE_CONFIRM). A session that is busy is never typed into.
+// the question a click gets (OVERRIDE_CONFIRM) when the session has not
+// reported the end of its turn, or when this window has not yet been told
+// whether the session is busy (after a reload). A session that is busy is
+// never typed into.
 //
 // How the state file is read follows the hook's own "Reader contract"
 // (ctx_handoff.py module docstring): crossed_at ties the file to a request,
@@ -51,6 +53,9 @@ const DUE_AT = 400000;
 // Asked before typing into a session whose turn marker does not say "ended".
 const OVERRIDE_CONFIRM = 'This session has not reported the end of its turn. If a permission prompt or a question is open in the terminal, the typed line and Enter could answer it. Type the handoff request anyway?';
 const OVERRIDE_TITLE = 'This session has not reported the end of its turn. Click to type the request anyway (asks first).';
+// The turn marker says "ended", but this window has not been told whether the
+// session is busy: the same question, a tooltip that gives the real reason.
+const OVERRIDE_TITLE_UNSEEN = 'This window has seen no busy or idle event for this session since it loaded. Click to type the request anyway (asks first).';
 
 // Why the last request came to nothing: text beside the button, never a popup.
 // Not "did not reach the session": a line typed while a turn is starting is
@@ -181,7 +186,12 @@ function canContinue(state, handoffReadable, running) {
     && info.writtenAt !== null && info.path !== null && handoffReadable === true;
 }
 
-/** The Sessions-sidebar chip: running Claude sessions with a reading, only. */
+/**
+ * The Sessions-sidebar chip: running Claude sessions with a reading, only.
+ * The text is the token count and nothing else. A handoff that is due shows as
+ * the colour (level 'due', red) and in the tooltip; one that is written adds a
+ * tick (level 'written', green).
+ */
 function chipState(input) {
   const o = input || {};
   if (!o.running || o.isTerminal) return null;
@@ -189,7 +199,7 @@ function chipState(input) {
   if (!meter) return null;
   const info = handoffInfo(o.state, o.handoffReadable);
   if (info.status === 'due') {
-    return { text: meter.text + ' due', level: 'due', title: 'Context ' + meter.full + ' — handoff due' };
+    return { text: meter.text, level: 'due', title: 'Context ' + meter.full + ' — handoff due' };
   }
   if (info.status === 'written') {
     return { text: meter.text + ' ✓', level: 'written', title: 'Context ' + meter.full + ' — handoff written' };
@@ -210,10 +220,19 @@ function chipState(input) {
  *                             end of its turn (no state file, no Stop since the
  *                             last prompt, the spinner came on after the last
  *                             Stop, or no Stop since the last request typed
- *                             here): a click asks first (OVERRIDE_CONFIRM)
+ *                             here), OR `busyKnown` is not true (see below):
+ *                             a click asks first (OVERRIDE_CONFIRM)
  *   disabled                  never typed into: busy, still starting, shown in
  *                             another window, not running. `title` says which.
  * busy === true is never overridable.
+ *
+ * `busyKnown` says whether `busy` can be believed. Main sends cli-busy-state
+ * only when a session CHANGES between busy and idle, and a window that has
+ * just loaded (a reload, a session moved in from another window) starts with
+ * an empty busy map: "not busy" there means "not told". It is true once this
+ * window has had a busy or idle event for the session since it loaded, or
+ * main itself reported the flag (readCtxState with a boolean `busy`).
+ * Anything but true turns a plain enabled control into an override.
  */
 function buttonModel(input) {
   const o = input || {};
@@ -248,7 +267,8 @@ function buttonModel(input) {
   const stopAfterSent = sentAtMs === null || (lastStopMs !== null && lastStopMs > sentAtMs);
   const ended = turnEnded(state) && !busyAfterStop && stopAfterSent;
   const allowed = running && !o.ownedElsewhere && !o.pendingRow && o.busy !== true;
-  const override = allowed && !ended;
+  const busyKnown = o.busyKnown === true;
+  const override = allowed && (!ended || !busyKnown);
 
   let why = '';
   if (!allowed) {
@@ -257,7 +277,9 @@ function buttonModel(input) {
     else if (o.busy === true) why = 'Session is working';
     else why = 'Session is not running';
   }
-  const typingTitle = okTitle => (!allowed ? why : override ? OVERRIDE_TITLE : okTitle);
+  // The turn not having ended is the stronger reason, so it is the one named.
+  const overrideTitle = ended ? OVERRIDE_TITLE_UNSEEN : OVERRIDE_TITLE;
+  const typingTitle = okTitle => (!allowed ? why : override ? overrideTitle : okTitle);
 
   const info = handoffInfo(state, o.handoffReadable);
   if (canContinue(state, o.handoffReadable, running)) {
@@ -548,6 +570,13 @@ function handoffEntry(id) {
       readableCheckedAtMs: 0,  // when that check ran
       request: handoffRestoreRequest(id) || handoffIdleRequest(),
       lastBusyAtMs: null,
+      // This window has had a cli-busy-state event (busy or idle) for the
+      // session since this script loaded. Deliberately NOT kept across a
+      // reload: that is exactly when the busy map starts out empty.
+      seenBusyEvent: false,
+      // The busy flag as main reported it on the last read: true / false, or
+      // null when the reply carried none (always, until main has that step).
+      mainBusy: null,
       notRunningSinceMs: 0,    // first time a request's session was seen not running
       continueLockUntil: 0,    // Continue ignores clicks until then
       continueError: '',       // why the last Continue came to nothing
@@ -604,6 +633,12 @@ function handoffIsTerminal(id) {
 // at all, and a missing window._isOwnedElsewhere. (`running` fails closed
 // separately: without activePtyIds it is false, and nothing is typed into a
 // session that is not running.)
+//
+// `busy` is the app's own flag OR main's (when main reports one): the app's is
+// kept up by events and is the fresher of the two, main's is the only one that
+// knows about a turn already running when this window loaded. Either saying
+// "busy" is enough not to type. `busyKnown` (see buttonModel) is true once
+// either source has actually spoken; with neither, the click asks first.
 function handoffInputs(id) {
   const entry = handoffRt.cache.get(id) || null;
   const nowMs = Date.now();
@@ -613,11 +648,14 @@ function handoffInputs(id) {
   try { if (typeof sessionBusyState !== 'undefined') busy = !!sessionBusyState.get(id); } catch {}
   try { if (typeof pendingSessions !== 'undefined') pendingRow = !!pendingSessions.has(id); } catch {}
   try { if (typeof window._isOwnedElsewhere === 'function') ownedElsewhere = !!window._isOwnedElsewhere(id); } catch {}
+  const mainBusy = entry && typeof entry.mainBusy === 'boolean' ? entry.mainBusy : null;
+  if (mainBusy === true) busy = true;
   const errorShown = !!entry && !!entry.continueError && nowMs - entry.continueErrorAtMs < HANDOFF_ERROR_SHOWN_MS;
   return {
     isTerminal: handoffIsTerminal(id),
     running: handoffIsRunning(id),
     ownedElsewhere, pendingRow, busy,
+    busyKnown: mainBusy !== null || (!!entry && entry.seenBusyEvent === true),
     lastBusyAtMs: entry ? entry.lastBusyAtMs : null,
     sidecar: entry ? entry.sidecar : null,
     state: entry ? entry.state : null,
@@ -697,6 +735,9 @@ async function handoffReadPair(id) {
     return {
       sidecar: res.sidecar && typeof res.sidecar === 'object' ? res.sidecar : null,
       state: res.state && typeof res.state === 'object' ? res.state : null,
+      // Main's own busy flag for the session, when it sends one. Only a real
+      // boolean counts; anything else is "main did not say".
+      busy: typeof res.busy === 'boolean' ? res.busy : undefined,
     };
   }
   if (typeof window.api.readFileForPanel !== 'function') return null;
@@ -785,6 +826,8 @@ async function handoffDoRefresh(id) {
   if (handoffRt.cache.get(id) !== entry) return;
   if (pair.sidecar !== undefined) entry.sidecar = pair.sidecar;
   if (pair.state !== undefined) entry.state = pair.state;
+  // Not kept from an earlier read: a reply without the flag is "not told".
+  entry.mainBusy = typeof pair.busy === 'boolean' ? pair.busy : null;
   await handoffCheckReadable(entry);
   if (handoffRt.cache.get(id) !== entry) return;
   handoffApplyOutcome(entry);
@@ -1276,6 +1319,8 @@ function handoffInit() {
     api.onCliBusyState(handoffGuard('busy listener failed', (sessionId, busy) => {
       if (typeof sessionId !== 'string' || !HANDOFF_ID_RE.test(sessionId)) return;
       const entry = handoffEntry(sessionId);
+      // Busy or idle: either way this window now knows which.
+      entry.seenBusyEvent = true;
       if (busy) {
         entry.lastBusyAtMs = Date.now();
       } else {
@@ -1314,7 +1359,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    REQUEST_LINE, WARN_AT, DUE_AT, OVERRIDE_CONFIRM,
+    REQUEST_LINE, WARN_AT, DUE_AT, OVERRIDE_CONFIRM, OVERRIDE_TITLE, OVERRIDE_TITLE_UNSEEN,
     HANDOFF_NOT_LANDED, HANDOFF_NOT_WRITTEN, HANDOFF_SESSION_ENDED,
     REQUEST_EXPIRY_MS, POLL_EVERY_TICKS,
     fmtTokens, chipLevel, deriveCtxDir, meterModel, meterWidth, turnEnded, handoffInfo,
