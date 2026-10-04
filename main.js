@@ -106,6 +106,28 @@ const { PREVIEW_SCHEME, PREVIEW_SCHEMES, handlePreviewAssetRequest } = require('
 const { createTaskManager } = require('./task-manager');
 const { createPanelPathGuard } = require('./save-containment');
 
+// Token analytics (the Stats > Tokens tab). The store is derived data and must
+// never be able to stop the app: a syntax error, a missing file or a missing
+// export in any of its modules costs the Tokens tab, nothing else. Hence the
+// guarded require and a stand-in with the same method names. On this side of
+// the reloader line for the same reason as the block above.
+const TOKEN_USAGE_METHODS = ['init', 'noteChanged', 'flush', 'rescan', 'disable', 'enable', 'shutdown', 'close',
+  'status', 'summary', 'models', 'daily', 'sessions', 'context'];
+let tokenUsage;
+let tokenUsageInitTimer = null;
+try {
+  tokenUsage = require('./token-usage');
+  for (const name of TOKEN_USAGE_METHODS) {
+    if (typeof tokenUsage[name] !== 'function') throw new Error('token-usage.js has no ' + name + '()');
+  }
+} catch (err) {
+  try { log.error('[token-usage] load failed', err); } catch {}
+  tokenUsage = {};
+  for (const name of TOKEN_USAGE_METHODS) {
+    tokenUsage[name] = () => ({ error: 'Token store unavailable: load failed' });
+  }
+}
+
 // MUST run at module scope, before the app is ready: registering the scheme
 // inside whenReady is too late and it silently loses standard/secure/fetch/CORS
 // privileges, which is the difference between an HTML preview that renders and
@@ -1244,6 +1266,99 @@ ipcMain.handle('get-stats', () => {
     return null;
   }
 });
+
+// --- IPC: token analytics (Stats > Tokens) ---
+//
+// A copy of `guarded` with its own log tag: that one logs under [projects] and
+// would misattribute a failure here. Every tokenUsage method already answers
+// { error } instead of throwing; this is the second layer.
+function guardedTokens(fn) {
+  return async (_event, ...args) => {
+    try { return await fn(...args); } catch (err) {
+      try { log.error('[token-usage]', err); } catch {}
+      return { error: (err && err.message) || String(err) };
+    }
+  };
+}
+// Registration is in a try block because ipcMain.handle throws on a channel
+// that already has a handler, and this runs at module scope: an uncaught throw
+// here would stop the app from starting.
+try {
+  ipcMain.handle('token-stats-summary', guardedTokens((q) => tokenUsage.summary(q)));
+  ipcMain.handle('token-stats-models', guardedTokens((q) => tokenUsage.models(q)));
+  ipcMain.handle('token-stats-daily', guardedTokens((q) => tokenUsage.daily(q)));
+  ipcMain.handle('token-stats-sessions', guardedTokens((q) => tokenUsage.sessions(q)));
+  ipcMain.handle('token-stats-context', guardedTokens((q) => tokenUsage.context(q)));
+  ipcMain.handle('token-stats-rescan', guardedTokens(() => tokenUsage.rescan()));
+  ipcMain.handle('token-stats-disable', guardedTokens(() => tokenUsage.disable()));
+  ipcMain.handle('token-stats-enable', guardedTokens(() => tokenUsage.enable()));
+} catch (err) {
+  try { log.error('[token-usage] handler registration failed', err); } catch {}
+}
+
+// --- IPC: read-ctx-state (the context-handoff hook's two files for a session) ---
+//
+// The header meter and the sidebar chips used to read these through
+// read-file-for-panel, which marks every path it reads as save-allowed
+// (panelPaths.surface above). This reads the two JSON files and answers; the
+// handoff file itself is only statted, never read, so nothing here goes
+// through panelPaths.
+//
+// CTX_ID_RE is what keeps a renderer string from becoming a path: the folder
+// holds only <uuid>.json and <uuid>.state.json, and nothing else is joined.
+const CTX_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// → { value, code }: code 'ENOENT' = the file is not there (normal), anything
+// else = it could not be read just now (e.g. caught mid-write), null = read.
+function readCtxJson(p) {
+  try { return { value: JSON.parse(fs.readFileSync(p, 'utf8')), code: null }; }
+  catch (err) {
+    return { value: null, code: err && err.code === 'ENOENT' ? 'ENOENT' : (err instanceof SyntaxError ? 'EPARSE' : (err && err.code) || 'EREAD') };
+  }
+}
+try {
+  // Not through guardedTokens, deliberately: a throw in this handler rejects
+  // the renderer's invoke, which is what sends it back to its old panel read
+  // for a minute (public/ctx-handoff.js handoffReadCtxState). An { error }
+  // reply would leave the meter with nothing to show.
+  ipcMain.handle('read-ctx-state', (_event, sessionId) => {
+    if (typeof sessionId !== 'string' || !CTX_ID_RE.test(sessionId)) return { error: 'bad session id' };
+    const ctxDir = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'claude-ctx');
+    const sidecar = readCtxJson(path.join(ctxDir, sessionId + '.json'));
+    const state = readCtxJson(path.join(ctxDir, sessionId + '.state.json'));
+    // null = the state names no handoff. Only ENOENT means "gone": the renderer
+    // takes Continue away for that and for nothing else.
+    let handoffReadable = null;
+    let handoffCode = null;
+    const hp = state.value && typeof state.value.handoff_path === 'string' ? state.value.handoff_path : '';
+    if (hp) {
+      try {
+        const st = fs.statSync(hp);
+        handoffReadable = st.isFile() && st.size > 0;
+      } catch (err) {
+        handoffReadable = false;
+        handoffCode = err && err.code === 'ENOENT' ? 'ENOENT' : (err && err.code) || 'ESTAT';
+      }
+    }
+    const reply = {
+      sidecar: sidecar.value, state: state.value,
+      codes: { sidecar: sidecar.code, state: state.code, handoff: handoffCode },
+      handoffReadable,
+    };
+    // `busy` only when main actually knows: the session is running and a title
+    // that says busy or idle has been read at least once (_titleBusy is set
+    // nowhere else). In every other case the key is ABSENT, which the renderer
+    // reads as "not told" and asks before typing.
+    try {
+      const live = resolveLiveSession(sessionId).session;
+      if (live && !live.exited && typeof live._titleBusy === 'boolean') {
+        reply.busy = live._cliBusy === true || live._titleBusy === true;
+      }
+    } catch {}
+    return reply;
+  });
+} catch (err) {
+  try { log.error('[ctx-state] handler registration failed', err); } catch {}
+}
 
 // --- IPC: refresh-stats (run /stats via PTY, fetch rate limits via API) ---
 //
@@ -2573,6 +2688,7 @@ function startProjectsWatcher() {
         pendingFolders.add(folder);
       } else if (basename.endsWith('.jsonl')) {
         pendingFolders.add(folder);
+        try { tokenUsage.noteChanged(filename); } catch {} // full relative path; this callback has no try/catch of its own
       } else if (basename.endsWith('.md')) {
         // A memory or notes file. No folder is queued — the session cache is
         // unaffected — but the memory index now needs rebuilding.
@@ -2818,6 +2934,47 @@ if (!gotSingleInstanceLock) {
     createWindow();
     startProjectsWatcher();
 
+    // Token store: opened 3 s later so it does not compete with the first
+    // window's get-projects and with every session resuming after a relaunch.
+    // Watcher events before then are dropped by noteChanged (the store is not
+    // open yet); its startup walk picks those files up.
+    tokenUsageInitTimer = setTimeout(() => {
+      tokenUsageInitTimer = null;
+      try {
+        const started = tokenUsage.init({
+          log,
+          broadcast: registry.broadcast,
+          projectsDir: PROJECTS_DIR,
+          appVersion: app.getVersion(),
+          workerPath: path.join(__dirname, 'workers', 'scan-tokens.js'),
+          // Title precedence as the sidebar: user rename > custom-title >
+          // ai-title > summary (session-cache.js, the search-title comment).
+          sessionInfo: (sessionId) => {
+            try {
+              const cached = getCachedSession(sessionId);
+              const title = getMeta(sessionId)?.name || cached?.customTitle || cached?.aiTitle || cached?.summary || '';
+              return title ? { title } : null;
+            } catch { return null; }
+          },
+          folderMeta: (slug) => {
+            try {
+              const meta = getFolderMeta(slug);
+              return meta && meta.projectPath ? { projectPath: meta.projectPath } : null;
+            } catch { return null; }
+          },
+          // The id's own PTY, not resolveLiveSession: a forked session lives on
+          // under a NEW id, and the old id's transcript is no longer written.
+          isRunning: (sessionId) => {
+            const session = activeSessions.get(sessionId);
+            return !!session && !session.exited;
+          },
+        });
+        if (started && started.error) log.warn('[token-usage] init:', started.error);
+      } catch (err) {
+        try { log.error('[token-usage] init failed', err); } catch {}
+      }
+    }, 3000);
+
     // Memory written while the app was closed would otherwise stay out of
     // search until someone opened the Memory tab.
     try {
@@ -2989,6 +3146,16 @@ app.on('before-quit', () => {
     projectsWatcher = null;
   }
 
+  // Token store: stop the scanner and its timers (and an init that has not run
+  // yet). Not relied on for correctness -- a reloader relaunch emits neither
+  // quit event -- so a failure here is only logged.
+  try {
+    clearTimeout(tokenUsageInitTimer);
+    tokenUsage.shutdown();
+  } catch (err) {
+    try { log.error('[token-usage] shutdown failed', err); } catch {}
+  }
+
   // Kill all PTY processes on quit
   for (const [, session] of activeSessions) {
     if (!session.exited) {
@@ -3020,4 +3187,5 @@ app.on('before-quit', () => {
 // Close SQLite after all windows are closed to avoid "connection is not open" errors
 app.on('will-quit', () => {
   closeDb();
+  try { tokenUsage.close(); } catch {}
 });

@@ -459,6 +459,9 @@ function pollDue(tick, ids) {
 const HANDOFF_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 // How often the handoff file itself is read again once it has been checked.
 const HANDOFF_RECHECK_MS = 60000;
+// After window.api.readCtxState throws or rejects, how long the files are read
+// through the panel read before main is asked again.
+const HANDOFF_CTX_STATE_BACKOFF_MS = 60000;
 // activePtyIds is refreshed by a 3 s poll (app.js POLL_FAST_MS) and can lag a
 // fork's new id by one round: "not running" has to hold this long to count.
 const HANDOFF_ENDED_AFTER_MS = 6000;
@@ -490,6 +493,9 @@ const handoffRt = {
   // file could never see.
   inert: false,
   tickCount: 0,
+  // window.api.readCtxState threw or rejected: until this time the hook's
+  // files are read the old way (see handoffReadCtxState).
+  ctxStateBrokenUntilMs: 0,
 };
 
 // Once per message: a failure in a 1 s tick must not become a log flood.
@@ -727,17 +733,65 @@ async function handoffReadJson(filePath) {
   return undefined;
 }
 
+// Main's read-ctx-state call. → { res } when main answered (res is whatever it
+// said), or null when the caller has to read the files the old way.
+//
+// "The function exists" is not "main can answer": preload.js takes effect at a
+// window reload, while the handler exists only in a main process started after
+// the merge. Against an older main the invoke REJECTS ("No handler
+// registered"), and without the catch that would stop the meter and the chips
+// at exactly the moment the Hand off button matters. So a throw or a rejection
+// sends this window back to the panel read for a minute, then it asks again.
+// An answer of any kind, { error: 'bad session id' } included, is main
+// answering and is no reason to back off.
+async function handoffReadCtxState(id) {
+  if (typeof window.api.readCtxState !== 'function') return null;
+  if (Date.now() < handoffRt.ctxStateBrokenUntilMs) return null;
+  try {
+    return { res: await window.api.readCtxState(id) };
+  } catch (err) {
+    handoffRt.ctxStateBrokenUntilMs = Date.now() + HANDOFF_CTX_STATE_BACKOFF_MS;
+    handoffLogOnce('readCtxState failed; reading the files through the panel read instead', err);
+    return null;
+  }
+}
+
+// One file of a readCtxState reply, in handoffReadJson's three values: main's
+// code 'ENOENT' → null (not there, which is normal), an object → the object,
+// anything else → undefined (could not be read just now: keep what we had).
+function handoffCtxValue(value, code) {
+  if (code === 'ENOENT') return null;
+  if (value && typeof value === 'object') return value;
+  return undefined;
+}
+
 async function handoffReadPair(id) {
-  // A dedicated main-process call, once it exists, replaces the generic panel read.
-  if (typeof window.api.readCtxState === 'function') {
-    const res = await window.api.readCtxState(id);
-    if (!res || typeof res !== 'object') return { sidecar: undefined, state: undefined };
+  // The dedicated main-process call replaces the generic panel read, whose
+  // handler marks every path it reads as save-allowed.
+  const viaMain = await handoffReadCtxState(id);
+  if (viaMain) {
+    const res = viaMain.res;
+    // `handoff: null` = this read says nothing about the handoff file (see
+    // handoffCheckReadable).
+    if (!res || typeof res !== 'object') return { sidecar: undefined, state: undefined, handoff: null };
+    const codes = res.codes && typeof res.codes === 'object' ? res.codes : {};
+    const state = handoffCtxValue(res.state, codes.state);
+    let handoff = null;
+    if (state) {
+      // Main statted the file THIS state names, so its answer is only used
+      // together with that state. A main that sent the state without the
+      // answer leaves the check to the panel read (undefined).
+      handoff = typeof res.handoffReadable === 'boolean'
+        ? { readable: res.handoffReadable, gone: codes.handoff === 'ENOENT' }
+        : undefined;
+    }
     return {
-      sidecar: res.sidecar && typeof res.sidecar === 'object' ? res.sidecar : null,
-      state: res.state && typeof res.state === 'object' ? res.state : null,
+      sidecar: handoffCtxValue(res.sidecar, codes.sidecar),
+      state,
       // Main's own busy flag for the session, when it sends one. Only a real
       // boolean counts; anything else is "main did not say".
       busy: typeof res.busy === 'boolean' ? res.busy : undefined,
+      handoff,
     };
   }
   if (typeof window.api.readFileForPanel !== 'function') return null;
@@ -753,7 +807,13 @@ async function handoffReadPair(id) {
 // When written_at CHANGES, and after that at most once a minute -- not on every
 // poll: the check reads the whole handoff file across IPC. The minute is what
 // lets a failed check heal and a deleted handoff stop offering Continue.
-async function handoffCheckReadable(entry) {
+//
+// `fromMain` is the `handoff` of a readCtxState reply: { readable, gone } =
+// main statted the file with that read, so it is used at once and nothing is
+// read here; null = main answered but could not read the state just now, so
+// entry.state is an older one and what we had stands; undefined = main did not
+// say (or the panel path is in use), checked below with the panel read.
+async function handoffCheckReadable(entry, fromMain) {
   const state = entry.state;
   const writtenAt = state && typeof state.written_at === 'number' ? state.written_at : null;
   const filePath = state && typeof state.handoff_path === 'string' ? state.handoff_path : '';
@@ -764,16 +824,24 @@ async function handoffCheckReadable(entry) {
     return;
   }
   const sameHandoff = entry.readableFor === writtenAt;
-  if (sameHandoff && Date.now() - entry.readableCheckedAtMs < HANDOFF_RECHECK_MS) return;
+  if (fromMain === null) return;
   let readable = false;
   let gone = false;
-  try {
-    if (typeof window.api.readFileForPanel === 'function') {
-      const res = await window.api.readFileForPanel(filePath);
-      readable = !!(res && res.ok);
-      gone = !!res && !res.ok && res.code === 'ENOENT';
-    }
-  } catch {}
+  if (fromMain) {
+    // Costs nothing (it came with the read), so the once-a-minute rule below
+    // does not apply: a deleted handoff stops offering Continue at this read.
+    readable = fromMain.readable === true;
+    gone = fromMain.gone === true;
+  } else {
+    if (sameHandoff && Date.now() - entry.readableCheckedAtMs < HANDOFF_RECHECK_MS) return;
+    try {
+      if (typeof window.api.readFileForPanel === 'function') {
+        const res = await window.api.readFileForPanel(filePath);
+        readable = !!(res && res.ok);
+        gone = !!res && !res.ok && res.code === 'ENOENT';
+      }
+    } catch {}
+  }
   entry.readableCheckedAtMs = Date.now();
   // A handoff that was readable a minute ago and fails once is most likely
   // being rewritten: only "the file is gone" takes Continue away.
@@ -828,7 +896,7 @@ async function handoffDoRefresh(id) {
   if (pair.state !== undefined) entry.state = pair.state;
   // Not kept from an earlier read: a reply without the flag is "not told".
   entry.mainBusy = typeof pair.busy === 'boolean' ? pair.busy : null;
-  await handoffCheckReadable(entry);
+  await handoffCheckReadable(entry, pair.handoff);
   if (handoffRt.cache.get(id) !== entry) return;
   handoffApplyOutcome(entry);
   handoffPaint(id);

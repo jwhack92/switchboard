@@ -7572,3 +7572,280 @@ body.session-drop-target #session-drop-overlay { display: flex; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ---- Stats sub-tabs and the Tokens tab (token-stats-view.js) ----
+   One appended section; nothing above is changed. The app has one (dark)
+   theme, so the chart colours are chosen for this view's surface #111118 and
+   kept as custom properties on the container: a light theme would redefine
+   them here and nowhere else. The eight series slots are the dataviz skill's
+   dark steps in its fixed order (validate_palette.js --mode dark --surface
+   #111118: all checks pass, worst adjacent CVD delta E 8.4). */
+.stats-subtabs {
+  display: flex;
+  gap: 2px;
+}
+.stats-subtab {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: #b4b4c0;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.stats-subtab:hover { color: #ceceda; background: rgba(255,255,255,0.04); }
+.stats-subtab.active { color: #ceceda; background: rgba(255,255,255,0.07); }
+.stats-subtab:focus-visible { outline: 2px solid #8ccbff; outline-offset: 1px; }
+
+#stats-tokens-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  --tok-surface: #111118;
+  --tok-ink: #d0d0e8;
+  --tok-ink-2: #bdbdc8;
+  --tok-muted: #9a9aa8;
+  --tok-grid: rgba(255,255,255,0.06);
+  --tok-axis: rgba(255,255,255,0.16);
+  --tok-s0: #3987e5;
+  --tok-s1: #d95926;
+  --tok-s2: #199e70;
+  --tok-s3: #c98500;
+  --tok-s4: #d55181;
+  --tok-s5: #008300;
+  --tok-s6: #9085e9;
+  --tok-s7: #e66767;
+  --tok-other: #6f6f7c;
+  --tok-compaction: #d6ad59;
+  --tok-handoff: #3ecf5a;
+}
+#stats-tokens-body::-webkit-scrollbar { width: 5px; }
+#stats-tokens-body::-webkit-scrollbar-track { background: transparent; }
+#stats-tokens-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.06); border-radius: 3px; }
+
+.token-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  max-width: 900px;
+  margin-bottom: 10px;
+}
+.token-toolbar-gap { flex: 1; }
+.token-chips {
+  display: flex;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.token-chip {
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--tok-ink-2);
+  background: transparent;
+  border: none;
+  border-right: 1px solid rgba(255,255,255,0.08);
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.token-chip:last-child { border-right: none; }
+.token-chip:hover { background: rgba(255,255,255,0.04); }
+.token-chip.active { background: rgba(128,136,255,0.22); color: #e2e2f4; }
+.token-chip:focus-visible,
+.token-btn:focus-visible,
+.token-sort:focus-visible,
+.token-session-row:focus-visible { outline: 2px solid #8ccbff; outline-offset: -2px; }
+.token-custom { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--tok-muted); }
+.token-date {
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--tok-ink);
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 6px;
+  padding: 3px 6px;
+  color-scheme: dark;
+}
+.token-status { font-size: 11px; color: var(--tok-muted); font-variant-numeric: tabular-nums; }
+.token-btn {
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--tok-ink-2);
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.token-btn:hover { background: rgba(255,255,255,0.08); color: #e2e2f4; }
+.token-btn:disabled { opacity: 0.45; cursor: default; }
+.token-btn-quiet { background: transparent; border-color: transparent; color: var(--tok-muted); }
+.token-progress {
+  max-width: 900px;
+  height: 3px;
+  background: rgba(255,255,255,0.06);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+.token-progress-fill {
+  height: 100%;
+  background: rgba(128,136,255,0.7);
+  transition: width 0.3s ease;
+}
+.token-scan-notice,
+.token-section,
+.token-footer,
+.token-off { max-width: 900px; }
+.token-off { display: flex; align-items: center; gap: 12px; }
+.token-section { margin-bottom: 28px; }
+.token-section .stats-refresh-error { margin-bottom: 0; }
+.token-section .stats-spinner { padding: 12px 0; }
+.token-empty { padding: 20px; text-align: left; }
+.token-subtitle { font-size: 11px; color: var(--tok-muted); margin: 16px 0 0; }
+
+/* Headline cards */
+.token-headline { grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); margin-top: 0; }
+.token-card-weighted { border-color: rgba(128,136,255,0.35); }
+.token-card-narrow .stat-card-value { font-size: 18px; line-height: 29px; }
+.token-card-note { font-size: 11px; color: var(--tok-compaction); }
+.token-types { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.token-types .stat-card { padding: 10px 14px; }
+.token-types .stat-card-value { font-size: 18px; }
+
+/* Stacked columns: one common scale, 2px surface gaps between segments */
+.token-daily { margin-bottom: 0; }
+.token-chart { height: 180px; }
+.token-chart .token-col { gap: 0; cursor: default; }
+.token-stack {
+  width: 100%;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 2px;
+  min-height: 0;
+  border-radius: 4px 4px 0 0;
+  overflow: hidden;
+}
+.token-seg { flex: 1 1 0; min-height: 1px; }
+.token-col:hover .token-stack { filter: brightness(1.2); }
+.token-chart .daily-chart-col .daily-chart-label.token-day-label {
+  display: block;
+  white-space: nowrap;
+  color: var(--tok-muted);
+}
+.token-legend { flex-wrap: wrap; gap: 6px 14px; }
+.token-legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--tok-ink-2); }
+.token-s0 { background: var(--tok-s0); }
+.token-s1 { background: var(--tok-s1); }
+.token-s2 { background: var(--tok-s2); }
+.token-s3 { background: var(--tok-s3); }
+.token-s4 { background: var(--tok-s4); }
+.token-s5 { background: var(--tok-s5); }
+.token-s6 { background: var(--tok-s6); }
+.token-s7 { background: var(--tok-s7); }
+.token-s-other { background: var(--tok-other); }
+
+/* Tables */
+.token-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  color: var(--tok-ink-2);
+}
+.token-table th {
+  text-align: left;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--tok-muted);
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  white-space: nowrap;
+}
+.token-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  vertical-align: middle;
+}
+.token-table th.num,
+.token-table td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.token-table .token-strong { color: var(--tok-ink); font-weight: 600; }
+.token-row-total td { color: var(--tok-ink); font-weight: 600; border-bottom: none; }
+.token-model { color: var(--tok-ink); }
+.token-share { width: 150px; }
+.token-share .usage-track { display: inline-block; width: 90px; vertical-align: middle; }
+.token-share-pct { margin-left: 8px; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--tok-muted); }
+.token-sort {
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+.token-sort:hover,
+.token-sort.active { color: var(--tok-ink); }
+.token-session-row { cursor: pointer; }
+.token-session-row:hover td { background: rgba(255,255,255,0.03); }
+.token-session-row.selected td { background: rgba(128,136,255,0.12); }
+.token-session-cell { max-width: 320px; }
+.token-session-title,
+.token-session-slug { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.token-session-title { color: var(--tok-ink); }
+.token-session-slug { font-size: 10px; color: var(--tok-muted); }
+.token-running {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #3ecf5a;
+  margin-right: 6px;
+}
+.token-more { margin-top: 10px; }
+
+/* Context over time (inline SVG) */
+.token-ctx-svg { display: block; width: 100%; height: auto; overflow: visible; }
+.token-ctx-grid { stroke: var(--tok-grid); stroke-width: 1; }
+.token-ctx-axis { stroke: var(--tok-axis); stroke-width: 1; }
+.token-ctx-tick { fill: var(--tok-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.token-ctx-ref { stroke: var(--tok-axis); stroke-width: 1; stroke-dasharray: 5 4; }
+.token-ctx-ref-label { fill: var(--tok-muted); font-size: 10px; }
+.token-ctx-line { stroke: var(--tok-s0); stroke-width: 2; stroke-linejoin: round; }
+.token-ctx-point { fill: var(--tok-s0); opacity: 0.45; }
+.token-ctx-compaction-line { stroke: var(--tok-compaction); stroke-width: 1; stroke-dasharray: 3 3; opacity: 0.7; }
+.token-ctx-compaction-drop { stroke: var(--tok-compaction); stroke-width: 2; }
+.token-ctx-mark-label { fill: var(--tok-ink-2); font-size: 10px; font-variant-numeric: tabular-nums; }
+.token-ctx-handoff-line { stroke: var(--tok-handoff); stroke-width: 1.5; }
+.token-ctx-handoff-ring { fill: var(--tok-surface); stroke: var(--tok-handoff); stroke-width: 1.5; }
+.token-ctx-handoff-tick { stroke: var(--tok-handoff); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.token-ctx-handoff.consumed { opacity: 0.45; }
+.token-ctx-cross { stroke: var(--tok-axis); stroke-width: 1; pointer-events: none; }
+.token-ctx-marker { fill: var(--tok-s0); stroke: var(--tok-surface); stroke-width: 2; pointer-events: none; }
+.token-caption { font-size: 11px; color: var(--tok-muted); margin-top: 6px; }
+
+/* The one reusable tooltip; it is appended to <body>, so it cannot use the
+   container's custom properties. */
+.token-tooltip {
+  position: fixed;
+  z-index: 1000;
+  pointer-events: none;
+  max-width: 230px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #d0d0e8;
+  background: #1e1e28;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  padding: 6px 9px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+  font-variant-numeric: tabular-nums;
+}
+.token-tooltip-head { color: #ffffff; font-weight: 600; }
+.token-tooltip-dim { color: #9a9aa8; }
+
+.token-footer .stats-notice { display: block; margin-top: 12px; line-height: 1.5; }

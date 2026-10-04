@@ -1,9 +1,66 @@
 // --- Stats view ---
 // Depends on globals: escapeHtml (utils.js), statsViewerBody (app.js)
+// Optional: loadTokenStats (token-stats-view.js), behind a typeof guard.
 
 let cachedUsage = null;
 
-async function loadStats() {
+// Which sub-tab the Stats view shows. Kept here, not in the DOM, so leaving
+// the Stats tab and coming back lands on the same one. Default is Activity.
+let statsSubtab = 'activity';
+let statsSubtabsWired = false;
+
+function statsTokensBody() {
+  return document.getElementById('stats-tokens-body');
+}
+
+// Wired on the first loadStats rather than at script load: this file is parsed
+// before app.js and must not depend on anything being ready at that moment.
+function wireStatsSubtabs() {
+  if (statsSubtabsWired) return;
+  const buttons = document.querySelectorAll('#stats-viewer-header .stats-subtab');
+  if (!buttons || !buttons.length) return;
+  statsSubtabsWired = true;
+  for (const btn of buttons) {
+    btn.addEventListener('click', () => setStatsSubtab(btn.dataset.subtab));
+  }
+}
+
+function setStatsSubtab(name) {
+  const next = name === 'tokens' ? 'tokens' : 'activity';
+  // A click on the tab already showing must not start another /stats run.
+  if (next === statsSubtab) return;
+  statsSubtab = next;
+  loadStats();
+}
+
+// The dispatcher. Called by app.js on every Stats tab click and by the strip.
+// It shows one container and hides the other; each renderer writes only into
+// its own container, so an Activity refresh that is still pending when Tokens
+// is clicked finishes out of sight instead of landing on the Tokens view.
+function loadStats() {
+  wireStatsSubtabs();
+  const tokensBody = statsTokensBody();
+  // Without the container or the script (an old index.html, a failed script
+  // load) the view falls back to Activity, exactly as before this change.
+  const showTokens = statsSubtab === 'tokens' && !!tokensBody && typeof loadTokenStats === 'function';
+
+  const buttons = document.querySelectorAll('#stats-viewer-header .stats-subtab');
+  for (const btn of buttons || []) {
+    const active = btn.dataset.subtab === (showTokens ? 'tokens' : 'activity');
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', active ? 'true' : 'false');
+  }
+
+  statsViewerBody.style.display = showTokens ? 'none' : '';
+  if (tokensBody) tokensBody.style.display = showTokens ? '' : 'none';
+
+  // refreshStats spawns a PTY /stats run (main.js); it is not started while
+  // Tokens is the active sub-tab.
+  if (showTokens) return loadTokenStats();
+  return renderActivity();
+}
+
+async function renderActivity() {
   statsViewerBody.innerHTML = '';
 
   // Show spinner while refreshing

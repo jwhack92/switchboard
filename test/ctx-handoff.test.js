@@ -1860,6 +1860,9 @@ function boot(opts = {}) {
     launch: async () => {},
     // What main's readCtxState answers (opts.readCtxState only).
     ctxReply: () => null,
+    // 'throw' = the call itself throws; 'reject' = the invoke rejects, which
+    // is what a main process without the handler does.
+    ctxFail: null,
   };
 
   const controls = fakeElement('div', byId); controls.id = 'terminal-header-controls';
@@ -1882,7 +1885,15 @@ function boot(opts = {}) {
   };
   // The later main-process step: one call for both files, and main's busy flag.
   if (opts.readCtxState) {
-    api.readCtxState = async (id) => { reads.push('readCtxState:' + id); return knobs.ctxReply(id); };
+    // Not an async function, so that 'throw' is a synchronous throw.
+    api.readCtxState = (id) => {
+      reads.push('readCtxState:' + id);
+      if (knobs.ctxFail === 'throw') throw new Error('readCtxState blew up');
+      if (knobs.ctxFail === 'reject') {
+        return Promise.reject(new Error("Error invoking remote method 'read-ctx-state': No handler registered"));
+      }
+      return Promise.resolve(knobs.ctxReply(id));
+    };
   }
   class FakeDate extends Date {
     constructor(...args) { if (args.length) super(...args); else super(now); }
@@ -2281,6 +2292,271 @@ test('browser: readCtxState without a boolean busy keeps the ask-first rule', as
   await h.refresh();
   assert.equal(h.inputs().busyKnown, false);
   assert.equal(h.header().primaryOverride, true);
+});
+
+// --- readCtxState as main really answers it (step 4) ---
+//
+// main.js 'read-ctx-state': { sidecar, state, codes: { sidecar, state, handoff },
+// handoffReadable } plus a top-level boolean `busy` ONLY when main knows it.
+
+const VM_SIDECAR_FILE = VM_DIR + '\\' + SID + '.json';
+const VM_STATE_FILE = VM_DIR + '\\' + SID + '.state.json';
+
+// A reply in main's shape. `busy` is absent unless given.
+function mainReply(h, over = {}) {
+  return {
+    sidecar: VM_SIDECAR, state: endedState(h),
+    codes: { sidecar: null, state: null, handoff: null },
+    handoffReadable: null,
+    ...over,
+  };
+}
+
+function ctxCalls(h) { return h.reads.filter(entry => entry.startsWith('readCtxState:')).length; }
+function panelReads(h) { return h.reads.filter(entry => !entry.startsWith('readCtxState:')); }
+function cached(h, field) { return JSON.parse(h.run(`JSON.stringify(handoffRt.cache.get('${SID}').${field})`) || 'null'); }
+
+test('browser: a readCtxState that throws or rejects falls back to the panel read and is not called again for 60 s', async () => {
+  for (const mode of ['throw', 'reject']) {
+    // A new preload with an OLD main process: the function exists, the handler does not.
+    const h = boot({ readCtxState: true });
+    h.knobs.ctxFail = mode;
+    h.setSidecar(VM_SIDECAR);
+    h.setState(endedState(h));
+    await h.refresh();
+    const failedAt = h.now;
+    assert.equal(ctxCalls(h), 1, mode);
+    assert.deepEqual(panelReads(h).sort(), [VM_SIDECAR_FILE, VM_STATE_FILE].sort(), `${mode}: the same read went on through the panel`);
+    assert.equal(h.header().meter, true, `${mode}: the meter still shows`);
+    assert.equal(h.header().primary, 'Hand off', mode);
+    assert.equal(h.inputs().busyKnown, false, `${mode}: nothing from main, so not told`);
+    assert.equal(h.header().primaryOverride, true, mode);
+
+    // Inside the minute: the panel read, and main is not asked.
+    for (let i = 0; i < 3; i++) {
+      await h.advance(18000);
+      h.reads.length = 0;
+      await h.refresh();
+      assert.ok(h.now - failedAt < 60000);
+      assert.equal(ctxCalls(h), 0, `${mode}: ${h.now - failedAt} ms after the failure`);
+      assert.equal(panelReads(h).length, 2, mode);
+    }
+    // The files are followed in the meantime.
+    h.setSidecar({ ...VM_SIDECAR, total_input_tokens: 455000 });
+    h.reads.length = 0;
+    await h.refresh();
+    assert.equal(ctxCalls(h), 0, mode);
+    assert.equal(cached(h, 'sidecar').total_input_tokens, 455000, mode);
+
+    // After the minute main is asked again; still failing, so another minute.
+    await h.advance(60000 - (h.now - failedAt));
+    h.reads.length = 0;
+    await h.refresh();
+    const failedAgainAt = h.now;
+    assert.equal(ctxCalls(h), 1, `${mode}: asked again after 60 s`);
+    assert.equal(panelReads(h).length, 2, mode);
+    await h.advance(30000);
+    h.reads.length = 0;
+    await h.refresh();
+    assert.equal(ctxCalls(h), 0, `${mode}: a second minute`);
+
+    // Main has the handler now (the relaunch happened): back to main, no panel read.
+    h.knobs.ctxFail = null;
+    h.knobs.ctxReply = () => mainReply(h, { sidecar: { ...VM_SIDECAR, total_input_tokens: 470000 }, busy: false });
+    await h.advance(60000 - (h.now - failedAgainAt));
+    h.reads.length = 0;
+    await h.refresh();
+    assert.equal(ctxCalls(h), 1, mode);
+    assert.deepEqual(panelReads(h), [], mode);
+    assert.equal(cached(h, 'sidecar').total_input_tokens, 470000, mode);
+    assert.equal(h.inputs().busyKnown, true, mode);
+    assert.equal(h.errors.filter(line => line.includes('readCtxState failed')).length, 1, `${mode}: logged once`);
+    assert.equal(h.errors.filter(line => line.includes('read failed')).length, 0, `${mode}: the refresh itself never failed`);
+  }
+});
+
+test('browser: the back-off is for the window, not for one session', async () => {
+  const h = boot({ readCtxState: true });
+  h.knobs.ctxFail = 'reject';
+  const other = 'bbbbbbbb-1111-2222-3333-444444444444';
+  h.run(`activePtyIds = new Set(['${SID}', '${other}'])`);
+  await h.refresh();
+  assert.equal(ctxCalls(h), 1);
+  await h.run(`handoffRefresh('${other}')`);
+  await flush();
+  assert.equal(ctxCalls(h), 1, 'the handler is missing for every session alike');
+  assert.ok(panelReads(h).some(file => file.includes(other)));
+});
+
+test('browser: an { error } reply from readCtxState is an answer: no back-off, no panel read, the last reading kept', async () => {
+  const h = boot({ readCtxState: true });
+  h.knobs.ctxReply = () => mainReply(h, { busy: false });
+  await h.refresh();
+  assert.equal(h.header().meter, true);
+  for (const reply of [{ error: 'bad session id' }, null, 'nope', 7]) {
+    h.knobs.ctxReply = () => reply;
+    h.reads.length = 0;
+    await h.refresh();
+    assert.equal(ctxCalls(h), 1, JSON.stringify(reply));
+    assert.deepEqual(panelReads(h), [], JSON.stringify(reply));
+    assert.deepEqual(cached(h, 'sidecar'), VM_SIDECAR, JSON.stringify(reply));
+    assert.equal(h.header().meter, true, JSON.stringify(reply));
+    assert.equal(h.inputs().busyKnown, false, 'a reply without the flag is not told');
+  }
+  // ...and the very next read asks main again.
+  h.knobs.ctxReply = () => mainReply(h, { sidecar: { ...VM_SIDECAR, total_input_tokens: 500000 } });
+  h.reads.length = 0;
+  await h.refresh();
+  assert.equal(ctxCalls(h), 1);
+  assert.equal(cached(h, 'sidecar').total_input_tokens, 500000);
+  assert.equal(h.errors.length, 0);
+});
+
+test('browser: readCtxState codes: ENOENT is "not there", an object is the value, anything else keeps the last reading', async () => {
+  const h = boot({ readCtxState: true });
+  const state = endedState(h);
+  h.knobs.ctxReply = () => mainReply(h, { state });
+  await h.refresh();
+  assert.deepEqual(cached(h, 'sidecar'), VM_SIDECAR);
+  assert.deepEqual(cached(h, 'state'), state);
+
+  // Caught mid-write, locked, or any other failure: undefined, so what we had stands.
+  for (const code of ['EPARSE', 'EBUSY', 'EPERM', 'EREAD', null, undefined, 0]) {
+    h.knobs.ctxReply = () => ({ sidecar: null, state: null, codes: { sidecar: code, state: code, handoff: null }, handoffReadable: null });
+    await h.refresh();
+    assert.deepEqual(cached(h, 'sidecar'), VM_SIDECAR, `sidecar, code ${String(code)}`);
+    assert.deepEqual(cached(h, 'state'), state, `state, code ${String(code)}`);
+    assert.equal(h.header().meter, true, `code ${String(code)}`);
+  }
+  // A reply with no codes at all says nothing about a missing value either.
+  h.knobs.ctxReply = () => ({ sidecar: null, state: null });
+  await h.refresh();
+  assert.deepEqual(cached(h, 'sidecar'), VM_SIDECAR);
+  assert.deepEqual(cached(h, 'state'), state);
+
+  // Each file on its own: the state could not be read, the sidecar moved on.
+  const newer = { ...VM_SIDECAR, total_input_tokens: 430000 };
+  h.knobs.ctxReply = () => ({ sidecar: newer, state: null, codes: { sidecar: null, state: 'EPARSE', handoff: null }, handoffReadable: null });
+  await h.refresh();
+  assert.deepEqual(cached(h, 'sidecar'), newer);
+  assert.deepEqual(cached(h, 'state'), state);
+
+  // ENOENT is the file not being there, which is normal: the reading is cleared.
+  h.knobs.ctxReply = () => ({ sidecar: newer, state: null, codes: { sidecar: null, state: 'ENOENT', handoff: null }, handoffReadable: null });
+  await h.refresh();
+  assert.equal(cached(h, 'state'), null);
+  assert.deepEqual(cached(h, 'sidecar'), newer);
+  h.knobs.ctxReply = () => ({ sidecar: null, state: null, codes: { sidecar: 'ENOENT', state: 'ENOENT', handoff: null }, handoffReadable: null });
+  await h.refresh();
+  assert.equal(cached(h, 'sidecar'), null);
+  assert.equal(h.header().meter, false);
+  // ENOENT wins over a value sent beside it, as the panel path never had both.
+  h.knobs.ctxReply = () => ({ sidecar: VM_SIDECAR, state, codes: { sidecar: 'ENOENT', state: null, handoff: null }, handoffReadable: null });
+  await h.refresh();
+  assert.equal(cached(h, 'sidecar'), null);
+  assert.deepEqual(cached(h, 'state'), state);
+  assert.deepEqual(panelReads(h), [], 'never the panel read');
+});
+
+test('browser: handoffReadable from main is used for Continue and the handoff file is not read through the panel', async () => {
+  const h = boot({ readCtxState: true });
+  const state = writtenVmState(h);
+  // The panel read would say "gone" (the file map is empty): main's answer is the one used.
+  h.knobs.ctxReply = () => mainReply(h, { state, handoffReadable: true });
+  await h.refresh();
+  assert.equal(h.header().primary, 'Continue in new session');
+  assert.deepEqual(panelReads(h), []);
+
+  // "Could not be read just now" (any code but ENOENT) on a handoff that was
+  // readable does not take Continue away...
+  for (const code of ['EBUSY', 'EPERM', 'ESTAT', null]) {
+    h.knobs.ctxReply = () => mainReply(h, { state, handoffReadable: false, codes: { sidecar: null, state: null, handoff: code } });
+    await h.refresh();
+    assert.equal(h.header().primary, 'Continue in new session', `code ${String(code)}`);
+  }
+  // ...only "the file is gone" does, and at this read, not a minute later.
+  h.knobs.ctxReply = () => mainReply(h, { state, handoffReadable: false, codes: { sidecar: null, state: null, handoff: 'ENOENT' } });
+  await h.refresh();
+  assert.equal(h.header().primary, 'Hand off');
+  // Back again as soon as main can stat it.
+  h.knobs.ctxReply = () => mainReply(h, { state, handoffReadable: true });
+  await h.refresh();
+  assert.equal(h.header().primary, 'Continue in new session');
+  assert.deepEqual(panelReads(h), []);
+});
+
+test('browser: a handoff main never saw readable offers no Continue, whatever the code', async () => {
+  for (const code of ['EBUSY', null, 'ENOENT']) {
+    const h = boot({ readCtxState: true });
+    h.setHandoffFile(true); // the panel read would say readable
+    h.knobs.ctxReply = () => mainReply(h, {
+      state: writtenVmState(h), handoffReadable: false, codes: { sidecar: null, state: null, handoff: code },
+    });
+    await h.refresh();
+    assert.equal(h.header().primary, 'Hand off', `code ${String(code)}`);
+    assert.deepEqual(panelReads(h), [], `code ${String(code)}`);
+  }
+});
+
+test('browser: a read where main could not read the state leaves Continue as it was, without a panel read', async () => {
+  const h = boot({ readCtxState: true });
+  const state = writtenVmState(h);
+  h.knobs.ctxReply = () => mainReply(h, { state, handoffReadable: true });
+  await h.refresh();
+  assert.equal(h.header().primary, 'Continue in new session');
+  // The state file was caught mid-write: no handoff path for main to stat.
+  h.knobs.ctxReply = () => ({ sidecar: VM_SIDECAR, state: null, codes: { sidecar: null, state: 'EPARSE', handoff: null }, handoffReadable: null });
+  await h.advance(61000); // past the once-a-minute rule of the panel check
+  await h.refresh();
+  assert.equal(h.header().primary, 'Continue in new session');
+  assert.deepEqual(panelReads(h), []);
+});
+
+test('browser: a main that sends the state without handoffReadable leaves the check to the panel read', async () => {
+  const h = boot({ readCtxState: true });
+  h.setHandoffFile(true);
+  h.knobs.ctxReply = () => ({ sidecar: VM_SIDECAR, state: writtenVmState(h), codes: { sidecar: null, state: null } });
+  await h.refresh();
+  assert.equal(h.header().primary, 'Continue in new session');
+  assert.deepEqual(panelReads(h), [VM_HANDOFF]);
+});
+
+test('browser: a state with no handoff needs no check at all', async () => {
+  const h = boot({ readCtxState: true });
+  h.knobs.ctxReply = () => mainReply(h); // handoffReadable: null, as main sends it
+  await h.refresh();
+  assert.equal(h.header().primary, 'Hand off');
+  assert.deepEqual(panelReads(h), []);
+});
+
+test('browser: main\'s reply without a busy key stays "not told"; with one it is known', async () => {
+  // Main leaves the key out unless the session is running and it has read a title.
+  const h = boot({ readCtxState: true });
+  h.knobs.ctxReply = () => mainReply(h);
+  await h.refresh();
+  assert.equal(cached(h, 'mainBusy'), null);
+  assert.equal(h.inputs().busyKnown, false);
+  assert.equal(h.header().primaryOverride, true, 'asks first');
+  await h.click('primary');
+  assert.equal(h.confirms.length, 1);
+
+  const told = boot({ readCtxState: true });
+  told.knobs.ctxReply = () => mainReply(told, { busy: false });
+  await told.refresh();
+  assert.equal(cached(told, 'mainBusy'), false);
+  assert.equal(told.inputs().busyKnown, true);
+  assert.equal(told.header().primaryOverride, false);
+  // Dropped again by a later reply: back to "not told", not the old answer.
+  told.knobs.ctxReply = () => mainReply(told);
+  await told.refresh();
+  assert.equal(cached(told, 'mainBusy'), null);
+  assert.equal(told.inputs().busyKnown, false);
+
+  const busy = boot({ readCtxState: true });
+  busy.knobs.ctxReply = () => mainReply(busy, { busy: true });
+  await busy.refresh();
+  assert.equal(busy.inputs().busy, true);
+  assert.equal(busy.header().primaryEnabled, false);
 });
 
 test('browser: the three flags that forbid typing fail closed when app.js cannot be read', async () => {

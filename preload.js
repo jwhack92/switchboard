@@ -8,6 +8,20 @@ contextBridge.exposeInMainWorld('api', {
   getStats: () => ipcRenderer.invoke('get-stats'),
   refreshStats: () => ipcRenderer.invoke('refresh-stats'),
   getUsage: () => ipcRenderer.invoke('get-usage'),
+  // Token analytics (Stats > Tokens). Each resolves to its result or to
+  // { error }; with an OLD main process (no handler yet) the invoke rejects,
+  // so callers catch.
+  getTokenStatsSummary: (q) => ipcRenderer.invoke('token-stats-summary', q),
+  getTokenStatsModels: (q) => ipcRenderer.invoke('token-stats-models', q),
+  getTokenStatsDaily: (q) => ipcRenderer.invoke('token-stats-daily', q),
+  getTokenStatsSessions: (q) => ipcRenderer.invoke('token-stats-sessions', q),
+  getTokenStatsContext: (q) => ipcRenderer.invoke('token-stats-context', q),
+  rescanTokenStats: () => ipcRenderer.invoke('token-stats-rescan'),
+  disableTokenStats: () => ipcRenderer.invoke('token-stats-disable'),
+  enableTokenStats: () => ipcRenderer.invoke('token-stats-enable'),
+  onTokenStatsChanged: (cb) => ipcRenderer.on('token-stats-changed', (_e, info) => cb(info)),
+  // The context-handoff hook's sidecar + state for one session, read by main.
+  readCtxState: (sessionId) => ipcRenderer.invoke('read-ctx-state', sessionId),
   getMemories: () => ipcRenderer.invoke('get-memories'),
   readMemory: (filePath) => ipcRenderer.invoke('read-memory', filePath),
   saveMemory: (filePath, content) => ipcRenderer.invoke('save-memory', filePath, content),

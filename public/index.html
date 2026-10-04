@@ -109,9 +109,16 @@
     </div>
     <div id="stats-viewer" style="display:none;">
       <div id="stats-viewer-header">
-        <span id="stats-viewer-title">Activity</span>
+        <div class="stats-subtabs" role="tablist">
+          <button class="stats-subtab active" role="tab" aria-selected="true" data-subtab="activity">Activity</button>
+          <button class="stats-subtab" role="tab" aria-selected="false" data-subtab="tokens">Tokens</button>
+        </div>
       </div>
       <div id="stats-viewer-body"></div>
+      <!-- The Tokens sub-tab has its own container: the Activity render clears
+           and refills #stats-viewer-body after an await (stats-view.js), so a
+           shared body would let a late Activity render land on the Tokens view. -->
+      <div id="stats-tokens-body" style="display:none"></div>
     </div>
     <div id="memory-viewer" style="display:none;"></div>
     <div id="plan-viewer" style="display:none;"></div>
@@ -240,6 +247,7 @@
   <script src="task-runner.js"></script>
   <script src="grid-view.js"></script>
   <script src="stats-view.js"></script>
+  <script src="token-stats-view.js"></script>
   <script src="jsonl-viewer.js"></script>
   <script src="dialogs.js"></script>
   <script src="sidebar.js"></script>
