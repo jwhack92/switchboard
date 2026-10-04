@@ -405,6 +405,11 @@ const SCENARIOS = {
     // not be deleted drops the store's five tables in place and keeps this one.
     t._handle().exec('CREATE TABLE rebuild_marker (x)');
     assert.equal(H.hasTable('rebuild_marker'), true);
+    // There is no scanner in this scenario, so the flag its `done` would set is
+    // written here: a store whose first backfill never finished is deleted by a
+    // rebuild, not kept (the last part of this scenario).
+    const backfillFinished = () => t._handle().prepare("UPDATE meta SET value = '2026-10-03T00:00:00.000Z' WHERE key = 'backfill_done'").run();
+    backfillFinished();
     const idBefore = H.identity();
 
     // One query is in flight when Rebuild is clicked.
@@ -452,6 +457,7 @@ const SCENARIOS = {
     assert.equal(workers.made.length, 2);
 
     // Twice in a row, with no query between.
+    backfillFinished();
     assert.deepEqual(t.rescan(), { ok: true });
     assert.equal(H.closedFlag(workers.made[1]), 1);
     assert.equal(workers.made.length, 3);
@@ -459,9 +465,27 @@ const SCENARIOS = {
     kept = keptFiles();
     assert.equal(kept.length, 1, 'only the latest is kept: ' + kept.join(', '));
     assert.deepEqual(keptCounts(kept[0]), { responses: 2, marker: 0, check: 'ok' });
+
+    // A third time, before the new store's first backfill has finished (its
+    // flag is still empty): that store is really deleted, with the worker's
+    // connection open on it, and the copy kept above is left as it is.
+    H.apply(f, [H.cand('n3', f, { output: 1 })]);
+    assert.equal((await t.summary(ALL)).totals.responses, 1);
+    t._handle().exec('CREATE TABLE rebuild_marker (x)');
+    const keptInode = String(fs.statSync(path.join(H.dirs.dataDir, kept[0]), { bigint: true }).ino);
+    assert.deepEqual(t.rescan(), { ok: true });
+    assert.equal(H.closedFlag(workers.made[2]), 1);
+    assert.equal(workers.made.length, 4);
+    assert.equal(H.hasTable('rebuild_marker'), false, 'deleted and created again, not emptied in place');
+    assert.equal((await t.summary(ALL)).totals.responses, 0);
+    const still = keptFiles().filter((n) => /^token-usage\.db\.before-rebuild-\d{13}$/.test(n));
+    assert.deepEqual(still, kept, 'the kept copy is still the full one');
+    assert.equal(String(fs.statSync(path.join(H.dirs.dataDir, still[0]), { bigint: true }).ino), keptInode);
+    assert.deepEqual(keptCounts(still[0]), { responses: 2, marker: 0, check: 'ok' });
+    assert.equal(ctx.logs.filter((l) => l.includes('had not finished its first backfill')).length, 1);
     assert.deepEqual(ctx.logs.filter((l) => l.startsWith('warn: ') || l.startsWith('error: ')), []);
     t.close();
-    assert.equal(H.closedFlag(workers.made[2]), 1);
+    assert.equal(H.closedFlag(workers.made[3]), 1);
   },
 
   // Real worker. The kill switch, shutdown() and close() each close the

@@ -727,6 +727,117 @@ const SCENARIOS = {
     assert.deepEqual(H.dump(), before, 'incremental state equals a fresh rebuild');
   },
 
+  cascadeChainNewestFirst(H) {
+    // Gate finding 1 (what M10 left). The chain of cascadeChain, but all three
+    // files are touched in ONE flush, newest first: C2, C1, O. Each rescan
+    // queues the next younger file (C1's queues C2, O's queues C1), so the
+    // cascade's own flush holds C2 before C1. Sent in that order, C2 is
+    // rescanned first and C1's rescan then deletes the row it owns (r-12) and
+    // stores its own placeholder line; the finalised line lives only in C2,
+    // which has had its one extra reset. The row kept the placeholder until a
+    // Rebuild. Cascade-queued paths are flushed oldest file first, so C2 is
+    // rescanned behind C1 in the same batch.
+    const { t } = H;
+    const { ctx, workers } = H.start({ worker: true });
+    const O = H.mainRow(SID_O, { birthtime_ms: 1000 });
+    const C1 = H.mainRow(SID_C, { birthtime_ms: 2000 });
+    const C2 = H.mainRow(SID_X, { birthtime_ms: 3000 });
+    const byRel = { [O.rel_path]: 'O', [C1.rel_path]: 'C1', [C2.rel_path]: 'C2' };
+    for (const f of [O, C1, C2]) H.touch(f.rel_path);
+    const placeholder = { finalized: 0, stop_reason: null, output: 4 };
+    // Every counter of a finalised line differs from the placeholder's, so a
+    // row that kept the placeholder cannot pass for the right one.
+    const final1 = { output: 250, ts_ms: T0 + 150, input: 12, cache_write: 22, cache_write_5m: 17, cache_write_1h: 5,
+      cache_read: 1002, thinking: 8, model: 'claude-sonnet-5-1', stop_reason: 'tool_use' };
+    const final2 = { output: 900, ts_ms: T0 + 200, input: 11, cache_write: 21, cache_write_5m: 19, cache_write_1h: 2,
+      cache_read: 1001, thinking: 9, model: 'claude-fable-5-1' };
+    const msgs = {
+      O: (o) => H.chunk(O, [H.cand('r-o', O, placeholder), H.cand('own-o', O)], o),
+      C1: (o) => H.chunk(C1, [H.cand('r-o', C1, final1), H.cand('r-12', C1, placeholder)], o),
+      C2: (o) => H.chunk(C2, [H.cand('r-12', C2, final2), H.cand('own-2', C2)], o),
+    };
+    const counters = (id) => {
+      const r = H.resp(id);
+      return [r.model, r.ts_ms, r.input, r.output, r.cache_write, r.cache_write_5m, r.cache_write_1h, r.cache_read,
+        r.thinking, r.finalized, r.stop_reason];
+    };
+    const wantRO = ['claude-sonnet-5-1', T0 + 150, 12, 250, 22, 17, 5, 1002, 8, 1, 'tool_use'];
+    const wantR12 = ['claude-fable-5-1', T0 + 200, 11, 900, 21, 19, 2, 1001, 9, 1, 'end_turn'];
+    H.apply(msgs.O());
+    H.apply(msgs.C1());
+    H.apply(msgs.C2());
+    const ids = [O, C1, C2].map((f) => H.file(f.rel_path).id);
+    assert.deepEqual(['r-o', 'own-o', 'r-12', 'own-2'].map((m) => H.resp(m).file_id), [ids[0], ids[0], ids[1], ids[2]]);
+    assert.deepEqual([counters('r-o'), counters('r-12')], [wantRO, wantR12]);
+    const before = H.dump();
+    const scans = () => workers.last.of('scan');
+    const base = scans().length;
+    const fullRescans = { O: 0, C1: 0, C2: 0 };
+    const rescan = (name) => { fullRescans[name]++; H.apply(msgs[name]({ fullRescan: true })); };
+
+    t.noteChanged(C2.rel_path);
+    t.noteChanged(C1.rel_path);
+    t.noteChanged(O.rel_path);
+    ctx.clock.advance(3000);
+    assert.equal(scans().length, base + 1);
+    assert.deepEqual(scans().pop().files.map((f) => byRel[f.rel_path]), ['C2', 'C1', 'O'],
+      'paths the watcher reported keep the order they arrived in');
+    rescan('C2');
+    rescan('C1');
+    assert.equal(H.file(C2.rel_path).indexed_bytes, 0, 'C1 owns a row C2 sighted: C2 gets its one extra reset');
+    // An unrelated file the watcher reports while the cascade is being queued.
+    const W = H.mainRow('44444444-4444-4444-8444-444444444444', { birthtime_ms: 500 });
+    byRel[W.rel_path] = 'W';
+    H.touch(W.rel_path);
+    t.noteChanged(W.rel_path);
+    rescan('O');
+    assert.equal(H.file(C1.rel_path).indexed_bytes, 0, 'O owns a row C1 sighted: C1 gets its one extra reset');
+    assert.deepEqual([H.resp('r-o').output, H.resp('r-12').output], [4, 4], 'both shared rows hold a placeholder for now');
+
+    // The cascade's flush. Whatever order it is sent in is the order the worker
+    // answers in, each file with a full rescan (its row is reset).
+    ctx.clock.advance(3000);
+    assert.equal(scans().length, base + 2);
+    const sent = scans().pop().files;
+    for (const f of sent) {
+      if (byRel[f.rel_path] === 'W') { assert.equal(f.prev, null); continue; }    // a file with nothing to count
+      assert.deepEqual([f.prev.head_hash, f.prev.indexed_bytes], [null, 0], byRel[f.rel_path] + ' is sent with its reset row');
+      rescan(byRel[f.rel_path]);
+    }
+    assert.deepEqual(counters('r-12'), wantR12, 'the row C1 owns holds the finalised line that only C2 has');
+    assert.deepEqual(counters('r-o'), wantRO, 'the row O owns holds the finalised line that only C1 has');
+    // Queued as C2, W, C1. W is older than all of them and stays where it was:
+    // only the cascade's own paths are put in birth order.
+    assert.deepEqual(sent.map((f) => byRel[f.rel_path]), ['C1', 'W', 'C2'],
+      'cascade-queued paths go oldest file first; a watcher path keeps its place');
+    assert.deepEqual(H.dump(), before, 'every row and every counter is back');
+
+    // The cycle ends by itself, and no file was fully rescanned more than twice.
+    ctx.clock.advance(60000);
+    assert.equal(scans().length, base + 2, 'nothing more is queued');
+    assert.deepEqual(fullRescans, { O: 1, C1: 2, C2: 2 });
+    for (const f of [O, C1, C2]) {
+      const row = H.file(f.rel_path);
+      assert.deepEqual([row.indexed_bytes, row.head_hash], [5000, f.head_hash], byRel[f.rel_path] + ' is left with its offset');
+    }
+    // The guard itself is untouched: C1's second rescan still finds C2 "already
+    // rescanned, extra reset used" and says so. It costs nothing here, because
+    // C2 is in the same batch behind C1.
+    assert.equal(ctx.logs.filter((l) => l.includes('already rescanned in this cycle')).length, 1);
+    checkInvariants(t._handle());
+
+    // Equal to a fresh rebuild (Rebuild, then the files as a backfill delivers
+    // them: main files oldest first), for every column of every row.
+    const incremental = H.dump();
+    assert.deepEqual(t.rescan(), { ok: true });
+    assert.equal(H.n('responses'), 0);
+    H.apply(msgs.O());
+    H.apply(msgs.C1());
+    H.apply(msgs.C2());
+    assert.deepEqual(H.dump(), incremental, 'incremental state equals a fresh rebuild');
+    assert.deepEqual([counters('r-o'), counters('r-12')], [wantRO, wantR12]);
+  },
+
   cascadeTerminates(H) {
     // A ring of three agent files, each owning a row the next one sighted. No
     // number of rescans settles it, so the cascade has to stop by itself: each
@@ -1154,15 +1265,50 @@ const SCENARIOS = {
     ctx.clock.advance(2500);
     workers.last.emit('message', { type: 'done', gen: t._gen(), mode: 'backfill', seen: [], missing: [] });
     assert.deepEqual(info().slice(2), ['info: [token-usage] backfill done 1 files in 2.5 s']);
+    // The routine catch-up walk (every 10 minutes, for as long as the app
+    // runs) says the same at DEBUG: at info it was two lines every 10 minutes,
+    // about 290 a day, around the few lines the post-relaunch check looks for.
+    const debug = () => ctx.logs.filter((l) => l.startsWith('debug: '));
+    const loud = () => ctx.logs.filter((l) => !l.startsWith('info: ') && !l.startsWith('debug: '));
+    const doneMsg = (mode) => workers.last.emit('message', { type: 'done', gen: t._gen(), mode, seen: [], missing: [] });
     ctx.clock.advance(600000 - 12500);      // the 10-minute tick
     ctx.clock.advance(300);
-    workers.last.emit('message', { type: 'done', gen: t._gen(), mode: 'catchup', seen: [], missing: [] });
-    assert.deepEqual(info().slice(3), ['info: [token-usage] catch-up started', 'info: [token-usage] catch-up done 1 files in 0.3 s']);
-    assert.deepEqual(ctx.logs.filter((l) => !l.startsWith('info: ')), [], 'and nothing at warn or error');
-    // The next open says how many files it already holds.
+    doneMsg('catchup');
+    assert.deepEqual(info().slice(3), [], 'a routine catch-up adds nothing at info');
+    assert.deepEqual(debug(), ['debug: [token-usage] catch-up started', 'debug: [token-usage] catch-up done 1 files in 0.3 s']);
+    ctx.clock.advance(600000 - 300);        // and the next tick, the same
+    doneMsg('catchup');
+    assert.deepEqual(info().slice(3), []);
+    assert.deepEqual(debug().slice(2), ['debug: [token-usage] catch-up started', 'debug: [token-usage] catch-up done 1 files in 0.0 s']);
+    assert.deepEqual(loud(), [], 'and nothing at warn or error');
+
+    // The next open says how many files it already holds, and the FIRST walk
+    // after an open is at info even though it is a catch-up: these are the
+    // lines a relaunch leaves in the log when the store was already filled.
     t.close();
     assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
+    H.hello(workers.last);
     assert.equal(info().pop(), 'info: [token-usage] opened ' + H.dbFile + ' schema ' + t.SCHEMA_VERSION + ', 1 files');
+    let at = info().length;
+    ctx.clock.advance(10000);
+    ctx.clock.advance(700);
+    doneMsg('catchup');
+    assert.deepEqual(info().slice(at), ['info: [token-usage] catch-up started', 'info: [token-usage] catch-up done 1 files in 0.7 s']);
+    assert.equal(debug().length, 4);
+    ctx.clock.advance(600000 - 10700);      // the tick after it is routine again
+    doneMsg('catchup');
+    assert.deepEqual(info().slice(at + 2), []);
+    assert.deepEqual(debug().slice(4), ['debug: [token-usage] catch-up started', 'debug: [token-usage] catch-up done 1 files in 0.0 s']);
+
+    // Every backfill is at info, whenever it runs (here: after a Rebuild).
+    assert.deepEqual(t.rescan(), { ok: true });
+    at = info().length;
+    H.hello(workers.last);
+    ctx.clock.advance(1200);
+    doneMsg('backfill');
+    assert.deepEqual(info().slice(at), ['info: [token-usage] backfill started', 'info: [token-usage] backfill done 0 files in 1.2 s']);
+    assert.equal(debug().length, 6);
+    assert.deepEqual(loud(), []);
   },
 
   async noThrow(H) {
@@ -1218,8 +1364,17 @@ const SCENARIOS = {
     assert.equal(t.status().reasonCode, 'failure');
     // "Try again" on a store that still cannot open: an { error }, never a throw.
     let again;
+    const sent = ctx.sent.length;
     assert.doesNotThrow(() => { again = t.enable(); });
     assert.ok(isError(again), 'enable: ' + JSON.stringify(again));
+    // The init inside enable() THREW (it is the guard that answered). The other
+    // windows are told all the same: the broadcast used to sit behind that
+    // init, so a second window kept its old totals with no event.
+    assert.equal(ctx.sent.length, sent + 1, 'an enable() whose init throws is still announced');
+    assert.deepEqual(ctx.sent[sent], { channel: 'token-stats-changed', at: ctx.clock.now(),
+      payload: { phase: 'idle', done: 0, total: 0, changedSessions: [] } });
+    assert.deepEqual([t.status().state, t.status().reasonCode, t.status().reason], ['disabled', 'failure', again.error],
+      'and the store is off with the real reason, as after any failed init');
     assert.doesNotThrow(() => { again = t.rescan(); });
     assert.ok(isError(again), 'rescan: ' + JSON.stringify(again));
     assert.equal(t.status().reasonCode, 'failure');
@@ -1548,6 +1703,8 @@ const SCENARIOS = {
     // 3. A changed schema version at open.
     H.hello(workers.last, 2);
     H.apply(H.chunk(O, [H.cand('s1', O), H.cand('s2', O)]));
+    // Its backfill is finished: only such a store takes the kept copy's place (scenario rebuildBeforeBackfillDone).
+    workers.last.emit('message', { type: 'done', gen: t._gen(), mode: 'backfill', seen: [O.rel_path], missing: [] });
     t._handle().prepare("UPDATE meta SET value = '999' WHERE key = 'schema_version'").run();
     t.close();
     assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
@@ -1561,6 +1718,7 @@ const SCENARIOS = {
     // (the file is deleted), and one warn line says the store was not kept.
     H.hello(workers.last, 2);
     H.apply(H.chunk(O, [H.cand('f1', O)]));
+    workers.last.emit('message', { type: 'done', gen: t._gen(), mode: 'backfill', seen: [O.rel_path], missing: [] });
     const realRename = fs.renameSync;
     fs.renameSync = (from, to) => {
       if (String(to).includes('before-rebuild')) throw Object.assign(new Error('EBUSY: resource busy or locked, rename'), { code: 'EBUSY' });
@@ -1580,6 +1738,103 @@ const SCENARIOS = {
     k = kept();
     assert.equal(k.length, 1, 'the copy kept before is left alone');
     assert.deepEqual(readKept(k[0]).ids, ['s1', 's2']);
+  },
+
+  rebuildBeforeBackfillDone(H) {
+    // Gate note on M11: only the latest copy is kept, so a rebuild of a store
+    // whose first backfill had not finished replaced the full copy with a
+    // nearly empty one (Rebuild, then a parser change before the walk was
+    // over). Such a store is now deleted, as a rebuild did before M11, and the
+    // kept copy stays.
+    const { t } = H;
+    const { ctx, workers } = H.start({ worker: true });
+    const kept = () => H.listData().filter((f) => /^token-usage\.db\.before-rebuild-\d{13}$/.test(f));
+    const keptIds = (name) => {
+      const old = new (require('better-sqlite3'))(path.join(H.dirs.dataDir, name), { readonly: true, fileMustExist: true });
+      try {
+        return old.prepare('SELECT message_id FROM responses ORDER BY message_id').all().map((r) => r.message_id);
+      } finally {
+        old.close();
+      }
+    };
+    const notKept = () => ctx.logs.filter((l) => l === 'info: [token-usage] rebuild: the store being replaced had not finished its first backfill; it is deleted, not kept');
+    const backfillDone = () => workers.last.emit('message', { type: 'done', gen: t._gen(), mode: 'backfill', seen: [], missing: [] });
+    const O = H.mainRow(SID_O);
+    H.touch(O.rel_path);
+
+    // A finished store is kept, as before.
+    H.apply(H.chunk(O, [H.cand('m1', O), H.cand('m2', O)]));
+    backfillDone();
+    assert.ok(H.meta('backfill_done'));
+    assert.deepEqual(t.rescan(), { ok: true });
+    const first = kept();
+    assert.equal(first.length, 1, H.listData().join(', '));
+    assert.deepEqual(keptIds(first[0]), ['m1', 'm2']);
+    assert.equal(notKept().length, 0);
+
+    // 1. The new backfill is under way; the app is restarted and the parser's
+    // version has changed: a second rebuild before the first one's walk is done.
+    H.hello(workers.last);
+    H.apply(H.chunk(O, [H.cand('p1', O)]));
+    assert.equal(H.meta('backfill_done'), '');
+    t.close();
+    assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
+    H.hello(workers.last, 2);
+    assert.equal(H.n('responses'), 0, 'rebuilt');
+    assert.deepEqual(kept(), first, 'the kept copy is still the first one');
+    assert.deepEqual(keptIds(first[0]), ['m1', 'm2'], 'and it is the full store');
+    assert.equal(notKept().length, 1, ctx.logs.join('\n'));
+
+    // 2. The Rebuild button, again before a backfill has finished.
+    H.hello(workers.last, 2);
+    H.apply(H.chunk(O, [H.cand('p2', O)]));
+    t.close();
+    assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
+    assert.deepEqual(t.rescan(), { ok: true });
+    assert.equal(H.n('responses'), 0);
+    assert.deepEqual(kept(), first);
+
+    // 3. A changed schema version at open, the same.
+    H.hello(workers.last, 2);
+    H.apply(H.chunk(O, [H.cand('p3', O)]));
+    t._handle().prepare("UPDATE meta SET value = '999' WHERE key = 'schema_version'").run();
+    t.close();
+    assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
+    assert.equal(H.n('responses'), 0);
+    assert.deepEqual(kept(), first);
+    assert.deepEqual(keptIds(first[0]), ['m1', 'm2']);
+    assert.equal(notKept().length, 3);
+    // The folder holds the store (with its -wal and -shm), the one kept copy
+    // (with what reading it left beside it) and nothing else.
+    assert.deepEqual(H.listData().filter((f) => !/^token-usage\.db(-wal|-shm)?$/.test(f) && !f.startsWith(first[0])), [],
+      'no leftover of the deleted stores');
+    assert.deepEqual(ctx.logs.filter((l) => l.startsWith('warn: ') || l.startsWith('error: ')), [], 'deleting it is not a failure: nothing at warn');
+
+    // A store whose backfill has finished replaces the copy, as before.
+    H.hello(workers.last, 2);
+    H.apply(H.chunk(O, [H.cand('q1', O)]));
+    backfillDone();
+    assert.deepEqual(t.rescan(), { ok: true });
+    const second = kept();
+    assert.equal(second.length, 1, 'never more than one: ' + second.join(', '));
+    assert.notDeepEqual(second, first);
+    assert.deepEqual(keptIds(second[0]), ['q1']);
+    assert.equal(notKept().length, 3);
+
+    // With no copy in the folder the rule is the same: nothing is kept of a
+    // store that never finished.
+    for (const f of H.listData()) {
+      if (f.startsWith('token-usage.db.before-rebuild-')) fs.unlinkSync(path.join(H.dirs.dataDir, f));
+    }
+    H.hello(workers.last, 2);
+    H.apply(H.chunk(O, [H.cand('x1', O)]));
+    assert.equal(H.meta('backfill_done'), '');
+    t.close();
+    assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
+    assert.deepEqual(t.rescan(), { ok: true });
+    assert.equal(H.n('responses'), 0);
+    assert.deepEqual(kept(), [], H.listData().join(', '));
+    assert.equal(notKept().length, 4);
   },
 
   async corruptAtRunTime(H) {
@@ -1814,6 +2069,7 @@ function parentMain() {
     cascadeGuard: 'cascade guard: mutual owners are rescanned at most once per cycle',
     cascadeContinuationFirst: 'cascade: a continuation and then its original fully rescanned in one cycle end equal to a fresh rebuild',
     cascadeChain: 'cascade: a file already rescanned in the cycle gets one extra reset when a later rescan deletes rows it sighted',
+    cascadeChainNewestFirst: 'cascade: three chained files touched newest first in one flush end equal to a fresh rebuild (cascade paths flushed oldest first)',
     cascadeTerminates: 'cascade: a ring of owners stops by itself, no file fully rescanned more than twice in a cycle',
     missingMarks: 'a file marked missing is sent with its mark and size -1: not reported again, and scanned if it comes back',
     generation: 'stale gen writes nothing; out-of-order seq is dropped with scan_error protocol; discarded pass writes nothing',
@@ -1828,6 +2084,7 @@ function parentMain() {
     parseVersion: 'parse_version comes from hello; a changed parser rebuilds the store',
     indexChain: 'the secondary indexes are built one per timer turn after a backfill; a Rebuild cancels the chain; the flag is set last',
     rebuildKeepsOld: 'a rebuild keeps the store it replaces as token-usage.db.before-rebuild-<ms>, the latest only; a failed rename falls back to a delete',
+    rebuildBeforeBackfillDone: 'a rebuild of a store whose first backfill never finished deletes it and leaves the kept copy alone',
     corruptAtRunTime: 'corruption at run time: renamed, generation bumped, rebuilt once, then disabled',
     queryCorrupt: 'corruption that only a query meets is recovered the same way: one renamed file, a backfill; other query errors change nothing',
     writeFailure: 'a write-path failure disables the store without throwing and without the kill-switch file',

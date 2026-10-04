@@ -35,6 +35,7 @@ const path = require('path');
 const POLL_MS = 250;
 const SETTLE_ROUNDS_MAX = 40;
 const SETTLE_WAIT_MS = 1500;
+const INDEX_WAIT_MS = 60000;    // longest wait for the index chain before the counts are taken
 
 function usage() {
   return 'usage: token-rehearsal.js --data-dir <path under the temp dir> [--projects-dir <path>] [--timeout-min <n>] [--json]';
@@ -130,6 +131,34 @@ function dbBytes(dataDir) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// The secondary indexes are built one statement per timer turn after the
+// backfill's `done` (token-usage.js, startIndexBuild: about a second in all on
+// the real-size store), so a count taken right after the walk can see fewer
+// than seven. Wait until meta.indexes_built is '1', for at most timeoutMs.
+// Sleeping between reads is also what lets the chain's timers run.
+// `readFlag()` returns the stored value. → { built, waitedMs } (plus `error`
+// when the flag could not be read: there is then nothing to wait for).
+async function waitForIndexes(readFlag, opts) {
+  const o = opts || {};
+  const timeoutMs = typeof o.timeoutMs === 'number' ? o.timeoutMs : INDEX_WAIT_MS;
+  const pollMs = typeof o.pollMs === 'number' ? o.pollMs : POLL_MS;
+  const now = typeof o.now === 'function' ? o.now : Date.now;
+  const nap = typeof o.sleep === 'function' ? o.sleep : sleep;
+  const t0 = now();
+  for (;;) {
+    let value;
+    try {
+      value = readFlag();
+    } catch (err) {
+      return { built: false, waitedMs: now() - t0, error: err && err.message ? err.message : String(err) };
+    }
+    const waitedMs = now() - t0;
+    if (value === '1') return { built: true, waitedMs };
+    if (waitedMs >= timeoutMs) return { built: false, waitedMs };
+    await nap(pollMs);
+  }
+}
+
 async function run(args) {
   const dataDir = checkDataDir(args.dataDir, process.env);
   const projectsDir = path.resolve(args.projectsDir || path.join(os.homedir(), '.claude', 'projects'));
@@ -204,6 +233,13 @@ async function run(args) {
   }
   const tSettled = Date.now();
 
+  // Not part of the wall time above: the index chain is the store's own work
+  // after the walk, and the times stay comparable with earlier rehearsals.
+  const flagSql = "SELECT value FROM meta WHERE key = 'indexes_built'";
+  const indexWait = finished
+    ? await waitForIndexes(() => { const row = store._handle().prepare(flagSql).get(); return row ? row.value : null; })
+    : { built: false, waitedMs: 0 };
+
   const db = store._handle();
   const files = db.prepare(
     `SELECT kind, COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes, COALESCE(SUM(indexed_bytes), 0) AS indexed,
@@ -239,6 +275,8 @@ async function run(args) {
     settleRounds,
     rescansAfterWalk,
     filesStillWaiting: waiting,
+    indexesBuilt: indexWait.built,
+    indexWaitSeconds: indexWait.waitedMs / 1000,
     filesScanned: counts.files,
     filesWithErrors: status && typeof status.filesWithErrors === 'number' ? status.filesWithErrors : null,
     files,
@@ -267,7 +305,7 @@ function printText(r) {
     out.push(`    ${f.kind.padEnd(9)} ${n(f.n)} files, ${n(f.bytes)} bytes, ${n(f.indexed)} indexed, ${n(f.errors)} errors, ${n(f.missing)} missing, ${n(f.skipped)} lines skipped`);
   }
   for (const e of r.errorKinds) out.push(`    scan_error ${JSON.stringify(e.error)}: ${n(e.n)} files`);
-  out.push(`  rows:      ${n(r.counts.responses)} responses, ${n(r.counts.sightings)} sightings, ${n(r.counts.sharedIds)} ids seen in more than one file, ${n(r.counts.compactions)} compactions, ${n(r.counts.indexes)} indexes`);
+  out.push(`  rows:      ${n(r.counts.responses)} responses, ${n(r.counts.sightings)} sightings, ${n(r.counts.sharedIds)} ids seen in more than one file, ${n(r.counts.compactions)} compactions, ${n(r.counts.indexes)} indexes (${r.indexesBuilt ? 'indexes_built set' : 'indexes_built NOT SET'} after waiting ${r.indexWaitSeconds.toFixed(1)} s)`);
   out.push(`  db size:   ${n(r.dbBytes)} bytes after close (while open: db ${n(r.dbBytesOpen.db)}, wal ${n(r.dbBytesOpen.wal)})`);
   out.push(`  log lines: ${JSON.stringify(r.logLines)}, broadcasts ${n(r.broadcasts)}`);
   for (const line of r.firstWarnings) out.push('    ' + line);
@@ -311,5 +349,5 @@ if (require.main === module) {
     process.exit(1);
   });
 } else {
-  module.exports = { parseArgs, checkDataDir, isInside, realish };
+  module.exports = { parseArgs, checkDataDir, isInside, realish, waitForIndexes, INDEX_WAIT_MS };
 }

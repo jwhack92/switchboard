@@ -259,8 +259,9 @@ let parseVersion = null;
 let lastWorkerMsgMs = 0;
 let unansweredSinceMs = null; // when the oldest walk or scan was posted that no worker message has followed
 let respawnTimes = [];
-let walk = null;              // { mode, startedMs } while a walk is running
+let walk = null;              // { mode, startedMs, level } while a walk is running
 let walkWanted = false;
+let walkDoneSinceOpen = false; // a walk has finished since init: later catch-up walks log at debug
 let rescanRunning = false;
 let phase = 'idle';
 let progressDone = 0;
@@ -572,8 +573,16 @@ function wipeAndReopen() {
   // First, and confirmed: on Windows the query worker's open handle makes the
   // rename fail, and a reader makes the checkpoint below wait out the busy timeout.
   const readerClosed = closeQueryWorker();
+  // Only the latest copy is kept, so a store whose first backfill never
+  // finished (the flag is still the '' stampFresh wrote) must not take the
+  // place of the copy kept before it: that one is a full store, this one holds
+  // part of what a walk was still reading. It is deleted, as a rebuild did
+  // before copies were kept. A flag that cannot be read says nothing, and the
+  // store is then kept as any other.
+  let unfinished = false;
+  try { unfinished = !!db && !!S && getMeta('backfill_done') === ''; } catch { /* unknown */ }
   let complete = false;
-  if (db && readerClosed) {
+  if (db && readerClosed && !unfinished) {
     try {
       const r = db.pragma('wal_checkpoint(TRUNCATE)');
       complete = Array.isArray(r) && r.length > 0 && r[0].busy === 0;
@@ -581,7 +590,8 @@ function wipeAndReopen() {
   }
   closeDbQuiet();
   gen++;
-  keepOldStore(complete);
+  if (unfinished) logAt('info', '[token-usage] rebuild: the store being replaced had not finished its first backfill; it is deleted, not kept');
+  else keepOldStore(complete);
   removeDbFiles();          // the main file when it was not kept; what is left of its -wal and -shm either way
   db = new Database(dbPath);
   applyPragmas();
@@ -676,6 +686,7 @@ function initImpl(c) {
   catchupNeeded = false;
   rescanRunning = false;
   walkWanted = false;
+  walkDoneSinceOpen = false;
   tzPending = false;
   respawnTimes = [];
   lastWalkMs = -Infinity;
@@ -848,8 +859,16 @@ function enableImpl() {
   }
   if (state === 'ok' && db && !stopped) return { ok: true, state: 'ok' };
   closeImpl();
-  const r = initImpl(ctx);
-  sendBroadcast();          // on or still off, every window's tab should look again
+  let r;
+  try {
+    r = initImpl(ctx);
+  } finally {
+    // On, still off, or an init that threw (the guard answers that one and
+    // turns the store off): every window's tab should look again. The message
+    // carries no state, and a window that asks because of it is answered after
+    // the guard has run, so it sees the final state either way.
+    sendBroadcast();
+  }
   if (r && r.error) return r;
   return { ok: true, state: state === 'ok' ? 'ok' : 'disabled' };
 }
@@ -1432,19 +1451,29 @@ function requestWalk() {
   const now = clock.now();
   endCascadeCycle();        // a walk is a new root event for the cascade guard
   if (!post({ type: 'walk', gen, mode, known: knownFiles() })) { walkWanted = true; return false; }
-  walk = { mode, startedMs: now };
+  walk = { mode, startedMs: now, level: walkLogLevel(mode) };
   walkWanted = false;
   lastWalkMs = now;
   phase = mode;
   progressDone = 0;
   progressTotal = 0;
   if (mode === 'backfill' && !getMeta('backfill_started')) setMeta('backfill_started', iso(Date.now()));
-  logAt('info', '[token-usage] ' + walkName(mode) + ' started');
+  logAt(walk.level, '[token-usage] ' + walkName(mode) + ' started');
   scheduleBroadcast();
   return true;
 }
 
 function walkName(mode) { return mode === 'backfill' ? 'backfill' : 'catch-up'; }
+
+// Where a walk's two lines go. Every backfill, and every walk until one has
+// finished since the store was opened, is at info: those are the lines to look
+// for after a relaunch. The catch-up walks after that run every 10 minutes for
+// as long as the app is open (about 290 lines a day at info), so they say the
+// same at debug. "Until one has finished", not "the first one": a first walk
+// whose worker died leaves the next walk at info too.
+function walkLogLevel(mode) {
+  return mode === 'backfill' || !walkDoneSinceOpen ? 'info' : 'debug';
+}
 
 // Rows in `files`, for a log line. A log line must not be what fails an open or
 // a walk: a store that cannot be read shows itself at the next real statement.
@@ -1468,8 +1497,9 @@ function onDone(msg) {
   setMeta('last_catchup', stamp);
   if (mode === 'backfill') setMeta('backfill_done', stamp);
   if (getMeta('indexes_built') !== '1') startIndexBuild();
-  logAt('info', '[token-usage] ' + walkName(mode) + ' done ' + fileCount() + ' files'
+  logAt(walk ? walk.level : walkLogLevel(mode), '[token-usage] ' + walkName(mode) + ' done ' + fileCount() + ' files'
     + (walk ? ' in ' + (Math.max(0, clock.now() - walk.startedMs) / 1000).toFixed(1) + ' s' : ''));
+  walkDoneSinceOpen = true;
   walk = null;
   phase = 'idle';
   rescanRunning = false;
@@ -1824,6 +1854,31 @@ function noteChangedImpl(relFilename) {
   return { ok: true, queued: true };
 }
 
+// The order of a flush. A path the watcher reported keeps its place. The paths
+// the cascade queued are put oldest file first (birth time, then path: the
+// order a backfill scans main files in) into the places such paths held.
+// Queue order is the order the rescans happened in, and for a chain touched
+// newest first (C2, C1, O: C2 continues C1, C1 continues O) that puts C2 before
+// C1. C1's rescan then deletes the rows it owns after C2 was applied, C2 has
+// had its one extra reset, and those rows kept C1's line until a Rebuild.
+// Oldest first, each file is rescanned behind the file whose rows it copied.
+// Only the order changes: the same paths are sent, and cascade() decides what
+// is reset and queued exactly as before.
+function cascadeOldestFirst(batch) {
+  if (cascadePending.size < 2) return batch;
+  const slots = [];
+  const queued = [];
+  for (let i = 0; i < batch.length; i++) {
+    if (!cascadePending.has(batch[i])) continue;
+    const row = S.fileByPath.get(batch[i]);
+    slots.push(i);
+    queued.push({ rel: batch[i], birth: row && isNum(row.birthtime_ms) ? row.birthtime_ms : Infinity });
+  }
+  queued.sort((a, b) => (a.birth < b.birth ? -1 : a.birth > b.birth ? 1 : a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  for (let i = 0; i < slots.length; i++) batch[slots[i]] = queued[i].rel;
+  return batch;
+}
+
 function flushImpl() {
   clearFlushTimers();
   if (state !== 'ok' || !db) return unavailable();
@@ -1847,7 +1902,7 @@ function flushImpl() {
   }
   if (!carriesCascade) endCascadeCycle();
 
-  const batch = Array.from(pending);
+  const batch = cascadeOldestFirst(Array.from(pending));
   pending.clear();
   cascadePending.clear();
   const files = [];
