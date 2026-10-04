@@ -60,8 +60,9 @@ test('addDirs splits on commas and trims, skipping empties', () => {
 
 test('model and effort pass through; empty and unknown levels are left to claude', () => {
   // The effort level is checked against a list rather than passed blind: a
-  // stored setting outlives the claude version that understood it, and an
-  // unknown level fails the launch outright instead of degrading.
+  // stored setting outlives the claude version that understood it. The CLI
+  // warns on an unknown value and starts at its default effort; the list keeps
+  // one from reaching it at all.
   assert.deepEqual(
     claude.buildLaunchArgs({ sessionId: 'a', isNew: true, options: { model: 'opus', effort: 'xhigh' } }),
     ['--session-id', 'a', '--model', 'opus', '--effort', 'xhigh']
@@ -74,6 +75,24 @@ test('model and effort pass through; empty and unknown levels are left to claude
     claude.buildLaunchArgs({ sessionId: 'a', isNew: true, options: { effort: 'ultra' } }),
     ['--session-id', 'a'],
     'claude has no ultra level'
+  );
+});
+
+test("effort 'ultracode' is passed through, ahead of the first prompt", () => {
+  // Not a level: `--effort ultracode` starts the session with ultracode on at
+  // xhigh. The handoff continuation is what sets it (public/ctx-handoff.js).
+  assert.deepEqual(
+    claude.buildLaunchArgs({ sessionId: 'a', isNew: true, options: { effort: 'ultracode' } }),
+    ['--session-id', 'a', '--effort', 'ultracode']
+  );
+  // The continuation always carries a first prompt, and a flag after the
+  // positional argument would be read as part of it or not at all.
+  assert.deepEqual(
+    claude.buildLaunchArgs({
+      sessionId: 'a', isNew: true,
+      options: { model: 'opus', effort: 'ultracode', initialPrompt: 'Read C:/h/handoff.md in full' },
+    }),
+    ['--session-id', 'a', '--model', 'opus', '--effort', 'ultracode', 'Read C:/h/handoff.md in full']
   );
 });
 

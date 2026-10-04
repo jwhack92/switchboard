@@ -22,25 +22,27 @@
     { value: 'dontAsk', label: "Don't Ask", desc: 'Auto-deny tools not explicitly allowed' },
     { value: 'bypassPermissions', label: 'Bypass', desc: 'Auto-accept all tool calls' },
   ];
-  // Effort levels. Not decorative: harnesses/claude.js:339 holds
-  // EFFORT_LEVELS = new Set(['low','medium','high','xhigh','max']) and
-  // buildLaunchArgs (harnesses/claude.js:407) emits --effort ONLY for a value
-  // in that set. A level offered here but missing there is a control that
-  // silently does nothing. This list is that set plus the empty "Default",
-  // which means "emit no flag". Keep the two in step.
+  // Effort levels. Not decorative: harnesses/claude.js holds EFFORT_LEVELS
+  // (low, medium, high, xhigh, max, ultracode) and buildLaunchArgs emits
+  // --effort ONLY for a value in that set. A level offered here but missing
+  // there is a control that silently does nothing. This list is the five
+  // levels of that set plus the empty "Default", which means "emit no flag".
+  // Keep the two in step. 'ultracode' is the one exception: the harness
+  // accepts it for the handoff continuation (public/ctx-handoff.js
+  // handoffContinue) and it is deliberately not offered here.
   const CLAUDE_EFFORTS = [
     { value: '', label: 'Default' }, { value: 'low', label: 'Low' }, { value: 'medium', label: 'Medium' },
     { value: 'high', label: 'High' }, { value: 'xhigh', label: 'Extra High' }, { value: 'max', label: 'Max' },
   ];
   // Every field below was checked against what this fork actually consumes:
-  //   permissionMode / dangerouslySkipPermissions  harnesses/claude.js:398-402
-  //   model                                        harnesses/claude.js:404-406
-  //   effort                                       harnesses/claude.js:407-409
-  //   allowedTools                                 harnesses/claude.js:365
-  //   appendSystemPrompt                           harnesses/claude.js:415-417
-  //   worktree / worktreeName                      harnesses/claude.js:383-388
-  //   chrome                                       harnesses/claude.js:410-412
-  //   addDirs                                      harnesses/claude.js:366-369
+  //   permissionMode / dangerouslySkipPermissions  harnesses/claude.js:402-406
+  //   model                                        harnesses/claude.js:408-410
+  //   effort                                       harnesses/claude.js:411-413
+  //   allowedTools                                 harnesses/claude.js:369
+  //   appendSystemPrompt                           harnesses/claude.js:419-421
+  //   worktree / worktreeName                      harnesses/claude.js:387-392
+  //   chrome                                       harnesses/claude.js:414-416
+  //   addDirs                                      harnesses/claude.js:370-373
   //   preLaunchCmd                                 main.js:1384-1390 — prepended to the command
   //                                                string, NOT an argv flag, so buildLaunchArgs
   //                                                never sees it

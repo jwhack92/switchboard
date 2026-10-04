@@ -333,10 +333,14 @@ function classifyNotification(message) {
 
 // --- Launch ---
 
-// The levels `claude --effort` accepts. Checked rather than passed blind: a
-// stored setting can outlive the claude version that understood it, and an
-// unknown level fails the launch.
-const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+// The values `claude --effort` accepts. Checked rather than passed blind: a
+// stored setting can outlive the claude version that understood it. The
+// installed CLI does not fail the launch on an unknown value -- it warns and
+// starts at the default effort -- but the allowlist still keeps one from
+// reaching it. 'ultracode' is not a sixth level: `--effort ultracode` starts
+// the session with ultracode on at xhigh effort. `claude --help` does not
+// list it; read in the CLI itself, Claude Code 2.1.289.
+const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']);
 
 /**
  * Argv for the claude binary. Returned as an array so the caller can quote it

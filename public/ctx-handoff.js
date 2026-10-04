@@ -207,6 +207,14 @@ function chipState(input) {
   return { text: meter.text, level: meter.level, title: 'Context ' + meter.full };
 }
 
+// Whether the session had ultracode on at its last prompt, as the hook read it
+// from the transcript. The boolean true only: false is "switched off", null
+// and a missing key (an older hook) are "not seen", and none of them is a
+// reason to start the next session in it.
+function inUltracode(state) {
+  return !!state && typeof state === 'object' && state.ultracode === true;
+}
+
 /**
  * What the header buttons show. `primary` is one button in three guises (Hand
  * off / Writing… / Continue in new session); `update` is the small one beside
@@ -290,9 +298,15 @@ function buttonModel(input) {
     else if (info.status === 'due') {
       title = 'Start a new session in the same folder that reads the last handoff this session wrote (a newer one was due and was not written)';
     }
+    // The new session is started the way this one was left (handoffContinue),
+    // and the button says so before the click.
+    const ultracode = o.ultracode === true;
+    if (ultracode && !locked) title += '. It starts in ultracode, like this one';
     model.visible = true;
     model.primary = {
-      kind: 'continue', label: 'Continue in new session', enabled: !locked, override: false, title,
+      kind: 'continue',
+      label: ultracode ? 'Continue in new session (ultracode)' : 'Continue in new session',
+      enabled: !locked, override: false, title,
     };
     model.update = {
       visible: running,
@@ -666,6 +680,7 @@ function handoffInputs(id) {
     sidecar: entry ? entry.sidecar : null,
     state: entry ? entry.state : null,
     handoffReadable: entry ? entry.handoffReadable : false,
+    ultracode: !!entry && inUltracode(entry.state),
     request: entry ? entry.request : handoffIdleRequest(),
     continueLocked: !!entry && nowMs < entry.continueLockUntil,
     continueError: errorShown ? entry.continueError : '',
@@ -1224,6 +1239,10 @@ async function handoffContinue(id) {
     // Same folder as the old session, not a fresh worktree of it.
     delete options.worktree;
     delete options.worktreeName;
+    // An ultracode session continues as one. Set after the defaults, so it
+    // would win over an effort from them (they carry none today);
+    // `--effort ultracode` is ultracode on at xhigh (harnesses/claude.js).
+    if (inUltracode(entry.state)) options.effort = 'ultracode';
     options.initialPrompt = continuePrompt(info.path);
     await launchNewSession(target, options);
   } catch (err) {

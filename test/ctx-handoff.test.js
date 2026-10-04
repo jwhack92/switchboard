@@ -798,6 +798,55 @@ test('buttonModel: rule 3, a locked Continue shows as disabled and comes back wh
   );
 });
 
+test('buttonModel: rule 3, Continue from an ultracode session says so in the label and the title', () => {
+  const written = { state: writtenState(), handoffReadable: true };
+  const plain = buttonModel(buttonArgs(written)).primary;
+  const ultra = buttonModel(buttonArgs({ ...written, ultracode: true })).primary;
+  assert.equal(ultra.kind, 'continue');
+  assert.equal(ultra.label, 'Continue in new session (ultracode)');
+  assert.equal(ultra.title, plain.title + '. It starts in ultracode, like this one');
+  assert.equal(ultra.enabled, true);
+  assert.equal(ultra.override, false);
+
+  // Only the boolean true. The flag is an input of its own: a state that
+  // carries the key does not turn it on by itself.
+  for (const ultracode of [false, null, undefined, 'yes', 1]) {
+    assert.deepEqual(
+      buttonModel(buttonArgs({ ...written, ultracode })).primary, plain, `ultracode ${String(ultracode)}`
+    );
+  }
+  assert.deepEqual(
+    buttonModel(buttonArgs({ state: writtenState({ ultracode: true }), handoffReadable: true })).primary, plain
+  );
+  assert.equal(plain.label, 'Continue in new session');
+  assert.equal(plain.title, 'Start a new session in the same folder that reads the handoff first');
+
+  // A stopped session whose newer handoff was never written: the same sentence
+  // on the longer title.
+  const due = { running: false, state: writtenState({ pending: true }), handoffReadable: true };
+  assert.equal(
+    buttonModel(buttonArgs({ ...due, ultracode: true })).primary.title,
+    buttonModel(buttonArgs(due)).primary.title + '. It starts in ultracode, like this one'
+  );
+
+  // While the launch is out the label stays and the title is the lock's.
+  const locked = buttonModel(buttonArgs({ ...written, ultracode: true, continueLocked: true })).primary;
+  assert.equal(locked.label, 'Continue in new session (ultracode)');
+  assert.equal(locked.title, buttonModel(buttonArgs({ ...written, continueLocked: true })).primary.title);
+});
+
+test('buttonModel: ultracode changes nothing but Continue', () => {
+  for (const over of [{}, { busy: true }, { state: null }, { request: { phase: 'requested', atMs: 1990000 } }]) {
+    assert.deepEqual(
+      buttonModel(buttonArgs({ ...over, ultracode: true })), buttonModel(buttonArgs(over)), JSON.stringify(over)
+    );
+  }
+  const written = { state: writtenState(), handoffReadable: true };
+  assert.deepEqual(
+    buttonModel(buttonArgs({ ...written, ultracode: true })).update, buttonModel(buttonArgs(written)).update
+  );
+});
+
 test('buttonModel: the Continue lock does not touch Hand off', () => {
   const m = buttonModel(buttonArgs({ continueLocked: true }));
   assert.equal(m.primary.kind, 'handoff');
@@ -2702,6 +2751,67 @@ test('browser: Continue starts one sibling in the same folder, no worktree, told
   });
   assert.deepEqual(h.sent, [], 'Continue types nothing into the old session');
   assert.equal(h.confirms.length, 0);
+});
+
+test('browser: Continue from an ultracode session starts the sibling in ultracode, over the stored effort', async () => {
+  const h = boot();
+  h.setSidecar(VM_SIDECAR);
+  h.setHandoffFile(true);
+  h.setState(writtenVmState(h, { ultracode: true, ultra_scan: { path: 'C:\\t\\s.jsonl', offset: 1234 } }));
+  await h.refresh();
+  assert.equal(h.inputs().ultracode, true);
+  assert.equal(h.header().primary, 'Continue in new session (ultracode)');
+  assert.ok(h.byId['handoff-primary-btn'].getAttribute('title').endsWith('. It starts in ultracode, like this one'));
+  // The default effort the settings would have given is replaced, not kept.
+  h.knobs.resolveOptions = async () => ({ model: 'm', effort: 'low', worktree: true, worktreeName: 'wt' });
+  await h.click('primary');
+  assert.equal(h.launches.length, 1);
+  assert.deepEqual(JSON.parse(h.launches[0]), {
+    target: { projectPath: 'C:\\proj' },
+    options: {
+      model: 'm', effort: 'ultracode',
+      initialPrompt: 'Read C:/h/handoff.md in full before doing anything else, then continue',
+    },
+  });
+});
+
+test('browser: only the boolean true carries ultracode over; anything else leaves the effort alone', async () => {
+  // false = switched off, null = no record seen, no key = an older hook.
+  const cases = [['false', { ultracode: false }], ['null', { ultracode: null }], ['absent', {}],
+    ['a string', { ultracode: 'yes' }], ['a number', { ultracode: 1 }]];
+  for (const [name, over] of cases) {
+    const h = boot();
+    h.setSidecar(VM_SIDECAR);
+    h.setHandoffFile(true);
+    h.setState(writtenVmState(h, over));
+    await h.refresh();
+    assert.equal(h.inputs().ultracode, false, name);
+    assert.equal(h.header().primary, 'Continue in new session', name);
+    await h.click('primary');
+    assert.equal(h.launches.length, 1, name);
+    const { options } = JSON.parse(h.launches[0]);
+    assert.ok(!('effort' in options), `${name}: no effort of ours`);
+
+    // ...and a stored effort goes through as it is.
+    h.knobs.resolveOptions = async () => ({ model: 'm', effort: 'high' });
+    await h.advance(3001);
+    await h.click('primary');
+    assert.equal(JSON.parse(h.launches[1]).options.effort, 'high', name);
+  }
+});
+
+test('browser: a session that left ultracode after its handoff continues without it', async () => {
+  const h = boot();
+  h.setSidecar(VM_SIDECAR);
+  h.setHandoffFile(true);
+  h.setState(writtenVmState(h, { ultracode: true }));
+  await h.refresh();
+  assert.equal(h.header().primary, 'Continue in new session (ultracode)');
+  h.setState(writtenVmState(h, { ultracode: false }));
+  await h.refresh();
+  assert.equal(h.header().primary, 'Continue in new session');
+  await h.click('primary');
+  assert.ok(!('effort' in JSON.parse(h.launches[0]).options));
 });
 
 test('browser: Continue stays locked until the launch has settled, however long that takes', async () => {
