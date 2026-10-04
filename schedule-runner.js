@@ -7,6 +7,11 @@ const crypto = require('crypto');
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 
+// Keys that would be written through the prototype chain instead of onto the
+// result. A schedule file arrives with whatever repository a project folder
+// holds, so a `__proto__:` block must not reach Object.prototype.
+const UNSAFE_FRONTMATTER_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 /** Parse YAML-like frontmatter from a markdown file (simple key: value parser). */
 function parseFrontmatter(content) {
   const match = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
@@ -14,14 +19,19 @@ function parseFrontmatter(content) {
 
   const meta = {};
   let currentKey = null;
-  const nested = {};
+  // Null prototype: a block named `hasOwnProperty` or `toString` has to start
+  // a fresh inner object, not resolve to the shared built-in and write on it.
+  const nested = Object.create(null);
 
   for (const line of match[1].split('\n')) {
     if (currentKey && line.match(/^\s+/) && line.includes(':')) {
       const m = line.match(/^\s+([^:]+):\s*(.*)$/);
       if (m && !m[1].trim().startsWith('#')) {
-        if (!nested[currentKey]) nested[currentKey] = {};
-        nested[currentKey][m[1].trim()] = m[2].trim();
+        const innerKey = m[1].trim();
+        if (!UNSAFE_FRONTMATTER_KEYS.has(currentKey) && !UNSAFE_FRONTMATTER_KEYS.has(innerKey)) {
+          if (!nested[currentKey]) nested[currentKey] = {};
+          nested[currentKey][innerKey] = m[2].trim();
+        }
       }
       continue;
     }
@@ -32,13 +42,13 @@ function parseFrontmatter(content) {
       if (val === '' || val === undefined) {
         currentKey = key;
       } else {
-        meta[key] = val;
+        if (!UNSAFE_FRONTMATTER_KEYS.has(key)) meta[key] = val;
         currentKey = null;
       }
     }
   }
   for (const [k, v] of Object.entries(nested)) {
-    meta[k] = v;
+    if (!UNSAFE_FRONTMATTER_KEYS.has(k)) meta[k] = v;
   }
   return { meta, body: match[2].trim() };
 }
