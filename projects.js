@@ -1550,6 +1550,10 @@ function legacyScheduleConfig(cli = {}) {
  * Import each old file-based schedule once. Each schedule-*.md becomes
  * a folder schedule on the folder it sits in. The file stays the source of
  * truth: the prompt tells the CLI to read it. Returns how many were imported.
+ *
+ * Every import arrives switched off. The file names its own permission mode,
+ * tools and add-dirs, and it comes with whatever repository the folder holds,
+ * so it must not start running before someone has turned it on.
  */
 function importLegacySchedules(scanned) {
   // The old global completion flag could represent an empty or partial scan.
@@ -1578,7 +1582,7 @@ function importLegacySchedules(scanned) {
       projectId: null, trackId: null, cwd: s.projectPath,
       prompt: `Run the scheduled task defined in ${s.filePath}. Read that file and follow its instructions.`,
       ...timing,
-      cli: 'claude', sessionConfig: config, enabled: s.enabled !== false, catchUp: false,
+      cli: 'claude', sessionConfig: config, enabled: false, catchUp: false,
       sourceFile: s.filePath,
       created: new Date().toISOString(),
     });
