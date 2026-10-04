@@ -340,34 +340,13 @@ async function showResumeSessionDialog(session) {
 // Jason: "When you start a new project a session should automatically open in
 // that project". Both ways of making one end in openFirstSession: Add project
 // on the sidebar (below) and New project on the Projects tab (projects-view.js).
-
-/**
- * The folder row an Add produced, out of the cached project list, or null.
- * `added` is add-project's reply ({ folder, projectPath }). The folder name is
- * the key; the second pass ignores case because on Windows a path typed in
- * another case lands in the folder that already exists under its own spelling.
- */
-function findAddedProject(projects, added) {
-  const list = Array.isArray(projects) ? projects : [];
-  const folder = added && typeof added.folder === 'string' ? added.folder : '';
-  const projectPath = added && typeof added.projectPath === 'string' ? added.projectPath : '';
-  if (!folder && !projectPath) return null;
-  const exact = list.find(p => p && ((folder && p.folder === folder) || (projectPath && p.projectPath === projectPath)));
-  if (exact) return exact;
-  const lower = folder.toLowerCase();
-  return (lower && list.find(p => p && typeof p.folder === 'string' && p.folder.toLowerCase() === lower)) || null;
-}
-
-/**
- * True when the added folder already has sessions: a hidden project that was
- * added back. It is shown again and no session is started in it. Pass the
- * list that includes archived sessions, so a project whose history is all
- * archived still counts as having one.
- */
-function addedProjectHasSessions(projects, added) {
-  const found = findAddedProject(projects, added);
-  return !!found && Array.isArray(found.sessions) && found.sessions.length > 0;
-}
+//
+// Whether an Add made a NEW project is main's answer (`created` in the
+// add-project reply), not something worked out here. The first version looked
+// the folder up in the reloaded project list and called it new when it was not
+// found or had no sessions; a hidden project typed in another spelling, a path
+// with a trailing slash and a known folder with no sessions all passed for new
+// and got a session.
 
 /**
  * Start Claude in `target` with the folder's default settings: what "Claude"
@@ -413,6 +392,7 @@ function showAddProjectDialog() {
 
   const pathInput = dialog.querySelector('#add-project-path');
   const errorEl = dialog.querySelector('#add-project-error');
+  const addBtn = dialog.querySelector('.add-project-add-btn');
   pathInput.focus();
 
   function close() {
@@ -420,7 +400,15 @@ function showAddProjectDialog() {
     document.removeEventListener('keydown', onKey);
   }
 
+  // One Add at a time. The dialog and its Enter listener stay up until main
+  // has answered, so a second Enter or click in that gap sent the request again
+  // and, now that an Add opens a session, started two. The flag is what stops
+  // it (Enter does not go through the button); the disabled button shows it.
+  // It is given back only when the dialog stays open for another try.
+  let adding = false;
+
   async function addProject() {
+    if (adding) return;
     const projectPath = pathInput.value.trim();
     if (!projectPath) {
       errorEl.textContent = 'Please enter a folder path.';
@@ -428,21 +416,31 @@ function showAddProjectDialog() {
       return;
     }
     errorEl.style.display = 'none';
-    const result = await window.api.addProject(projectPath);
-    if (result.error) {
-      errorEl.textContent = result.error;
+    adding = true;
+    addBtn.disabled = true;
+    let result;
+    try {
+      result = await window.api.addProject(projectPath);
+    } catch (err) {
+      // A rejected call must give the flag back too, or the dialog is dead.
+      result = { error: err.message };
+    }
+    if (!result || result.error) {
+      adding = false;
+      addBtn.disabled = false;
+      errorEl.textContent = result?.error || 'Could not add the project.';
       errorEl.style.display = 'block';
       return;
     }
     close();
 
     await loadProjects();
-    // A folder that is new here opens with a session in it. One that already
-    // has sessions (a hidden project added back) is only shown again.
-    if (!addedProjectHasSessions(cachedAllProjects, result)) {
-      const added = findAddedProject(cachedAllProjects, result);
-      await openFirstSession({ projectPath: (added && added.projectPath) || result.projectPath });
-    }
+    // Only a project this Add created opens with a session in it, under the
+    // path main settled on (the typed one with its slashes and any trailing
+    // separator put right). Jason, on a folder Switchboard already knows,
+    // listed or hidden, with or without sessions: "No session". That one is
+    // only shown again.
+    if (result.created === true) await openFirstSession({ projectPath: result.projectPath });
   }
 
   dialog.querySelector('.add-project-browse-btn').onclick = async () => {
@@ -451,7 +449,7 @@ function showAddProjectDialog() {
   };
 
   dialog.querySelector('.add-project-cancel-btn').onclick = close;
-  dialog.querySelector('.add-project-add-btn').onclick = addProject;
+  addBtn.onclick = addProject;
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
   function onKey(e) {

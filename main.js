@@ -620,16 +620,32 @@ ipcMain.handle('browse-folder', async (event) => {
 });
 
 // --- IPC: add-project ---
-ipcMain.handle('add-project', (_event, projectPath) => {
+ipcMain.handle('add-project', (_event, typedPath) => {
   try {
+    // One spelling for everything below. A typed path can end in a separator or
+    // use the other slash, and each spelling encodes to its own folder name: a
+    // trailing "\" used to seed a second folder for a project that was already
+    // here. path.resolve('') is the app's own folder, so an empty path is
+    // refused before it gets there.
+    if (typeof typedPath !== 'string' || !typedPath.trim()) return { error: 'Path is not a directory' };
+    const projectPath = path.resolve(typedPath);
+
     // Validate the path exists and is a directory
     const stat = fs.statSync(projectPath);
     if (!stat.isDirectory()) return { error: 'Path is not a directory' };
 
-    // Unhide if previously hidden
+    // Unhide if previously hidden. Matched on the resolved path, and without
+    // regard to case on Windows, where C:\Work and c:\work are one folder: an
+    // exact string match left a project hidden when it was typed any other way.
     const global = getSetting('global') || {};
-    if (global.hiddenProjects && global.hiddenProjects.includes(projectPath)) {
-      global.hiddenProjects = global.hiddenProjects.filter(p => p !== projectPath);
+    const spelling = (p) => {
+      const resolved = path.resolve(p);
+      return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+    };
+    const isThisProject = (p) => typeof p === 'string' && !!p && spelling(p) === spelling(projectPath);
+    const wasHidden = Array.isArray(global.hiddenProjects) && global.hiddenProjects.some(isThisProject);
+    if (wasHidden) {
+      global.hiddenProjects = global.hiddenProjects.filter(p => !isThisProject(p));
       setSetting('global', global);
     }
 
@@ -651,7 +667,9 @@ ipcMain.handle('add-project', (_event, projectPath) => {
     // id, so the real conversation was appended to the seed file and kept the
     // fabricated title for good. Carrying only `cwd` keeps deriveProjectPath
     // working while readSessionFile correctly yields no session.
+    let seeded = false;
     if (!fs.readdirSync(folderPath).some(f => f.endsWith('.jsonl'))) {
+      seeded = true;
       const seedFile = path.join(folderPath, require('crypto').randomUUID() + '.jsonl');
       const line = JSON.stringify({
         type: 'project-seed',
@@ -665,7 +683,13 @@ ipcMain.handle('add-project', (_event, projectPath) => {
     refreshFolder(folder);
     notifyRendererProjectsChanged();
 
-    return { ok: true, folder, projectPath };
+    // `created` is what the Add dialog opens a session on (public/dialogs.js).
+    // Jason, asked whether adding a folder Switchboard already knows (listed or
+    // hidden) but that has no sessions should open one: "No session". So it is
+    // true only when this call made the project entry: the seed was written,
+    // and the path was not a hidden project being shown again. Main decides it
+    // because the renderer can only guess from the project list.
+    return { ok: true, folder, projectPath, created: seeded && !wasHidden };
   } catch (err) {
     return { error: err.message };
   }

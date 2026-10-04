@@ -3988,10 +3988,18 @@ async function showNewProjectDialog({ name: initialName = '', folders: initialFo
     if (folders.includes(folder)) { renderFolders(); renderPreview(); }
   }
 
+  // One create at a time. Disabling the button does not cover it: Enter in the
+  // name or branch box calls create() directly (onKey below), and a second
+  // Enter while the first request was out made a second project, and now a
+  // second session with it. Given back only when the dialog stays open.
+  let creating = false;
+
   async function create() {
+    if (creating) return;
     const name = nameInput.value.trim();
     if (!name) { showError('Give the project a name.'); nameInput.focus(); return; }
     showError('');
+    creating = true;
     createBtn.disabled = true;
     createBtn.textContent = hasWorktree() ? 'Creating worktrees…' : 'Creating…';
     let result;
@@ -4012,7 +4020,7 @@ async function showNewProjectDialog({ name: initialName = '', folders: initialFo
     }
     createBtn.disabled = false;
     createBtn.textContent = 'Create project';
-    if (!result || result.error) { showError(result?.error || 'Could not create the project.'); return; }
+    if (!result || result.error) { creating = false; showError(result?.error || 'Could not create the project.'); return; }
     close();
     projectsUi.selectedProjectId = result.project?.id || null;
     setProjectTab(projectsUi.selectedProjectId, 'overview');
@@ -4023,13 +4031,16 @@ async function showNewProjectDialog({ name: initialName = '', folders: initialFo
     else showProjectOverview();
     if (result.errors?.length) {
       alert(`Project created, but some worktrees could not be made:\n\n${result.errors.join('\n')}\n\nAttach them again from the project settings.`);
-      // Its folders need attention first, and the session's folder may be one
-      // of the worktrees that was not made: no session is started.
-      return;
     }
     // A new project opens with a session in it (dialogs.js openFirstSession):
     // the same launch as Claude on the project's + menu, shown in place of the
     // overview, which stays one click away.
+    //
+    // After worktree errors too, once the alert is dismissed. Jason, asked what
+    // should happen when some worktrees could not be made: "Open the session
+    // anyway". The session does not start in a worktree: a project that was
+    // just made has no default folder set, so launchTargetFor gives its own
+    // folder, which createProject makes before it tries any worktree.
     const created = findTreeProject(result.project?.id);
     if (created) await openFirstSession(launchTargetFor(created), { runtime: 'claude' });
   }
