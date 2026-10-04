@@ -86,7 +86,7 @@ test('main wiring: a logger that throws does not stop the stand-in from being in
   assert.deepEqual({ ...stub.init({}) }, STUB_ERROR);
 });
 
-test('main wiring: the real token-usage.js passes the check, and before init nothing main calls can throw', () => {
+test('main wiring: the real token-usage.js passes the check, and before init nothing main calls can throw', async () => {
   const real = require('../token-usage');
   const log = fakeLog();
   const loaded = runRequire((id) => { assert.equal(id, './token-usage'); return real; }, log);
@@ -96,8 +96,12 @@ test('main wiring: the real token-usage.js passes the check, and before init not
   // calls that can arrive first. None may throw; none opens anything.
   assert.equal(typeof loaded.noteChanged('proj/' + SID + '.jsonl').error, 'string');
   assert.equal(typeof loaded.noteChanged(undefined).error, 'string');
+  // The queries answer through a Promise (they run in the query worker); it
+  // resolves to { error } and never rejects, which is what guardedTokens awaits.
   for (const name of ['summary', 'models', 'daily', 'sessions', 'context']) {
-    assert.equal(typeof loaded[name]({}).error, 'string', name);
+    const pending = loaded[name]({});
+    assert.equal(typeof pending.then, 'function', name);
+    assert.equal(typeof (await pending).error, 'string', name);
   }
   assert.equal(typeof loaded.rescan().error, 'string');
   assert.deepEqual(loaded.shutdown(), { ok: true });

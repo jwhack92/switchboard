@@ -11,6 +11,10 @@
 // under the Electron binary as Node, with TOKEN_USAGE_SCENARIO set. Contract
 // rule 5 holds as in the database test: temp dataDir, SWITCHBOARD_DATA_DIR on
 // the same folder, and a refusal to open anything outside os.tmpdir().
+//
+// The queries are asynchronous. ctx.createQueryWorker throws here, so they run
+// inline against the stub, in the same turn as the call: what summary() does
+// to the scheduler (the catch-up walk) is visible before its Promise resolves.
 
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -108,7 +112,8 @@ function makeHarness() {
   fs.mkdirSync(dirs.projectsDir, { recursive: true });
   installQueriesStub();
   const t = require(MOD);
-  const H = { t, dirs };
+  const queryWorkerPaths = [];
+  const H = { t, dirs, queryWorkerPaths };
   H.start = (opts) => {
     const o = opts || {};
     const workers = stubWorkers(o.failFirst);
@@ -123,6 +128,7 @@ function makeHarness() {
       dataDir: dirs.dataDir,
       workerPath: 'C:/app/workers/scan-tokens.js',
       createWorker: workers.createWorker,
+      createQueryWorker: (workerPath) => { queryWorkerPaths.push(workerPath); throw new Error('no query worker in this test'); },
       broadcast: (channel, payload) => sent.push({ channel, payload, at: clock.now() }),
     };
     assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
@@ -305,7 +311,7 @@ const SCENARIOS = {
     assert.equal(w.of('scan').length, 2);
   },
 
-  catchup(H) {
+  async catchup(H) {
     const { t } = H;
     const { workers, clock } = H.start();
     const w = workers.last;
@@ -334,20 +340,26 @@ const SCENARIOS = {
 
     // Tokens tab opened (summary): a walk only when the last one is older than 60 s.
     clock.advance(60000);
-    assert.equal(t.summary({}).name, 'summary');
+    assert.equal((await t.summary({})).name, 'summary');
     assert.equal(walks().length, 3, 'exactly 60 s old: not yet');
+    // The query worker is asked for beside the scan worker, never beside this file.
+    assert.deepEqual(H.queryWorkerPaths, [path.join('C:/app/workers', 'query-tokens.js')]);
+    assert.equal(t.status().queryMode, 'inline');
     clock.advance(1);
-    const s = t.summary({});
-    assert.equal(walks().length, 4);
+    const asked = t.summary({});
+    assert.equal(walks().length, 4, 'the walk is requested in the same turn as the call, not when the answer arrives');
+    const s = await asked;
     assert.equal(s.scan.phase, 'catchup');
-    t.summary({});
-    t.models({});
+    assert.equal(s.scan.queryMode, 'inline');
+    await t.summary({});
+    await t.models({});
     assert.equal(walks().length, 4, 'not while one is running, and only from summary');
     H.done(w);
-    t.summary({});
+    await t.summary({});
     assert.equal(walks().length, 4, 'and not within 60 s of the last one');
-    for (const name of ['models', 'daily', 'sessions', 'context']) { clock.advance(61000); t[name]({}); }
+    for (const name of ['models', 'daily', 'sessions', 'context']) { clock.advance(61000); await t[name]({}); }
     assert.equal(walks().length, 4, 'the other queries never trigger a walk');
+    assert.equal(H.queryWorkerPaths.length, 1, 'a query worker that could not start is not tried again per query');
 
     // A walk that has gone silent for 10 minutes is treated as a dead worker.
     clock.advance(600000);
@@ -360,7 +372,7 @@ const SCENARIOS = {
     assert.equal(walks().length, running, 'no second walk was stacked on the silent one');
   },
 
-  respawnBackoff(H) {
+  async respawnBackoff(H) {
     const { t } = H;
     const { workers, clock, ctx } = H.start();
     const made = () => workers.made.length;
@@ -410,7 +422,7 @@ const SCENARIOS = {
     assert.equal(made(), 4, 'at most 3 respawns per hour');
     assert.equal(t.status().state, 'ok');
     assert.match(t.status().reason, /scanner stopped/);
-    assert.equal(t.summary({}).name, 'summary', 'queries still answer');
+    assert.equal((await t.summary({})).name, 'summary', 'queries still answer');
     assert.equal(t.noteChanged(a).queued, true);
     assert.equal(ctx.logs.filter((l) => l.includes('scanner stopped')).length, 1, 'logged once');
 
@@ -432,9 +444,11 @@ const SCENARIOS = {
     assert.ok(typeof t.flush().error === 'string');
     assert.ok(typeof t.rescan().error === 'string');
     assert.equal(clock.count(), 0);
-    assert.equal(t.summary({}).name, 'summary', 'the store stays readable until close()');
+    assert.equal((await t.summary({})).name, 'summary', 'the store stays readable until close()');
+    assert.equal(clock.count(), 0, 'a query after shutdown arms no timer');
     assert.deepEqual(t.close(), { ok: true });
     assert.equal(t._handle(), null);
+    assert.match((await t.summary({})).error, /^Token store unavailable/);
   },
 
   spawnFails(H) {
@@ -553,9 +567,17 @@ function childMain() {
   const name = process.env.TOKEN_USAGE_SCENARIO;
   const fn = SCENARIOS[name];
   assert.equal(typeof fn, 'function', 'unknown scenario ' + name);
-  fn(makeHarness());
-  fs.writeSync(1, '\nRESULT ok\n');
-  process.exit(0);
+  // Scenarios that ask a query are async; the rest return at once.
+  Promise.resolve()
+    .then(() => fn(makeHarness()))
+    .then(() => {
+      fs.writeSync(1, '\nRESULT ok\n');
+      process.exit(0);
+    })
+    .catch((err) => {
+      process.stderr.write((err && err.stack) || String(err));
+      process.exit(1);
+    });
 }
 
 // -------------------------------------------------------------- parent half ----

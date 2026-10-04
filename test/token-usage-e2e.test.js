@@ -384,10 +384,18 @@ async function scenarioPipeline() {
   const t = require(STORE);
   const facts = { births: {} };
   // The real worker thread, started exactly as the store starts it (the 'walk'
-  // scenario leaves that to the store itself); the wrapper only listens, so the
+  // scenario leaves that to the store itself); the wrapper listens, so the
   // test can tell a resumed pass from a full rescan. Real timers throughout.
+  //
+  // It also holds back the FIRST walk request until the first summary has been
+  // answered. The queries are asynchronous now (they run in the query worker,
+  // which the store starts itself here, the real one), so without the gate the
+  // first answer would race the first chunks and "nothing is counted before
+  // the first walk" could not be asserted.
   let chunks = [];
   const takeChunks = () => { const c = chunks; chunks = []; return c; };
+  let held = [];
+  let releaseWalk = null;
   const createWorker = (workerPath, workerData) => {
     const { Worker } = require('worker_threads');
     const w = new Worker(workerPath, { workerData });
@@ -396,6 +404,11 @@ async function scenarioPipeline() {
         chunks.push({ rel: m.rel_path, seq: m.seq, last: m.last, full: m.fullRescan, from: m.resumed_from, n: m.candidates.length, discarded: m.discarded === true });
       }
     });
+    if (held !== null) {
+      const post = w.postMessage.bind(w);
+      w.postMessage = (m) => { if (held !== null && m && m.type === 'walk') held.push(m); else post(m); };
+      releaseWalk = () => { const list = held; held = null; for (const m of list) post(m); return list.length; };
+    }
     return w;
   };
   facts.init = t.init({
@@ -421,20 +434,29 @@ async function scenarioPipeline() {
 
   // The Tokens tab being opened starts the first walk without waiting for the
   // 10 s deferred start (it runs when the worker has said hello).
-  facts.firstSummary = t.summary(range);
+  const asked = t.summary(range);
+  assert.equal(typeof asked.then, 'function', 'a query returns a Promise');
+  facts.firstSummary = await asked;
+  facts.walksHeld = releaseWalk();
   await waitFor('the backfill', () => { const s = t.status(); return s.backfillDone && s.phase === 'idle'; });
 
-  const queries = () => ({
-    summary: t.summary(range),
-    summaryDefault: t.summary(),
-    models: t.models(range),
-    daily: t.daily(range),
-    sessions: t.sessions(range),
-    sessionsByOutput: t.sessions({ from: range.from, to: range.to, sort: 'output', limit: 1 }),
-    contextO: t.context({ sessionId: SID_O }),
-    contextC: t.context({ sessionId: SID_C }),
-  });
-  facts.backfill = { status: t.status(), snap: snapshot(t._handle()), queries: queries(), chunks: takeChunks() };
+  // All eight asked at once, as the Tokens tab does, then awaited.
+  const queries = async () => {
+    const asks = {
+      summary: t.summary(range),
+      summaryDefault: t.summary(),
+      models: t.models(range),
+      daily: t.daily(range),
+      sessions: t.sessions(range),
+      sessionsByOutput: t.sessions({ from: range.from, to: range.to, sort: 'output', limit: 1 }),
+      contextO: t.context({ sessionId: SID_O }),
+      contextC: t.context({ sessionId: SID_C }),
+    };
+    const out = {};
+    for (const key of Object.keys(asks)) out[key] = await asks[key];
+    return out;
+  };
+  facts.backfill = { status: t.status(), snap: snapshot(t._handle()), queries: await queries(), chunks: takeChunks() };
   for (const rel of [REL_O, REL_C]) facts.births[rel] = Math.floor(fs.statSync(abs(rel)).birthtimeMs);
 
   // --- An append, picked up through noteChanged + flush ---
@@ -459,7 +481,7 @@ async function scenarioPipeline() {
   facts.append.sameFileIds = fileRow(REL_C).id === before.c.id && fileRow(REL_S).id === before.s.id;
   facts.append.chunks = takeChunks();
   facts.append.snap = snapshot(t._handle());
-  facts.append.queries = queries();
+  facts.append.queries = await queries();
 
   // --- The cascade: the original is rewritten ---
   const idO = fileRow(REL_O).id;
@@ -477,19 +499,31 @@ async function scenarioPipeline() {
   facts.cascade.flushAfter = t.flush();
   facts.cascade.chunks = takeChunks();
   facts.cascade.snap = snapshot(t._handle());
-  facts.cascade.queries = queries();
+  facts.cascade.queries = await queries();
 
   // --- A fresh rebuild of the same tree ---
+  // The query worker has the database file open at this point (it answered
+  // the queries above). A marker table that only a real delete can remove
+  // tells a replaced file from one whose tables were dropped in place.
+  t._handle().exec('CREATE TABLE e2e_marker (x)');
   facts.rebuild = { rescan: t.rescan() };
+  facts.rebuild.markerGone = t._handle().prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'e2e_marker'").get().n === 0;
   await waitFor('the rebuild', () => { const s = t.status(); return s.backfillDone && s.phase === 'idle'; });
   assertInside(t._handle().name, dirs.dataDir);
   facts.rebuild.chunks = takeChunks();
   facts.rebuild.snap = snapshot(t._handle());
-  facts.rebuild.queries = queries();
+  facts.rebuild.queries = await queries();
   facts.rebuild.status = t.status();
 
   facts.shutdown = [t.shutdown(), t.close()];
-  facts.afterClose = { handle: t._handle() === null, status: t.status().state, summary: t.summary(range) };
+  facts.afterClose = { handle: t._handle() === null, status: t.status().state, summary: await t.summary(range) };
+  // Both connections are closed: the file can be deleted (on Windows an open
+  // handle would refuse this), which is what "delete it while the app is
+  // closed" relies on.
+  const copy = path.join(dirs.dataDir, 'copy-of-store.db');
+  fs.copyFileSync(path.join(dirs.dataDir, 'token-usage.db'), copy);
+  try { fs.unlinkSync(path.join(dirs.dataDir, 'token-usage.db')); facts.deletable = true; } catch (err) { facts.deletable = String(err && err.code); }
+  fs.renameSync(copy, path.join(dirs.dataDir, 'token-usage.db'));
   facts.logs = logs.filter((l) => !l.startsWith('info: ') && !l.startsWith('debug: '));
   facts.broadcastChannels = Array.from(new Set(broadcasts.map((b) => b.channel)));
   facts.dbFiles = fs.readdirSync(dirs.dataDir).sort();
@@ -539,7 +573,7 @@ async function scenarioWalk() {
   const idle = () => { const s = t.status(); return s.backfillDone && s.phase === 'idle' ? s : null; };
   const fileRow = (rel) => t._handle().prepare('SELECT * FROM files WHERE rel_path = ?').get(rel);
 
-  t.summary(range);
+  await t.summary(range);
   const first = await waitFor('the backfill', idle);
   facts.before = snapshot(t._handle());
 
@@ -549,7 +583,12 @@ async function scenarioWalk() {
   await sleep(5);   // the walk's "done" stamp must differ from the backfill's
 
   skew += 61 * 1000;
-  facts.summaryThatWalks = t.summary(range).scan.phase;
+  // The walk is requested in the same turn as the call; the answer (and its
+  // scan object) arrives later, from the query worker, when a walk this small
+  // may already be over.
+  const opened = t.summary(range);
+  facts.summaryThatWalks = t.status().phase;
+  facts.summaryAnswer = await opened;
   const second = await waitFor('the catch-up walk', () => { const s = idle(); return s && s.lastCatchupMs !== first.lastCatchupMs ? s : null; });
   facts.walk = { done: second.done, total: second.total, filesWithErrors: second.filesWithErrors };
   // The continuation's resumed pass was refused: its row is still the reset one.
@@ -741,6 +780,8 @@ function checkQueries(q, stage, label) {
   for (const name of ['summary', 'models', 'daily', 'sessions', 'contextO', 'contextC']) {
     assert.equal(q[name].error, undefined, `${label}: ${name} answered ${JSON.stringify(q[name].error)}`);
     assert.equal(q[name].scan && q[name].scan.state, 'ok', `${label}: ${name} carries scan`);
+    assert.equal(q[name].scan.queryMode, 'worker', `${label}: ${name} was answered by the query worker`);
+    assert.equal(q[name].scan.reasonCode, null);
   }
 
   // summary: totals and the split by kind.
@@ -809,6 +850,9 @@ test('e2e backfill: the worker, parser and store turn a transcript tree into one
   const f = pipeline();
   assert.equal(f.firstSummary.error, undefined);
   assert.equal(f.firstSummary.totals.responses, 0, 'nothing is counted before the first walk');
+  assert.equal(f.firstSummary.scan.queryMode, 'worker');
+  assert.equal(f.firstSummary.scan.files, 0);
+  assert.equal(f.walksHeld, 1, 'the first summary asked for the walk; the test held it until the answer was in');
   const s = f.backfill.status;
   assert.equal(s.state, 'ok');
   assert.equal(s.reason, null);
@@ -926,6 +970,8 @@ test('e2e cascade: after the original is rewritten, a flush leaves the store equ
   // The acceptance of design 7.3: every row, sighting, compaction, file and
   // total equals what a rebuild from nothing gives for the same tree.
   assert.deepEqual(f.rebuild.rescan, { ok: true });
+  assert.equal(f.rebuild.markerGone, true, 'Rebuild replaced the database file although the query worker had it open');
+  assert.equal(f.rebuild.status.queryMode, 'worker', 'and the query worker serves again afterwards');
   assert.deepEqual(f.cascade.snap, f.rebuild.snap);
   checkInvariants(f.rebuild.snap, 'rebuild');
   checkQueries(f.rebuild.queries, 3, 'rebuild');
@@ -942,6 +988,7 @@ test('e2e: nothing was logged at warn or error, and the store closes cleanly', (
   assert.equal(f.afterClose.handle, true);
   assert.equal(f.afterClose.status, 'disabled');
   assert.match(f.afterClose.summary.error, /^Token store unavailable/);
+  assert.equal(f.deletable, true, 'after close() no connection holds the file, the query worker\'s included');
   assert.ok(f.dbFiles.includes('token-usage.db'));
   assert.ok(!f.dbFiles.includes('token-usage.off'));
   assert.ok(!f.dbFiles.some((n) => n.includes('.corrupt-')));
@@ -950,6 +997,8 @@ test('e2e: nothing was logged at warn or error, and the store closes cleanly', (
 test('e2e catch-up walk across a cascade: a pass resumed from a row the cascade has reset is refused, and the next flush makes the store equal to a rebuild', () => {
   const f = runScenario('walk', { TU_E2E_BASE_MS: String(BASE) });
   assert.equal(f.summaryThatWalks, 'catchup', 'opening the tab more than a minute after the last walk starts one');
+  assert.equal(f.summaryAnswer.error, undefined, 'a query asked while a walk is running is answered');
+  assert.equal(f.summaryAnswer.scan.queryMode, 'worker');
   assert.deepEqual(f.walk, { done: 4, total: 4, filesWithErrors: 0 });
   assert.deepEqual(f.continuationAfterWalk, { head_hash: null, indexed_bytes: 0, scan_error: null });
   // Between the walk and the flush the continuation's copies are not applied yet.

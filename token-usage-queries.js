@@ -11,6 +11,18 @@ const path = require('path');
  * the `scan` field (token-usage.js adds it), or { error: 'bad request: ...' }.
  * Nothing here throws: a database failure comes back as { error: 'query failed: ...' }.
  *
+ * Two halves, because the queries run in a worker thread (workers/query-tokens.js)
+ * and three lookups cannot cross a thread boundary:
+ *  - the query itself needs only the database, the price table and two folders;
+ *  - decorateResult(name, result, lookups) fills in what only the main process
+ *    knows: session titles (sessionInfo), project path and label (folderMeta)
+ *    and isRunning. It is the ONLY place those three are called.
+ * createQueries without the lookups returns the undecorated shape (title null,
+ * projectPath and label = the slug, isRunning false); with them it runs
+ * decorateResult itself, so the worker path (query there, decorate in main) and
+ * the inline path (both here) give the same answer by construction.
+ * wireRequest(q) is the copy of a request that is safe to post to the worker.
+ *
  * Rules this file keeps, and why:
  *  - It only reads. Every statement is a prepared SELECT over the `responses`
  *    and `compactions` tables; the SQL strings are constants and every value
@@ -436,6 +448,110 @@ function readHandoffs(sessionId, slug, ctxDir, handoffsDir) {
   return out;
 }
 
+// --- the two ends of the thread boundary ---
+
+// Every field a request may carry (design section 4).
+const REQUEST_KEYS = ['from', 'to', 'topN', 'slug', 'sort', 'dir', 'limit', 'offset', 'sessionId'];
+const WIRE_STRING_MAX = 4096;
+
+// A value no field accepts and postMessage can always clone. A function, a
+// symbol or a nested object is replaced by it, so the worker refuses the field
+// with the same message the inline path gives for the original value.
+function unsendable() { return []; }
+
+function wireValue(v) {
+  const t = typeof v;
+  if (v === null || t === 'undefined' || t === 'boolean' || t === 'number' || t === 'bigint') return v;
+  // Longer than any valid value, so the check that refuses it still refuses it.
+  if (t === 'string') return v.length > WIRE_STRING_MAX ? v.slice(0, WIRE_STRING_MAX) : v;
+  return unsendable();
+}
+
+/**
+ * The request as it is posted to the query worker: the known fields only,
+ * primitives only. Never throws; a request that cannot be read at all becomes a
+ * value the queries answer with 'bad request: expected an object'.
+ */
+function wireRequest(q) {
+  try {
+    if (!isPlainObject(q)) return wireValue(q);
+    const out = {};
+    for (const key of REQUEST_KEYS) {
+      const v = q[key];
+      if (v !== undefined) out[key] = wireValue(v);
+    }
+    return out;
+  } catch {
+    return unsendable();
+  }
+}
+
+/**
+ * Main-process half of a query: fills title, projectPath, label and isRunning
+ * into a result that was computed without them. Changes `result` in place and
+ * returns it; an { error } or anything that is not a result passes through.
+ * Never throws: each lookup may be a query against the app's own database, and
+ * a failing one leaves the undecorated value.
+ */
+function decorateResult(name, result, lookups) {
+  try {
+    if (!isPlainObject(result) || typeof result.error === 'string') return result;
+    const l = isPlainObject(lookups) ? lookups : {};
+    const sessionInfo = typeof l.sessionInfo === 'function' ? l.sessionInfo : null;
+    const folderMeta = typeof l.folderMeta === 'function' ? l.folderMeta : null;
+    const isRunning = typeof l.isRunning === 'function' ? l.isRunning : null;
+
+    const titleOf = (sessionId) => {
+      if (!sessionInfo) return null;
+      try {
+        const info = sessionInfo(sessionId);
+        return info && typeof info.title === 'string' && info.title ? info.title : null;
+      } catch {
+        return null;
+      }
+    };
+    const paths = new Map();
+    const pathOf = (slug) => {
+      if (paths.has(slug)) return paths.get(slug);
+      let projectPath = slug;
+      if (folderMeta) {
+        try {
+          const meta = folderMeta(slug);
+          if (meta && typeof meta.projectPath === 'string' && meta.projectPath) projectPath = meta.projectPath;
+        } catch {
+          // The folder table is display detail; the slug is always available.
+        }
+      }
+      paths.set(slug, projectPath);
+      return projectPath;
+    };
+
+    if (name === 'daily' && Array.isArray(result.projects)) {
+      for (const p of result.projects) {
+        if (!isPlainObject(p)) continue;
+        p.projectPath = pathOf(p.slug);
+        p.label = p.projectPath === p.slug ? p.slug : lastSegment(p.projectPath);
+      }
+    } else if (name === 'sessions' && Array.isArray(result.rows)) {
+      for (const r of result.rows) {
+        if (!isPlainObject(r)) continue;
+        r.projectPath = pathOf(r.slug);
+        r.title = titleOf(r.sessionId);
+        let running = false;
+        if (isRunning) {
+          try { running = isRunning(r.sessionId) === true; } catch { running = false; }
+        }
+        r.isRunning = running;
+      }
+    } else if (name === 'context' && typeof result.sessionId === 'string') {
+      result.title = titleOf(result.sessionId);
+    }
+    return result;
+  } catch {
+    return result;
+  }
+}
+
 // --- the query object ---
 
 function createQueries(db, deps) {
@@ -443,9 +559,11 @@ function createQueries(db, deps) {
   const localDay = typeof d.localDay === 'function' ? d.localDay : ownLocalDay;
   const dayList = typeof d.dayList === 'function' ? d.dayList : ownDayList;
   const now = typeof d.now === 'function' ? d.now : Date.now;
-  const sessionInfo = typeof d.sessionInfo === 'function' ? d.sessionInfo : () => null;
-  const folderMeta = typeof d.folderMeta === 'function' ? d.folderMeta : () => null;
-  const isRunning = typeof d.isRunning === 'function' ? d.isRunning : () => false;
+  // The main-process lookups. Absent in the query worker (functions cannot be
+  // posted to a thread); the facade then runs decorateResult on the answer.
+  const lookups = { sessionInfo: d.sessionInfo, folderMeta: d.folderMeta, isRunning: d.isRunning };
+  const decorates = typeof d.sessionInfo === 'function' || typeof d.folderMeta === 'function'
+    || typeof d.isRunning === 'function';
 
   // Required on first use, not at module load and not when injected, so this
   // file loads (and its argument checks run) even if token-prices.js is broken.
@@ -468,10 +586,11 @@ function createQueries(db, deps) {
     return s;
   }
 
-  function guarded(fn) {
+  function guarded(name, fn) {
     return function query(q) {
       try {
-        return fn(q);
+        const res = fn(q);
+        return decorates ? decorateResult(name, res, lookups) : res;
       } catch (err) {
         return { error: 'query failed: ' + (err && err.message ? err.message : String(err)) };
       }
@@ -673,19 +792,6 @@ function createQueries(db, deps) {
     };
   }
 
-  function projectPathOf(slug, cache) {
-    if (cache.has(slug)) return cache.get(slug);
-    let projectPath = slug;
-    try {
-      const meta = folderMeta(slug);
-      if (meta && typeof meta.projectPath === 'string' && meta.projectPath) projectPath = meta.projectPath;
-    } catch {
-      // The folder table is display detail; the slug is always available.
-    }
-    cache.set(slug, projectPath);
-    return projectPath;
-  }
-
   function daily(q) {
     const req = request(q);
     if (req.error) return req;
@@ -761,17 +867,14 @@ function createQueries(db, deps) {
       return { day: key, total: emit(day.total), bySlug: slugs };
     });
 
-    const pathCache = new Map();
-    const projects = top.map((slug) => {
-      const projectPath = projectPathOf(slug, pathCache);
-      return {
-        slug,
-        projectPath,
-        label: projectPath === slug ? slug : lastSegment(projectPath),
-        colorIndex: colors.get(slug),
-        ...emit(bySlug.get(slug)),
-      };
-    });
+    // projectPath and label are the slug here; decorateResult replaces them.
+    const projects = top.map((slug) => ({
+      slug,
+      projectPath: slug,
+      label: slug,
+      colorIndex: colors.get(slug),
+      ...emit(bySlug.get(slug)),
+    }));
 
     const other = zero();
     for (const slug of ranked.slice(topN)) {
@@ -915,27 +1018,18 @@ function createQueries(db, deps) {
       return a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0;
     });
 
-    // The display lookups (title, project path, running) are done for the
-    // returned page only: each may be a query against the app's own database.
-    const pathCache = new Map();
+    // The display lookups (title, project path, running) are decorateResult's,
+    // for the returned page only: each may be a query against the app's own
+    // database. Here they are the undecorated values.
     const page = all.slice(offset, offset + limit).map((s) => {
-      let title = null;
-      try {
-        const info = sessionInfo(s.sessionId);
-        if (info && typeof info.title === 'string' && info.title) title = info.title;
-      } catch {
-        title = null;
-      }
-      let running = false;
-      try { running = isRunning(s.sessionId) === true; } catch { running = false; }
       const modelsByWeight = [...s.models.entries()]
         .sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : 1))
         .map((e) => e[0]);
       return {
         sessionId: s.sessionId,
         slug: s.slug,
-        projectPath: projectPathOf(s.slug, pathCache),
-        title,
+        projectPath: s.slug,
+        title: null,
         firstTs: s.firstTs,
         lastTs: s.lastTs,
         models: modelsByWeight,
@@ -946,7 +1040,7 @@ function createQueries(db, deps) {
         peakContext: s.peak,
         compactions: s.compactions,
         unfinalized: s.all.unfinalized,
-        isRunning: running,
+        isRunning: false,
       };
     });
 
@@ -1009,18 +1103,10 @@ function createQueries(db, deps) {
       win = { size: sidecar.context_window_size, source: 'sidecar' };
     }
 
-    let title = null;
-    try {
-      const info = sessionInfo(sessionId);
-      if (info && typeof info.title === 'string' && info.title) title = info.title;
-    } catch {
-      title = null;
-    }
-
     return {
       sessionId,
       slug,
-      title,
+      title: null,              // decorateResult fills it in
       model,
       contextWindow: win.size,
       contextWindowSource: win.source,
@@ -1033,16 +1119,19 @@ function createQueries(db, deps) {
   }
 
   return {
-    summary: guarded(summary),
-    models: guarded(models),
-    daily: guarded(daily),
-    sessions: guarded(sessions),
-    context: guarded(context),
+    summary: guarded('summary', summary),
+    models: guarded('models', models),
+    daily: guarded('daily', daily),
+    sessions: guarded('sessions', sessions),
+    context: guarded('context', context),
   };
 }
 
 module.exports = {
   createQueries,
+  // The two ends of the thread boundary (token-usage.js, workers/query-tokens.js):
+  decorateResult,
+  wireRequest,
   // For tests and for the renderer's own expectations:
   downsamplePoints,
   writtenAtMs,

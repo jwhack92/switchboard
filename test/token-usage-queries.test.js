@@ -955,4 +955,134 @@ function runParent() {
     assert.equal(b.weighted.tokens, 20, 'a price edit shows at the next query');
     assert.equal(b.weighted.pricesVersion, 'v2');
   });
+
+  // --- the two ends of the thread boundary (the queries run in a worker) ---
+
+  // A fake database that answers every statement from one list of grouped rows.
+  function fakeDb() {
+    const base = { input: 10, output: 1, cache_write: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, thinking: null, responses: 1, unfinalized: 0 };
+    const rows = [
+      { ...base, session_id: S1, kind: 'main', slug: SLUG_A, model: 'claude-opus-5-5', local_day: '2026-10-02', first_ts: 1, last_ts: 2, peak: 5, ts_ms: 1, message_id: 'm1', finalized: 1 },
+      { ...base, session_id: S3, kind: 'main', slug: SLUG_B, model: 'claude-opus-5-5', local_day: '2026-10-03', first_ts: 3, last_ts: 4, peak: 6, ts_ms: 3, message_id: 'm2', finalized: 1 },
+    ];
+    return {
+      prepare: (sql) => ({
+        all: () => (/FROM compactions/.test(sql) || /kind IN \('subagent', 'workflow'\)/.test(sql) ? [] : rows.map((r) => ({ ...r }))),
+        get: () => undefined,
+      }),
+    };
+  }
+  const RANGE = { from: '2026-10-01', to: '2026-10-03' };
+  const LOOKUPS = {
+    sessionInfo: (id) => (id === S1 ? { title: 'Alpha one' } : null),
+    folderMeta: (slug) => (slug === SLUG_A ? { projectPath: 'C:\\proj\\alpha' } : null),
+    isRunning: (id) => id === S3,
+  };
+
+  test('without the lookups a query returns the undecorated shape; decorateResult makes it equal to the query run with them', () => {
+    const { createQueries, decorateResult } = require('../token-usage-queries');
+    const now = () => Date.parse(NOW_ISO);
+    const bare = createQueries(fakeDb(), { now, ctxDir: 'Z:/none', handoffsDir: 'Z:/none' });
+    const full = createQueries(fakeDb(), { now, ctxDir: 'Z:/none', handoffsDir: 'Z:/none', ...LOOKUPS });
+
+    // The worker's half: nothing that needs the main process.
+    const sessions = bare.sessions(RANGE);
+    assert.deepEqual(sessions.rows.map((r) => [r.sessionId, r.title, r.projectPath, r.isRunning]),
+      [[S3, null, SLUG_B, false], [S1, null, SLUG_A, false]]);
+    const daily = bare.daily(RANGE);
+    assert.deepEqual(daily.projects.map((p) => [p.slug, p.projectPath, p.label]), [[SLUG_A, SLUG_A, SLUG_A], [SLUG_B, SLUG_B, SLUG_B]]);
+    const context = bare.context({ sessionId: S1 });
+    assert.equal(context.title, null);
+
+    // Main's half, on a copy as it arrives from the worker (a structured clone).
+    for (const [name, q] of [['summary', RANGE], ['models', RANGE], ['daily', RANGE], ['sessions', RANGE],
+      ['sessions', { ...RANGE, limit: 1 }], ['context', { sessionId: S1 }], ['context', { sessionId: S3 }], ['summary', { from: 'nope' }]]) {
+      const posted = structuredClone(bare[name](q));
+      const out = decorateResult(name, posted, LOOKUPS);
+      assert.equal(out, posted, name + ': decorated in place');
+      assert.deepEqual(out, full[name](q), name + ': worker answer + decorateResult = the inline answer');
+      assert.deepEqual(Object.keys(out), Object.keys(full[name](q)), name + ': same field order');
+    }
+    const done = decorateResult('sessions', structuredClone(sessions), LOOKUPS);
+    assert.deepEqual(done.rows.map((r) => [r.sessionId, r.title, r.projectPath, r.isRunning]),
+      [[S3, null, SLUG_B, true], [S1, 'Alpha one', 'C:\\proj\\alpha', false]]);
+    const dailyDone = decorateResult('daily', structuredClone(daily), LOOKUPS);
+    assert.deepEqual(dailyDone.projects.map((p) => [p.projectPath, p.label]), [['C:\\proj\\alpha', 'alpha'], [SLUG_B, SLUG_B]]);
+    assert.equal(decorateResult('context', structuredClone(context), LOOKUPS).title, 'Alpha one');
+  });
+
+  test('decorateResult: the lookups run for the rows it is given only, once per project, and a failing one leaves the row as it was', () => {
+    const { decorateResult } = require('../token-usage-queries');
+    const calls = [];
+    const rows = [
+      { sessionId: S1, slug: SLUG_A, projectPath: SLUG_A, title: null, isRunning: false },
+      { sessionId: S2, slug: SLUG_A, projectPath: SLUG_A, title: null, isRunning: false },
+      { sessionId: S3, slug: SLUG_B, projectPath: SLUG_B, title: null, isRunning: false },
+    ];
+    const out = decorateResult('sessions', { total: 99, rows }, {
+      sessionInfo: (id) => { calls.push('title ' + id); if (id === S2) throw new Error('boom'); return { title: id === S1 ? 'One' : '' }; },
+      folderMeta: (slug) => { calls.push('folder ' + slug); if (slug === SLUG_B) throw new Error('boom'); return { projectPath: 'C:/a' }; },
+      isRunning: (id) => { calls.push('running ' + id); if (id === S3) throw new Error('boom'); return id === S1 ? true : 'yes'; },
+    });
+    assert.equal(out.total, 99);
+    assert.deepEqual(out.rows.map((r) => [r.title, r.projectPath, r.isRunning]),
+      [['One', 'C:/a', true], [null, 'C:/a', false], [null, SLUG_B, false]],
+      'an empty title is null, only true is running, a throw leaves the undecorated value');
+    assert.deepEqual(calls.filter((c) => c.startsWith('folder')), ['folder ' + SLUG_A, 'folder ' + SLUG_B]);
+    assert.equal(calls.filter((c) => c.startsWith('title')).length, 3);
+    assert.equal(calls.filter((c) => c.startsWith('running')).length, 3);
+
+    // No lookups at all, or nonsense for lookups: the undecorated values stay.
+    for (const lookups of [undefined, null, {}, 'x', { sessionInfo: 'no', folderMeta: 7, isRunning: null }]) {
+      const row = { sessionId: S1, slug: SLUG_A, projectPath: SLUG_A, title: null, isRunning: false };
+      assert.doesNotThrow(() => decorateResult('sessions', { rows: [row] }, lookups));
+      assert.deepEqual(row, { sessionId: S1, slug: SLUG_A, projectPath: SLUG_A, title: null, isRunning: false });
+    }
+    // Anything that is not a result passes through untouched, and nothing throws.
+    const error = { error: 'bad request: x' };
+    assert.equal(decorateResult('sessions', error, LOOKUPS), error);
+    assert.deepEqual(error, { error: 'bad request: x' });
+    for (const junk of [undefined, null, 0, 'x', [], [1], { rows: 'no' }, { rows: [null, 1, 'x'] }, { projects: 7 }, { sessionId: 5 }]) {
+      for (const name of ['summary', 'models', 'daily', 'sessions', 'context', 'nope', undefined]) {
+        assert.doesNotThrow(() => decorateResult(name, junk, LOOKUPS));
+      }
+    }
+    // summary and models carry nothing to decorate.
+    const summary = { range: RANGE, totals: {}, rows: [{ sessionId: S1, slug: SLUG_A, title: null }] };
+    assert.deepEqual(decorateResult('summary', structuredClone(summary), LOOKUPS), summary);
+  });
+
+  test('wireRequest: only the known fields, only primitives, and the worker refuses what the inline path refuses', () => {
+    const { createQueries, wireRequest } = require('../token-usage-queries');
+    assert.deepEqual(wireRequest({ from: '2026-10-01', to: '2026-10-03', topN: 3, slug: 's', sort: 'output', dir: 'asc', limit: 5, offset: 2, sessionId: S1 }),
+      { from: '2026-10-01', to: '2026-10-03', topN: 3, slug: 's', sort: 'output', dir: 'asc', limit: 5, offset: 2, sessionId: S1 });
+    assert.deepEqual(wireRequest({ from: '2026-10-01', junk: () => {}, more: { deep: [1] } }), { from: '2026-10-01' });
+    assert.deepEqual(wireRequest({}), {});
+    assert.equal(wireRequest(undefined), undefined);
+    assert.equal(wireRequest(null), null);
+    assert.equal(wireRequest('x'.repeat(10000)).length, 4096);
+    assert.equal(wireRequest({ slug: 'x'.repeat(10000) }).slug.length, 4096, 'still longer than any valid slug');
+
+    const q = createQueries(fakeDb(), { now: () => Date.parse(NOW_ISO), ctxDir: 'Z:/none', handoffsDir: 'Z:/none' });
+    const thrower = new Proxy({}, { get() { throw new Error('trap'); }, ownKeys() { throw new Error('trap'); } });
+    const garbage = [undefined, null, 0, 42, NaN, '', 'x', true, [], [1, 2], {}, () => {}, Symbol('s'), 10n, new Date(0), new Map(),
+      { from: () => {} }, { to: Symbol('s') }, { topN: {} }, { slug: [] }, { slug: () => {} }, { slug: { a: 1 } }, { sort: 5n }, { dir: [] },
+      { limit: {} }, { offset: () => {} }, { sessionId: {} }, { sessionId: Symbol('s') }, { from: '2026-10-01', to: [] },
+      { slug: 'x'.repeat(5000) }, { from: 'x'.repeat(5000) }];
+    for (const g of garbage) {
+      let wired;
+      assert.doesNotThrow(() => { wired = wireRequest(g); });
+      assert.doesNotThrow(() => structuredClone(wired), 'what is posted can always be cloned');
+      for (const name of ['summary', 'models', 'daily', 'sessions', 'context']) {
+        assert.deepEqual(q[name](wired), q[name](g), name + ' answers the wired request as it answers the original');
+      }
+    }
+    // A request that cannot even be read is posted as something every query refuses.
+    let wired;
+    assert.doesNotThrow(() => { wired = wireRequest(thrower); });
+    assert.doesNotThrow(() => structuredClone(wired));
+    for (const name of ['summary', 'models', 'daily', 'sessions', 'context']) {
+      assert.match(q[name](wired).error, /^bad request: expected an object/);
+    }
+  });
 }

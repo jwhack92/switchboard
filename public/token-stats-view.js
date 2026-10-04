@@ -127,10 +127,32 @@ function tokOutcome(settled) {
   // carrying that text is the same state even when no scan object came with it.
   if (scanOff || /token-usage\.off/.test(errText)) {
     const reason = clean((v.scan && v.scan.reason) || errText || 'unknown reason');
-    return { kind: 'disabled', reason, killSwitch: /token-usage\.off/.test(reason), text: 'Token analytics is off: ' + reason + '.' };
+    const action = tokOffAction(v.scan && v.scan.reasonCode, reason);
+    return { kind: 'disabled', reason, action, killSwitch: action === 'enable', text: 'Token analytics is off: ' + reason + '.' };
   }
-  if (errText) return { kind: 'error', text: 'Token analytics unavailable: ' + clean(errText) + '.' };
+  if (errText) return { kind: 'error', reason: clean(errText), text: 'Token analytics unavailable: ' + clean(errText) + '.' };
   return { kind: 'ok', data: v };
+}
+
+// Which way back a switched-off store offers: 'enable' (the kill switch: the
+// user turned it off, so turning it on asks first) or 'retry' (the store failed
+// to open or broke while running: opening it again is all there is to do).
+// scan.reasonCode says which; a main process from before that field existed
+// sends none, and then the reason text is the only evidence there is. Every
+// reason that is not the kill switch gets Try again: a notice with no button
+// is a dead end until the next restart.
+function tokOffAction(reasonCode, reason) {
+  if (reasonCode === 'kill-switch') return 'enable';
+  if (reasonCode === 'failure') return 'retry';
+  return /token-usage\.off/.test(String(reason || '')) ? 'enable' : 'retry';
+}
+
+// "Scanned N files": the number of files the store holds. scan.total is only
+// the size of the last walk, which is 0 after a launch that found nothing new,
+// so it is used only when the main process does not send scan.files.
+function tokFileCount(scan) {
+  if (!scan) return 0;
+  return typeof scan.files === 'number' && isFinite(scan.files) ? scan.files : (Number(scan.total) || 0);
 }
 
 // Index of the point whose t is nearest to `t` (points sorted by t).
@@ -267,6 +289,7 @@ let tokLastQueryMs = 0;
 let tokInFlight = false;
 let tokStale = false;
 let tokTooltipEl = null;
+let tokOffNotice = null;         // the "Token analytics is off" notice now showing, if any
 
 // ── DOM helpers ─────────────────────────────────────────────────────────────
 
@@ -349,6 +372,7 @@ function tokConfirm(message) {
 
 function tokBuildSkeleton(body) {
   tokClear(body);
+  tokOffNotice = null;   // a Try again still in flight must not draw over this
   const ui = {};
 
   const bar = tokEl('div', 'token-toolbar');
@@ -492,7 +516,7 @@ function tokRenderScan(scan) {
     tokUi.status.textContent = 'Scanning transcripts… ' + tokNum(done) + ' / ' + tokNum(total);
   } else {
     const at = s.lastScanMs ? ' · updated ' + tokClock(s.lastScanMs) : '';
-    tokUi.status.textContent = 'Scanned ' + tokNum(total) + ' files' + at;
+    tokUi.status.textContent = 'Scanned ' + tokNum(tokFileCount(s)) + ' files' + at;
   }
   // The bar and the "totals are partial" notice are for the first full scan
   // only: a catch-up touches a handful of files and the totals are already whole.
@@ -576,9 +600,10 @@ async function tokLoad(opts) {
   if (tokStale) { tokStale = false; loadTokenStats({ quiet: true }); }
 }
 
-// The whole tab becomes one notice. Enable is offered only for the kill
-// switch: for a store that failed to open, Enable would change nothing.
-function tokRenderOff(body, outcome) {
+// The whole tab becomes one notice with one way back: Enable for the kill
+// switch, Try again for a store that failed. `note` is what the last Try again
+// came back with, shown on its own line under the reason.
+function tokRenderOff(body, outcome, note) {
   tokUi = null;
   tokScan = null;
   tokDaily = null;
@@ -586,14 +611,37 @@ function tokRenderOff(body, outcome) {
   tokClear(body);
   const notice = tokEl('div', 'stats-refresh-error token-off');
   notice.setAttribute('role', 'status');
+  // Untrusted text: the reason can carry a path or a driver message.
   notice.appendChild(tokEl('span', '', outcome.text));
-  if (outcome.killSwitch) {
-    const btn = tokEl('button', 'token-btn', 'Enable');
-    btn.type = 'button';
-    btn.addEventListener('click', tokEnable);
-    notice.appendChild(btn);
-  }
+  const action = outcome.action || (outcome.killSwitch ? 'enable' : 'retry');
+  const btn = tokEl('button', 'token-btn', action === 'enable' ? 'Enable' : 'Try again');
+  btn.type = 'button';
+  if (action === 'enable') btn.addEventListener('click', tokEnable);
+  else btn.addEventListener('click', () => tokRetry(body, notice, btn, outcome));
+  notice.appendChild(btn);
+  if (note) notice.appendChild(tokEl('div', 'token-off-note', note));
   body.appendChild(notice);
+  tokOffNotice = notice;
+}
+
+// Try again: ask main to open the store again (enableTokenStats re-runs its
+// init when no flag file is there). No confirm: nothing is deleted and nothing
+// is switched on that the user switched off. Never throws; a failure is said
+// in the notice and the button comes back, so it can be pressed again.
+async function tokRetry(body, notice, btn, outcome) {
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = 'Trying again…';
+  const settled = (await Promise.allSettled([tokCall('enableTokenStats')]))[0];
+  // The tab was redrawn while main was working (a sub-tab click, a change
+  // event): that render is newer than this answer and owns the body now.
+  if (tokOffNotice !== notice) return;
+  const answer = tokOutcome(settled);
+  if (answer.kind === 'ok') { await loadTokenStats(); return; }
+  // Still off with a reason of its own: show that reason, and whichever
+  // button it calls for.
+  if (answer.kind === 'disabled') { tokRenderOff(body, answer, 'Try again did not work.'); return; }
+  tokRenderOff(body, outcome, answer.kind === 'error' ? 'Try again failed: ' + answer.reason + '.' : answer.text);
 }
 
 // A toolbar action's own failure is said in the status text, in the same
@@ -1168,7 +1216,7 @@ function tokRenderFooter(container, outcome) {
     'Each API response is counted once (deduplicated by message id across resumed and forked sessions; copied history ' +
     'belongs to the original session). Weighted total is an estimate using API price ratios as of ' + version +
     ' — not a bill. Output is a lower bound: ' + tokNum(unfin) + ' responses never recorded a final count. ' +
-    'Days follow this machine’s clock. Scanned ' + tokNum(scan.total) + ' files, last update ' +
+    'Days follow this machine’s clock. Scanned ' + tokNum(tokFileCount(scan)) + ' files, last update ' +
     (scan.lastScanMs ? tokDateTime(scan.lastScanMs) : 'not yet') + '.');
   container.appendChild(notice);
   if (scan.filesMissing > 0) {
@@ -1186,7 +1234,7 @@ if (typeof window !== 'undefined' && window.api && typeof window.api.onTokenStat
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     TOK_NEEDS_RESTART, TOK_ALL_FROM,
-    formatTokens, tokNum, tokDayKey, tokParseDay, tokDayLabel, tokRangeFor, tokOutcome,
+    formatTokens, tokNum, tokDayKey, tokParseDay, tokDayLabel, tokRangeFor, tokOutcome, tokOffAction, tokFileCount,
     tokNearestIndex, tokStepPath, tokBucketDays, tokYTicks, tokXTicks, tokCounterValue,
   };
 }

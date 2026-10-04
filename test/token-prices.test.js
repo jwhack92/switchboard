@@ -22,6 +22,22 @@ const DESIGN_5_2 = [
   ['claude-haiku-4-5', 1, 5, 1.25, 2.0, 0.1, 0.1],
 ];
 
+// The four models the claude-api skill's price table (cached 2026-09-25) lists
+// and design 5.2 lacks, added on Jason's "Add them now". Same columns as above.
+// Base and output prices are the skill's "Current Models" table; the read ratio
+// is 0.025 for Mythos 5.1 (it shares Fable 5.1's rate) and 0.1 for the others
+// ("every other model at 0.1x", shared/model-migration.md:1684). Without these
+// rows the three older models showed as unpriced and Mythos 5.1 was weighted
+// with read 0.1, four times its real rate.
+const STAGE_2_ROWS = [
+  ['claude-mythos-5-1', 10, 50, 12.5, 20, 0.25, 0.025],
+  ['claude-opus-4-7', 5, 25, 6.25, 10.0, 0.5, 0.1],
+  ['claude-opus-4-6', 5, 25, 6.25, 10.0, 0.5, 0.1],
+  ['claude-sonnet-4-6', 3, 15, 3.75, 6.0, 0.3, 0.1],
+];
+
+const ALL_ROWS = DESIGN_5_2.concat(STAGE_2_ROWS);
+
 function near(actual, expected, msg) {
   assert.ok(Math.abs(actual - expected) < 1e-9, `${msg}: got ${actual}, want ${expected}`);
 }
@@ -39,18 +55,61 @@ function writeTable(file, obj, mtimeSec) {
   if (mtimeSec) fs.utimesSync(file, mtimeSec, mtimeSec);
 }
 
-test('token-prices.json: version and exactly the models of design 5.2', () => {
+test('token-prices.json: version and exactly the models of design 5.2 plus the four added rows', () => {
   const table = loadPriceTable();
   assert.strictEqual(table.version, '2026-09-25');
+  assert.strictEqual(ALL_ROWS.length, 12);
   assert.deepStrictEqual(
     Object.keys(table.models).sort(),
-    DESIGN_5_2.map((r) => r[0]).sort(),
+    ALL_ROWS.map((r) => r[0]).sort(),
   );
 });
 
-test('every model in 5.2 returns the listed ratios and base price', () => {
+test('the four added models are priced through weightsFor with the real JSON', () => {
   const table = loadPriceTable();
-  for (const [id, base, output, w5, w1, cacheRead, readRatio] of DESIGN_5_2) {
+  const got = {};
+  for (const [id] of STAGE_2_ROWS) got[id] = weightsFor(id, table);
+  // Spelled out in full, not derived from STAGE_2_ROWS, so a typo in the list
+  // above cannot agree with itself.
+  assert.deepStrictEqual(got, {
+    'claude-mythos-5-1': { input: 1, output: 5, write5m: 1.25, write1h: 2, read: 0.025, baseUsd: 10, priced: true },
+    'claude-opus-4-7': { input: 1, output: 5, write5m: 1.25, write1h: 2, read: 0.1, baseUsd: 5, priced: true },
+    'claude-opus-4-6': { input: 1, output: 5, write5m: 1.25, write1h: 2, read: 0.1, baseUsd: 5, priced: true },
+    'claude-sonnet-4-6': { input: 1, output: 5, write5m: 1.25, write1h: 2, read: 0.1, baseUsd: 3, priced: true },
+  });
+  // No row carries a ratio override: the model-independent ones apply.
+  for (const [id] of STAGE_2_ROWS) {
+    assert.deepStrictEqual(Object.keys(table.models[id]).sort(), ['baseUsd', 'read'], id);
+  }
+});
+
+test('a dated id of an added model normalises to its row', () => {
+  const table = loadPriceTable();
+  assert.strictEqual(normalizeModel('claude-sonnet-4-6-20260115'), 'claude-sonnet-4-6');
+  assert.strictEqual(normalizeModel('Claude-Opus-4-7-20260301'), 'claude-opus-4-7');
+  for (const [id] of STAGE_2_ROWS) {
+    // The date is made up: only its shape (a trailing -YYYYMMDD) matters here.
+    const dated = `${id}-20260115`;
+    assert.ok(!Object.prototype.hasOwnProperty.call(table.models, dated), `${dated} has no row of its own`);
+    assert.deepStrictEqual(weightsFor(dated, table), weightsFor(id, table), dated);
+    assert.strictEqual(weightsFor(dated, table).priced, true, dated);
+  }
+});
+
+test('Mythos 5.1 reads at the Fable 5.1 rate, a quarter of the default', () => {
+  const table = loadPriceTable();
+  const row = { input: 0, output: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 1000000 };
+  const mythos = weightsFor('claude-mythos-5-1', table);
+  assert.deepStrictEqual(mythos, weightsFor('claude-fable-5-1', table));
+  near(weightedTokens(row, mythos), 25000, 'mythos 5.1 weighted');
+  near(estimateUsd(weightedTokens(row, mythos), mythos), 0.25, 'mythos 5.1 cache read $/MTok');
+  near(estimateUsd(weightedTokens(row, weightsFor('claude-sonnet-4-6', table)), weightsFor('claude-sonnet-4-6', table)),
+    0.3, 'sonnet 4.6 cache read $/MTok');
+});
+
+test('every model in the table returns the listed ratios and base price', () => {
+  const table = loadPriceTable();
+  for (const [id, base, output, w5, w1, cacheRead, readRatio] of ALL_ROWS) {
     const w = weightsFor(id, table);
     assert.strictEqual(w.priced, true, id);
     assert.strictEqual(w.baseUsd, base, `${id} baseUsd`);
@@ -159,7 +218,7 @@ test('estimateUsd agrees with pricing each counter at its own dollar rate', () =
   // Independent check of the "input-token equivalents" idea: weighting then
   // multiplying by the base price must equal the per-counter bill.
   const row = { input: 123456, output: 7890, cache_write_5m: 4321, cache_write_1h: 999, cache_read: 2468024 };
-  for (const [id, base, output, w5, w1, cacheRead] of DESIGN_5_2) {
+  for (const [id, base, output, w5, w1, cacheRead] of ALL_ROWS) {
     const w = weightsFor(id, loadPriceTable());
     const bill = (row.input * base + row.output * output + row.cache_write_5m * w5
       + row.cache_write_1h * w1 + row.cache_read * cacheRead) / 1e6;

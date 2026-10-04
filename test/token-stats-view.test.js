@@ -569,10 +569,214 @@ test('disabled: the whole tab is one notice; Enable only for the kill switch, wi
   assert.equal(app.count('enableTokenStats'), 1);
   assert.equal(byClass(app.tokensBody, 'token-headline').length, 1, 'the tab comes back without a restart');
 
+  // Any other reason, from a main process that sends no reasonCode: never
+  // Enable (stage 2: it gets Try again instead of no button at all).
   const broken = boot({ respond: () => ({ error: 'Token store unavailable: database is corrupt', scan: { state: 'disabled', reason: 'database is corrupt' } }) });
   await openTokens(broken);
-  assert.equal(broken.tokensBody.textContent, 'Token analytics is off: database is corrupt.');
+  assert.equal(broken.tokensBody.children.length, 1);
+  assert.equal(broken.tokensBody.textContent, 'Token analytics is off: database is corrupt.Try again');
   assert.equal(button(broken.tokensBody, 'Enable'), undefined);
+});
+
+// ── the way back from a failed store (stage 2) ──────────────────────────────
+
+const offAnswer = (reason, reasonCode) => {
+  const scan = { state: 'disabled', reason };
+  if (reasonCode !== undefined) scan.reasonCode = reasonCode;
+  return { error: 'Token store unavailable: ' + reason, scan };
+};
+
+test('tokOffAction: reasonCode decides; without one the reason text does, and everything else is Try again', () => {
+  const { tokOffAction } = view;
+  assert.equal(tokOffAction('kill-switch', 'anything'), 'enable');
+  assert.equal(tokOffAction('failure', 'disabled by token-usage.off'), 'retry', 'the code wins over the text');
+  assert.equal(tokOffAction(undefined, 'disabled by token-usage.off'), 'enable');
+  assert.equal(tokOffAction(null, 'disabled by token-usage.off'), 'enable');
+  assert.equal(tokOffAction(undefined, 'database is corrupt'), 'retry');
+  assert.equal(tokOffAction(null, ''), 'retry');
+  assert.equal(tokOffAction('something new', 'closed'), 'retry');
+
+  const of = (value) => tokOutcome({ status: 'fulfilled', value });
+  const fail = of(offAnswer('SQLITE_CANTOPEN: unable to open database file', 'failure'));
+  assert.deepEqual([fail.kind, fail.action, fail.killSwitch], ['disabled', 'retry', false]);
+  const flag = of(offAnswer('switched off', 'kill-switch'));
+  assert.deepEqual([flag.kind, flag.action, flag.killSwitch], ['disabled', 'enable', true]);
+});
+
+test('reasonCode "failure": Try again, no confirm, one enableTokenStats call, and the tab reloads from the answer', async () => {
+  let off = true;
+  let release;
+  const app = boot({ respond: (name) => {
+    if (name === 'enableTokenStats') return new Promise(resolve => { release = () => { off = false; resolve({ ok: true, state: 'ok' }); }; });
+    if (off) return offAnswer('SQLITE_CANTOPEN: unable to open database file', 'failure');
+    return okData()[METHODS[name]];
+  } });
+  await openTokens(app);
+  assert.equal(app.tokensBody.children.length, 1);
+  assert.equal(app.tokensBody.children[0].attrs.role, 'status');
+  assert.equal(app.tokensBody.textContent, 'Token analytics is off: SQLITE_CANTOPEN: unable to open database file.Try again');
+  assert.equal(button(app.tokensBody, 'Enable'), undefined);
+
+  app.knobs.confirm = false;               // a confirm, if one were asked, would say no
+  const btn = button(app.tokensBody, 'Try again');
+  btn.fire('click');
+  await flush();
+  assert.equal(app.confirms.length, 0, 'Try again must not ask');
+  assert.equal(app.count('enableTokenStats'), 1);
+  // Working: the button says so and cannot be pressed twice.
+  assert.equal(btn.disabled, true);
+  assert.equal(btn.textContent, 'Trying again\u2026');
+  btn.fire('click');
+  await flush();
+  assert.equal(app.count('enableTokenStats'), 1, 'a second click while working must not call again');
+  assert.equal(app.count('getTokenStatsSummary'), 1);
+
+  release();
+  await flush();
+  assert.equal(app.count('enableTokenStats'), 1);
+  assert.equal(app.count('getTokenStatsSummary'), 2, 'the tab reloads after the answer');
+  assert.equal(byClass(app.tokensBody, 'token-headline').length, 1, 'the tab comes back without a restart');
+  assert.equal(byClass(app.tokensBody, 'token-off').length, 0);
+  assert.deepEqual(app.errors, []);
+});
+
+test('reasonCode "failure" and the store still will not open: the reload shows the notice and the button again', async () => {
+  // enable() answers { ok: true, state: 'disabled' } when init ran and left the
+  // store off (token-usage.js enableImpl); the queries then say why.
+  const app = boot({ respond: (name) => (name === 'enableTokenStats' ? { ok: true, state: 'disabled' } : offAnswer('disk is full', 'failure')) });
+  await openTokens(app);
+  button(app.tokensBody, 'Try again').fire('click');
+  await flush();
+  assert.equal(app.count('enableTokenStats'), 1);
+  assert.equal(app.count('getTokenStatsSummary'), 2);
+  assert.equal(app.tokensBody.children.length, 1);
+  assert.match(app.tokensBody.textContent, /^Token analytics is off: disk is full\.Try again$/);
+  assert.equal(button(app.tokensBody, 'Try again').disabled, undefined);
+});
+
+test('reasonCode "kill-switch": Enable only, whatever the reason text says', async () => {
+  const app = boot({ respond: () => offAnswer('switched off by the user', 'kill-switch') });
+  await openTokens(app);
+  assert.equal(app.tokensBody.textContent, 'Token analytics is off: switched off by the user.Enable');
+  assert.equal(button(app.tokensBody, 'Try again'), undefined);
+  assert.equal(byTag(app.tokensBody, 'button').length, 1);
+
+  // And the other way round: the code says failure, so the kill-switch text
+  // does not bring Enable back.
+  const failed = boot({ respond: () => offAnswer('disabled by token-usage.off', 'failure') });
+  await openTokens(failed);
+  assert.equal(button(failed.tokensBody, 'Enable'), undefined);
+  assert.ok(button(failed.tokensBody, 'Try again'));
+});
+
+test('no reasonCode (an older main process): the kill-switch text gives Enable, every other reason Try again', async () => {
+  const flag = boot({ respond: () => offAnswer('disabled by token-usage.off') });
+  await openTokens(flag);
+  assert.deepEqual(byTag(flag.tokensBody, 'button').map(b => b.textContent), ['Enable']);
+
+  for (const reason of ['database is corrupt', 'closed', 'failed']) {
+    const app = boot({ respond: () => offAnswer(reason) });
+    await openTokens(app);
+    assert.deepEqual(byTag(app.tokensBody, 'button').map(b => b.textContent), ['Try again'], reason);
+  }
+  // reasonCode null is "no code" too.
+  const nul = boot({ respond: () => offAnswer('database is corrupt', null) });
+  await openTokens(nul);
+  assert.deepEqual(byTag(nul.tokensBody, 'button').map(b => b.textContent), ['Try again']);
+});
+
+test('Try again that fails: the notice keeps its reason, says what came back, and the button works again', async () => {
+  const reason = 'unable to open <b>C:\\Users\\x\\.switchboard</b>';
+  let answer = () => ({ error: 'Token store unavailable: permission <i>denied</i>.' });
+  const app = boot({ respond: (name) => (name === 'enableTokenStats' ? answer() : offAnswer(reason, 'failure')) });
+  await openTokens(app);
+
+  // { error }
+  button(app.tokensBody, 'Try again').fire('click');
+  await flush();
+  assert.equal(app.count('enableTokenStats'), 1);
+  assert.equal(app.count('getTokenStatsSummary'), 1, 'a failed try does not reload the tab');
+  assert.equal(app.tokensBody.children.length, 1);
+  assert.equal(app.tokensBody.children[0].attrs.role, 'status');
+  assert.equal(app.tokensBody.textContent,
+    'Token analytics is off: ' + reason + '.Try againTry again failed: permission <i>denied</i>.');
+  assert.equal(button(app.tokensBody, 'Try again').disabled, undefined, 'the button is usable again');
+
+  // a rejected invoke (no handler in this main process)
+  answer = () => Promise.reject(new Error("Error invoking remote method 'token-stats-enable': No handler registered"));
+  button(app.tokensBody, 'Try again').fire('click');
+  await flush();
+  assert.equal(app.count('enableTokenStats'), 2);
+  assert.equal(app.tokensBody.textContent, 'Token analytics is off: ' + reason + '.Try again' + TOK_NEEDS_RESTART);
+  assert.equal(byClass(app.tokensBody, 'token-off-note').length, 1, 'one note, replaced, not stacked');
+
+  // a preload without the method is the same thing
+  delete app.api.enableTokenStats;
+  button(app.tokensBody, 'Try again').fire('click');
+  await flush();
+  assert.equal(app.tokensBody.textContent, 'Token analytics is off: ' + reason + '.Try again' + TOK_NEEDS_RESTART);
+
+  // { error } that carries the store's new state: that reason is shown.
+  app.api.enableTokenStats = () => offAnswer('database disk image is malformed', 'failure');
+  button(app.tokensBody, 'Try again').fire('click');
+  await flush();
+  assert.equal(app.tokensBody.textContent,
+    'Token analytics is off: database disk image is malformed.Try againTry again did not work.');
+  assert.ok(button(app.tokensBody, 'Try again'));
+
+  // Untrusted reason strings: text, never markup; nothing thrown.
+  assert.equal(app.htmlWrites.length, 0, 'innerHTML was used');
+  assert.equal(byTag(app.tokensBody, 'b').length + byTag(app.tokensBody, 'i').length, 0);
+  assert.deepEqual(app.errors, []);
+  assert.equal(app.confirms.length, 0);
+});
+
+test('a Try again answer that arrives after the tab was redrawn does not draw over it', async () => {
+  let off = true;
+  let release;
+  const app = boot({ respond: (name) => {
+    if (name === 'enableTokenStats') return new Promise(resolve => { release = resolve; });
+    return off ? offAnswer('disk is full', 'failure') : okData()[METHODS[name]];
+  } });
+  await openTokens(app);
+  button(app.tokensBody, 'Try again').fire('click');
+  await flush();
+  off = false;                       // the store came back by itself
+  app.run('loadStats()');            // and the tab was opened again
+  await flush();
+  assert.equal(byClass(app.tokensBody, 'token-headline').length, 1);
+  const writes = app.tokensBody.mutations;
+  release({ error: 'late failure' });
+  await flush();
+  assert.equal(app.tokensBody.mutations, writes);
+  assert.equal(/late failure/.test(app.tokensBody.textContent), false);
+});
+
+test('"Scanned N files" uses scan.files when it is a number, else scan.total', async () => {
+  const { tokFileCount } = view;
+  assert.equal(tokFileCount({ files: 3017, total: 0 }), 3017);
+  assert.equal(tokFileCount({ files: 0, total: 12 }), 0, 'a store with no files says 0, not the walk size');
+  assert.equal(tokFileCount({ files: null, total: 12 }), 12);
+  assert.equal(tokFileCount({ total: 12 }), 12);
+  assert.equal(tokFileCount({ files: '9', total: 12 }), 12);
+  assert.equal(tokFileCount({ files: NaN }), 0);
+  assert.equal(tokFileCount(null), 0);
+
+  // After a launch: the last walk found nothing, the store holds 3,017 files.
+  const app = boot({ respond: (name) => okData({ scan: { done: 0, total: 0, files: 3017 } })[METHODS[name]] });
+  await openTokens(app);
+  assert.match(app.tokensBody.textContent, /Scanned 3,017 files \u00b7 updated 14:02/);
+  assert.match(app.tokensBody.textContent, /Scanned 3,017 files, last update Oct 3 14:02\./);
+
+  // A change event carries no files field: the count from the last answer stays.
+  app.listeners[0]({ phase: 'idle', done: 4, total: 4 });
+  assert.match(byClass(app.tokensBody, 'token-status')[0].textContent, /^Scanned 3,017 files/);
+
+  // An older main process (no scan.files, or null while the store is closed).
+  const old = boot({ respond: (name) => okData({ scan: { total: 42, files: null } })[METHODS[name]] });
+  await openTokens(old);
+  assert.match(old.tokensBody.textContent, /Scanned 42 files \u00b7 updated/);
+  assert.match(old.tokensBody.textContent, /Scanned 42 files, last update/);
 });
 
 test('Disable and Rebuild ask first; Rebuild is disabled while a scan runs', async () => {

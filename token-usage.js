@@ -1,8 +1,10 @@
 'use strict';
 // Token store: the derived database ~/.switchboard/token-usage.db, its write
-// path, the scan scheduler, the one long-lived scanner worker and the facade
-// main.js calls. Reload class B (a change here needs an app restart), so it is
-// kept dumb: no parsing happens in this file, the worker does all of it.
+// path, the scan scheduler, the one long-lived scanner worker, the query worker
+// and the facade main.js calls. Reload class B (a change here needs an app
+// restart), so it is kept dumb: no parsing happens in this file (the scanner
+// worker does all of it) and no query runs in this thread unless the query
+// worker cannot be used.
 //
 // The one rule that shapes everything below: this module can never stop the
 // app. main.js has no uncaughtException handler and calls noteChanged() from a
@@ -11,7 +13,9 @@
 //   - every export is wrapped and answers { error } instead of throwing,
 //   - every worker handler and every timer callback is wrapped the same way,
 //   - a failure on the write path turns the store off (state 'disabled');
-//     it never propagates.
+//     it never propagates,
+//   - the five queries return a Promise that always resolves, to the answer or
+//     to { error, scan }; it never rejects.
 // The store is derived data: a corrupt file is renamed away and rebuilt, a
 // schema or parser change deletes the file and rebuilds. It never migrates and
 // never refuses to start.
@@ -43,6 +47,16 @@ const WORKER_SILENT_MS = 10 * 60 * 1000;
 const CHANGED_SESSIONS_MAX = 500;
 const KINDS = new Set(['main', 'subagent', 'workflow']);
 const OFF_REASON = 'disabled by ' + OFF_FILE;
+
+// The query worker (workers/query-tokens.js).
+const QUERY_TIMEOUT_MS = 30000;         // no answer by then: { error: 'query timed out' }, worker replaced
+const QW_HELLO_MS = 10000;              // no hello by then: the worker cannot start, queries run inline
+const QW_CLOSE_WAIT_MS = 5000;          // longest wait for "my connection is closed" before a delete or rename
+// Shorter than the scanner's: a query that waits for the respawn has 30 s in all.
+const QW_RESPAWN_DELAYS_MS = [1000, 5000, 15000];
+const WAITING_MAX = 200;                // queries waiting for an answer; past that a new one is refused
+const SIG_CLOSING = 0;                  // the two int32 shared with the query worker (see its header)
+const SIG_CLOSED = 1;
 
 // ---------------------------------------------------------------- schema ----
 
@@ -240,6 +254,17 @@ let progressTotal = 0;
 let lastWalkMs = -Infinity;
 let tzPending = false;
 
+// The query worker. Started by the first query, never by init: a store nobody
+// looks at needs no second connection, and whatever a native module in a worker
+// thread could do to this process cannot then happen at every app start.
+let qw = null;                // { worker, signal, ready, helloTimer }
+let qwUsed = false;           // a query has asked for it since init: start it again after a rebuild
+let qwRespawnTimes = [];
+let qwRespawnTimer = null;
+let querySeq = 0;
+let queryInline = false;      // latched: the worker cannot serve, queries run on this thread's handle
+const waiting = new Map();    // id -> { id, name, q, resolve, timer, sentTo }
+
 const pending = new Set();          // rel paths waiting for the next flush
 const cascadePending = new Set();   // the subset queued by the 3.3 cascade
 const cycleRescanned = new Set();   // file ids fully rescanned in this cascade cycle
@@ -331,6 +356,35 @@ function later(ms, name, fn) {
   return clock.setTimeout(() => safely(name, fn), ms);
 }
 
+// The same for the read side (query worker handlers and timers): a failure
+// there says nothing about the write path and must not turn the store off.
+function reading(name, fn) {
+  try {
+    fn();
+  } catch (err) {
+    try { fail(name, err, false); } catch { /* nothing may escape */ }
+  }
+}
+
+function laterReading(ms, name, fn) {
+  return clock.setTimeout(() => reading(name, fn), ms);
+}
+
+// For the five queries: the call never throws and the Promise never rejects.
+function guardQuery(name, fn) {
+  return function guardedQuery() {
+    let p;
+    try {
+      p = fn.apply(null, arguments);
+    } catch (err) {
+      p = queryFailure(name, err);
+    }
+    return Promise.resolve(p)
+      .then(null, (err) => queryFailure(name, err))
+      .then(null, (err) => ({ error: errMsg(err) }));
+  };
+}
+
 function cancel(t) {
   if (t === null || t === undefined) return;
   try { clock.clearTimeout(t); } catch { /* ignore */ }
@@ -406,7 +460,7 @@ function prepareAll() {
   S.resetFile = db.prepare('UPDATE files SET indexed_bytes = 0, head_hash = NULL, tail_hash = NULL WHERE id = ?');
   S.known = db.prepare('SELECT rel_path, size, mtime_ms, head_hash, indexed_bytes, tail_hash, scan_error FROM files');
   S.fileStats = db.prepare(
-    'SELECT COUNT(scan_error) AS errs, COUNT(missing_since) AS missing,\n' +
+    'SELECT COUNT(*) AS files, COUNT(scan_error) AS errs, COUNT(missing_since) AS missing,\n' +
     '  COALESCE(SUM(lines_skipped), 0) AS skipped, MAX(last_scan_ms) AS lastScan FROM files');
   S.tzBatch = db.prepare('SELECT rowid AS rid, ts_ms FROM responses WHERE rowid > ? ORDER BY rowid LIMIT ?');
   S.tzUpdate = db.prepare('UPDATE responses SET local_day = ? WHERE rowid = ?');
@@ -441,6 +495,7 @@ function removeDbFiles() {
 
 // Corrupt store: keep the evidence under another name, never delete it.
 function quarantine() {
+  closeQueryWorker();       // its open handle would make every rename fail on Windows
   const stamp = Date.now();
   for (const sfx of ['', '-wal', '-shm']) {
     try { fs.renameSync(dbPath + sfx, dbPath + '.corrupt-' + stamp + sfx); } catch { /* each one on its own */ }
@@ -451,6 +506,7 @@ function quarantine() {
 // than DROP on a 60 MB file; the DROP is only the fallback for a file that could
 // not be deleted, so a rebuild can never be refused.
 function wipeAndReopen() {
+  closeQueryWorker();       // its open handle would make the delete fail on Windows
   closeDbQuiet();
   gen++;
   removeDbFiles();
@@ -529,7 +585,11 @@ function initImpl(c) {
   if (state === 'ok' && db) return { ok: true, state: 'ok' };   // a second init changes nothing
 
   stopScanner();
+  closeQueryWorker();
   closeDbQuiet();
+  // Queries still waiting belong to the store that has just been closed, and
+  // their timers to the clock that is about to be replaced.
+  failWaiting('Token store unavailable: restarting');
   ctx = c;
   log = c.log || null;
   clock = makeClock(c.clock);
@@ -546,6 +606,9 @@ function initImpl(c) {
   tzPending = false;
   respawnTimes = [];
   lastWalkMs = -Infinity;
+  qwUsed = false;
+  qwRespawnTimes = [];
+  queryInline = false;
   gen++;
 
   // 1. Kill switch first: with the flag file present nothing is opened at all.
@@ -614,9 +677,11 @@ function stopScanner() {
 
 function disableWith(reason) {
   try { stopScanner(); } catch { /* keep going */ }
+  try { closeQueryWorker(); } catch { /* keep going */ }
   try { closeDbQuiet(); } catch { /* keep going */ }
   state = 'disabled';
   lastError = reason || 'failed';
+  try { pumpQueries(); } catch { /* keep going */ }     // whoever is waiting is told now
 }
 
 // Step 4 at run time: rename the corrupt file, bump the generation so chunks
@@ -634,6 +699,7 @@ function recoverCorrupt(msg) {
     rescanRunning = false;
     walkWanted = true;
     spawnWorker();
+    restartQueryWorker();
   } catch (err) {
     disableWith(errMsg(err));
   }
@@ -642,14 +708,18 @@ function recoverCorrupt(msg) {
 function shutdownImpl() {
   stopped = true;
   stopScanner();
+  closeQueryWorker();
+  pumpQueries();
   return { ok: true };
 }
 
 function closeImpl() {
   stopped = true;
   stopScanner();
+  closeQueryWorker();
   closeDbQuiet();
   if (state === 'ok') { state = 'disabled'; lastError = 'closed'; }
+  pumpQueries();
   return { ok: true };
 }
 
@@ -657,9 +727,11 @@ function disableImpl() {
   if (!ctx || !dataDir) return unavailable();   // before init there is no folder to write the flag into
   stopped = true;
   stopScanner();
+  closeQueryWorker();
   closeDbQuiet();
   state = 'disabled';
   lastError = OFF_REASON;
+  pumpQueries();
   fs.mkdirSync(dataDir, { recursive: true });
   fs.writeFileSync(path.join(dataDir, OFF_FILE), 'Token analytics disabled ' + iso(Date.now()) + '\n');
   return { ok: true, state: 'disabled' };
@@ -679,10 +751,34 @@ function enableImpl() {
   return { ok: true, state: state === 'ok' ? 'ok' : 'disabled' };
 }
 
+// 'kill-switch' | 'failure' | null. null is "on", and also the two off states
+// that are neither: before init, and after close().
+function reasonCode() {
+  if (state === 'ok' && db) return null;
+  if (lastError === OFF_REASON) return 'kill-switch';
+  if (state === 'uninit' || lastError === 'closed' || !lastError) return null;
+  return 'failure';
+}
+
+// "Try again": a store that is off because something failed (not because of
+// the kill switch) is opened again from scratch. Returns null when it is open.
+function reopenAfterFailure() {
+  if (!ctx || !dataDir || reasonCode() !== 'failure') return unavailable();
+  if (fs.existsSync(path.join(dataDir, OFF_FILE))) return unavailable();
+  closeImpl();
+  const r = initImpl(ctx);
+  if (r && r.error) return r;
+  if (state !== 'ok' || !db) return unavailable();
+  return null;
+}
+
 // Rebuild (design 3.4): bump gen, clear pending and timers, stop the worker,
 // delete and reopen, respawn, ask for a backfill walk.
 function rescanImpl() {
-  if (state !== 'ok' || !db) return unavailable();
+  if (state !== 'ok' || !db) {
+    const refused = reopenAfterFailure();
+    if (refused) return refused;
+  }
   if (stopped) return { error: 'Token store unavailable: shut down' };
   if (rescanRunning) return { error: 'rescan already running' };
   gen++;
@@ -694,8 +790,347 @@ function rescanImpl() {
   rescanRunning = true;
   walkWanted = true;
   if (!spawnWorker()) rescanRunning = false;   // nothing will ever report 'done'
+  // The worker file is read again at every spawn, so Rebuild is also the way
+  // to try a query worker that could not start before.
+  queryInline = false;
+  qwRespawnTimes = [];
+  restartQueryWorker();
   scheduleBroadcast();
   return { ok: true };
+}
+
+// ------------------------------------------------------------ query worker ----
+//
+// The five queries run in workers/query-tokens.js on its own READ-ONLY
+// connection. What this file keeps:
+//   - the list of queries waiting for an answer (each with a 30 s timer, so
+//     every Promise resolves whatever happens to the worker);
+//   - the worker's life: started by the first query, respawned with backoff at
+//     most 3 times an hour, and CLOSED WITH CONFIRMATION before every path that
+//     deletes, renames or closes the store (on Windows its open handle would
+//     make the delete or the rename fail);
+//   - the fallback: a worker that cannot start, or has used up its respawns,
+//     leaves the queries running here on the store's own handle, as they did
+//     before there was a worker. Slow for the terminals, but never dead.
+
+function queryMode() {
+  return state === 'ok' && !!db && !stopped && !queryInline ? 'worker' : 'inline';
+}
+
+function queryWorkerPath() {
+  if (ctx && typeof ctx.workerPath === 'string' && ctx.workerPath !== '') {
+    return path.join(path.dirname(ctx.workerPath), 'query-tokens.js');   // beside the scan worker
+  }
+  return path.join(__dirname, 'workers', 'query-tokens.js');
+}
+
+// The scan object for an answer. Reading it can fail like any statement; the
+// answer still goes out.
+function scanForAnswer(mode) {
+  let o;
+  try {
+    o = scanObject();
+  } catch (err) {
+    try { fail('status', err, false); } catch { /* keep going */ }
+    try { o = scanObject(); } catch { o = { state: 'disabled', reason: errMsg(err), reasonCode: 'failure', files: null, queryMode: 'inline' }; }
+  }
+  if (mode && o.state === 'ok') o.queryMode = mode;   // how THIS answer was computed
+  return o;
+}
+
+function withScan(res, name, mode) {
+  const out = res && typeof res === 'object'
+    ? Object.assign({}, res)
+    : { error: 'Token store unavailable: bad ' + name + ' result' };
+  out.scan = scanForAnswer(mode);
+  return out;
+}
+
+function queryFailure(name, err) {
+  let out;
+  try { out = fail(name, err, false); } catch (err2) { out = { error: errMsg(err2) }; }
+  try { out.scan = scanForAnswer(); } catch { /* the error alone is still an answer */ }
+  return out;
+}
+
+function settle(entry, out) {
+  if (!waiting.delete(entry.id)) return;      // answered already (a late result after a timeout)
+  cancel(entry.timer);
+  entry.timer = null;
+  try { entry.resolve(out); } catch { /* a resolver does not throw; nothing may escape anyway */ }
+}
+
+function failWaiting(error) {
+  for (const entry of Array.from(waiting.values())) {
+    settle(entry, { error, scan: scanForAnswer() });
+  }
+}
+
+// The queries on this thread's own handle: the code path from before the
+// query worker, and what the fallback runs.
+function runInline(name, q) {
+  if (!queries) {
+    // Lazy and inside the guard: a missing or broken queries module costs the
+    // Tokens tab an { error }, never the app.
+    const mod = require('./token-usage-queries');
+    queries = mod.createQueries(db, {
+      localDay,
+      dayList,
+      sessionInfo: ctx.sessionInfo,
+      folderMeta: ctx.folderMeta,
+      isRunning: ctx.isRunning,
+      ctxDir: ctx.ctxDir,
+      handoffsDir: ctx.handoffsDir,
+      now: () => clock.now(),
+    });
+  }
+  const fn = queries ? queries[name] : null;
+  if (typeof fn !== 'function') return { error: 'Token store unavailable: no ' + name + ' query' };
+  return fn.call(queries, q);
+}
+
+function inlineAnswer(name, q) {
+  let res;
+  try {
+    res = runInline(name, q);
+  } catch (err) {
+    try { res = fail(name, err, false); } catch (err2) { res = { error: errMsg(err2) }; }
+  }
+  return withScan(res, name, 'inline');
+}
+
+// What only this thread can add to the worker's answer: titles, project paths
+// and labels, isRunning.
+function workerAnswer(name, res) {
+  let out = res;
+  try {
+    const mod = require('./token-usage-queries');
+    if (typeof mod.decorateResult === 'function') {
+      out = mod.decorateResult(name, res, { sessionInfo: ctx.sessionInfo, folderMeta: ctx.folderMeta, isRunning: ctx.isRunning });
+    }
+  } catch (err) {
+    logOnce('warn', '[token-usage] could not add titles and project paths to a query answer: ' + errMsg(err));
+    out = res;
+  }
+  return withScan(out, name, 'worker');
+}
+
+function wire(q) {
+  const mod = require('./token-usage-queries');
+  return typeof mod.wireRequest === 'function' ? mod.wireRequest(q) : q;
+}
+
+function fallBackInline(why) {
+  if (queryInline) return;
+  queryInline = true;
+  logOnce('warn', '[token-usage] the query worker is not available (' + why + '): token queries run in the main process');
+}
+
+// Stop using a worker without waiting for it: it is dead, stuck or unwanted.
+// The closing flag makes a worker that is still alive close its connection at
+// its next message instead of starting another query.
+function dropQueryWorker(cur) {
+  if (qw === cur) qw = null;
+  cancel(cur.helloTimer);
+  cur.helloTimer = null;
+  try { Atomics.store(cur.signal, SIG_CLOSING, 1); } catch { /* ignore */ }
+  try {
+    const p = cur.worker.terminate();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch { /* already gone */ }
+}
+
+// Close the query worker's connection and WAIT for the confirmation. Called
+// before every delete, rename and close of the database file. Synchronous on
+// purpose: the callers are (Rebuild, the corrupt-file rename, disable, close),
+// and a state machine that waits for a message would leave the store half
+// closed while other calls arrive. The wait is the rest of the one query the
+// worker is in, at most: it starts no other once the flag is up.
+// Returns true when the connection is known to be closed.
+function closeQueryWorker() {
+  cancel(qwRespawnTimer);
+  qwRespawnTimer = null;
+  const cur = qw;
+  qw = null;
+  // Whatever was sent is asked again of the next worker, or answered by
+  // pumpQueries once the caller has settled what state the store is in.
+  for (const entry of waiting.values()) entry.sentTo = null;
+  if (!cur) return true;
+  cancel(cur.helloTimer);
+  cur.helloTimer = null;
+  let confirmed = false;
+  try {
+    Atomics.store(cur.signal, SIG_CLOSING, 1);
+    try { cur.worker.postMessage({ type: 'close' }); } catch { /* a dead worker holds no handle */ }
+    if (Atomics.load(cur.signal, SIG_CLOSED) !== 1) Atomics.wait(cur.signal, SIG_CLOSED, 0, QW_CLOSE_WAIT_MS);
+    confirmed = Atomics.load(cur.signal, SIG_CLOSED) === 1;
+  } catch (err) {
+    logOnce('warn', '[token-usage] could not wait for the query worker to close: ' + errMsg(err));
+  }
+  try {
+    const p = cur.worker.terminate();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch { /* already gone */ }
+  if (!confirmed) {
+    // The delete that follows may fail; wipeAndReopen then drops the tables in
+    // place, and a rename that fails leaves the store disabled. Neither throws.
+    logOnce('warn', '[token-usage] the query worker did not confirm that its connection is closed');
+  }
+  return confirmed;
+}
+
+function startQueryWorker() {
+  if (qw || state !== 'ok' || !db || stopped || queryInline || !ctx) return false;
+  let w = null;
+  try {
+    const signal = new Int32Array(new SharedArrayBuffer(8));
+    const data = { dbPath, signal: signal.buffer };
+    if (typeof ctx.ctxDir === 'string' && ctx.ctxDir) data.ctxDir = ctx.ctxDir;
+    if (typeof ctx.handoffsDir === 'string' && ctx.handoffsDir) data.handoffsDir = ctx.handoffsDir;
+    const workerPath = queryWorkerPath();
+    if (typeof ctx.createQueryWorker === 'function') {
+      w = ctx.createQueryWorker(workerPath, data);
+    } else {
+      const { Worker } = require('worker_threads');
+      w = new Worker(workerPath, { workerData: data });
+    }
+    if (!w || typeof w.on !== 'function' || typeof w.postMessage !== 'function') throw new Error('no worker was created');
+    const cur = { worker: w, signal, ready: false, helloTimer: null };
+    qw = cur;
+    w.on('message', (m) => reading('query worker message', () => onQueryWorkerMessage(cur, m)));
+    w.on('error', (e) => reading('query worker error', () => onQueryWorkerGone(cur, 'error: ' + errMsg(e))));
+    w.on('exit', (code) => reading('query worker exit', () => onQueryWorkerGone(cur, 'exit code ' + code)));
+    cur.helloTimer = laterReading(QW_HELLO_MS, 'query worker hello', () => {
+      cur.helloTimer = null;
+      if (qw === cur && !cur.ready) queryWorkerCannotStart(cur, 'no hello within ' + (QW_HELLO_MS / 1000) + ' s');
+    });
+    return true;
+  } catch (err) {
+    const cur = qw && qw.worker === w ? qw : null;
+    if (!cur && w && typeof w.terminate === 'function') {
+      try { const p = w.terminate(); if (p && typeof p.catch === 'function') p.catch(() => {}); } catch { /* ignore */ }
+    }
+    queryWorkerCannotStart(cur, errMsg(err));
+    return false;
+  }
+}
+
+// After a rebuild or a corrupt-file recovery, where the store stays open: the
+// worker comes back if the Tokens tab has been using it.
+function restartQueryWorker() {
+  if (qwUsed || waiting.size > 0) startQueryWorker();
+  pumpQueries();
+}
+
+function queryWorkerCannotStart(cur, why) {
+  if (cur) dropQueryWorker(cur);
+  fallBackInline(why);
+  pumpQueries();
+}
+
+function onQueryWorkerMessage(cur, msg) {
+  if (qw !== cur || !msg || typeof msg !== 'object') return;
+  if (msg.type === 'hello') {
+    if (cur.ready) return;
+    if (msg.ok !== true) {
+      queryWorkerCannotStart(cur, typeof msg.error === 'string' && msg.error ? msg.error : 'its hello carried no ok');
+      return;
+    }
+    cancel(cur.helloTimer);
+    cur.helloTimer = null;
+    cur.ready = true;
+    pumpQueries();
+    return;
+  }
+  if (msg.type === 'result') {
+    const entry = waiting.get(msg.id);
+    if (!entry || entry.sentTo !== cur) return;
+    settle(entry, workerAnswer(entry.name, msg.result));
+  }
+}
+
+// error and exit both land here; the identity check makes the second one, and
+// the exit of a worker that was closed on purpose, a no-op.
+function onQueryWorkerGone(cur, why) {
+  if (qw !== cur) return;
+  const served = cur.ready;
+  dropQueryWorker(cur);
+  if (!served) {
+    queryWorkerCannotStart(null, 'it stopped before its hello, ' + why);
+    return;
+  }
+  logAt('warn', '[token-usage] query worker stopped (' + why + ')');
+  // What it was working on has no answer. Queries not yet sent wait for the respawn.
+  for (const entry of Array.from(waiting.values())) {
+    if (entry.sentTo === cur) settle(entry, withScan({ error: 'query worker stopped (' + why + ')' }, entry.name, 'worker'));
+  }
+  scheduleQueryRespawn();
+  pumpQueries();
+}
+
+// Backoff, at most 3 respawns in any hour. Past that the queries run inline
+// until the next init or Rebuild.
+function scheduleQueryRespawn() {
+  if (qw || qwRespawnTimer !== null || stopped || state !== 'ok' || queryInline) return;
+  const now = clock.now();
+  qwRespawnTimes = qwRespawnTimes.filter((t) => now - t < RESPAWN_WINDOW_MS);
+  if (qwRespawnTimes.length >= RESPAWN_MAX) {
+    fallBackInline('it stopped more than ' + RESPAWN_MAX + ' times in an hour');
+    return;
+  }
+  const delay = QW_RESPAWN_DELAYS_MS[qwRespawnTimes.length];
+  qwRespawnTimes.push(now);
+  qwRespawnTimer = laterReading(delay, 'query worker respawn', () => {
+    qwRespawnTimer = null;
+    if (!qw) startQueryWorker();
+    pumpQueries();
+  });
+}
+
+function onQueryTimeout(entry) {
+  entry.timer = null;
+  if (!waiting.has(entry.id)) return;
+  const cur = entry.sentTo;
+  settle(entry, withScan({ error: 'query timed out' }, entry.name));
+  if (!cur || qw !== cur) return;
+  // The worker has been inside one query for 30 s: replace it. Everything else
+  // it was sent sits behind that query and has no answer either.
+  logAt('warn', '[token-usage] a ' + entry.name + ' query had no answer after ' + (QUERY_TIMEOUT_MS / 1000) + ' s: replacing the query worker');
+  dropQueryWorker(cur);
+  for (const other of Array.from(waiting.values())) {
+    if (other.sentTo === cur) settle(other, withScan({ error: 'query worker replaced after a timeout' }, other.name, 'worker'));
+  }
+  scheduleQueryRespawn();
+  pumpQueries();
+}
+
+// Move every waiting query as far as it can go now. Safe to call at any time.
+function pumpQueries() {
+  if (waiting.size === 0) return;
+  if (state !== 'ok' || !db) { failWaiting(unavailable().error); return; }
+  if (stopped) { failWaiting('Token store unavailable: shut down'); return; }
+  if (queryInline) {
+    for (const entry of Array.from(waiting.values())) {
+      if (entry.sentTo === null) settle(entry, inlineAnswer(entry.name, entry.q));
+    }
+    return;
+  }
+  if (!qw) {
+    if (qwRespawnTimer !== null) return;      // the backoff is running; the 30 s timer is the backstop
+    startQueryWorker();                       // a failure here latches the fallback and pumps again
+    return;
+  }
+  if (!qw.ready) return;                      // posted at hello
+  const cur = qw;
+  for (const entry of Array.from(waiting.values())) {
+    if (entry.sentTo !== null) continue;
+    try {
+      cur.worker.postMessage({ type: 'query', id: entry.id, name: entry.name, q: wire(entry.q), now: clock.now() });
+      entry.sentTo = cur;
+    } catch (err) {
+      settle(entry, withScan({ error: 'query could not be sent: ' + errMsg(err) }, entry.name, 'worker'));
+    }
+  }
 }
 
 // ------------------------------------------------------------------ worker ----
@@ -1310,6 +1745,9 @@ function scanObject() {
   const o = {
     state: ok ? 'ok' : 'disabled',
     reason: ok ? scannerError : (lastError || 'not initialised'),
+    // Why it is off, for the Tokens tab's way back: 'kill-switch' offers "turn
+    // on", 'failure' offers "Try again" (enable() re-runs init).
+    reasonCode: ok ? null : reasonCode(),
     phase,
     done: progressDone,
     total: progressTotal,
@@ -1321,9 +1759,12 @@ function scanObject() {
     linesSkipped: 0,
     parseVersion,
     pricesVersion: pricesVersion(),
+    files: null,                 // rows in the files table; null while the store is not open
+    queryMode: queryMode(),      // 'worker' | 'inline': where the next query runs
   };
   if (!ok) return o;
   const f = S.fileStats.get();
+  o.files = f.files || 0;
   o.filesWithErrors = f.errs || 0;
   o.filesMissing = f.missing || 0;
   o.linesSkipped = f.skipped || 0;
@@ -1334,29 +1775,28 @@ function scanObject() {
   return o;
 }
 
+// One query. Returns the answer (inline, or when there is nothing to ask) or a
+// Promise for it (the worker); guardQuery turns both into a Promise that
+// resolves.
 function runQuery(name, q) {
-  if (state !== 'ok' || !db) return Object.assign(unavailable(), { scan: scanObject() });
-  if (!queries) {
-    // Lazy and inside the guard: a missing or broken queries module costs the
-    // Tokens tab an { error }, never the app.
-    const mod = require('./token-usage-queries');
-    queries = mod.createQueries(db, {
-      localDay,
-      dayList,
-      sessionInfo: ctx.sessionInfo,
-      folderMeta: ctx.folderMeta,
-      isRunning: ctx.isRunning,
-      ctxDir: ctx.ctxDir,
-      handoffsDir: ctx.handoffsDir,
-      now: () => clock.now(),
-    });
+  if (state !== 'ok' || !db) return Object.assign(unavailable(), { scan: scanForAnswer() });
+  // After shutdown() the store stays readable until close(), on this thread:
+  // the app is quitting and no worker is started for that.
+  if (stopped || queryInline) return inlineAnswer(name, q);
+  if (waiting.size >= WAITING_MAX) {
+    return { error: 'Token store busy: ' + WAITING_MAX + ' queries are already waiting', scan: scanForAnswer() };
   }
-  const fn = queries ? queries[name] : null;
-  if (typeof fn !== 'function') return { error: 'Token store unavailable: no ' + name + ' query', scan: scanObject() };
-  const res = fn.call(queries, q);
-  const out = res && typeof res === 'object' ? Object.assign({}, res) : { error: 'Token store unavailable: bad ' + name + ' result' };
-  out.scan = scanObject();
-  return out;
+  qwUsed = true;
+  return new Promise((resolve) => {
+    const entry = { id: ++querySeq, name, q, resolve, timer: null, sentTo: null };
+    waiting.set(entry.id, entry);
+    try {
+      entry.timer = laterReading(QUERY_TIMEOUT_MS, 'query timeout', () => onQueryTimeout(entry));
+      pumpQueries();
+    } catch (err) {
+      settle(entry, queryFailure(name, err));
+    }
+  });
 }
 
 function summaryImpl(q) {
@@ -1382,12 +1822,13 @@ module.exports = {
   shutdown: guard('shutdown', shutdownImpl, false),
   close: guard('close', closeImpl, false),
   status: guard('status', scanObject, false),
-  // Queries (each: the design section 4 shape plus `scan`).
-  summary: guard('summary', summaryImpl, false),
-  models: guard('models', (q) => runQuery('models', q), false),
-  daily: guard('daily', (q) => runQuery('daily', q), false),
-  sessions: guard('sessions', (q) => runQuery('sessions', q), false),
-  context: guard('context', (q) => runQuery('context', q), false),
+  // Queries (each: the design section 4 shape plus `scan`, or { error, scan }).
+  // Asynchronous: a Promise that always resolves and never rejects.
+  summary: guardQuery('summary', summaryImpl),
+  models: guardQuery('models', (q) => runQuery('models', q)),
+  daily: guardQuery('daily', (q) => runQuery('daily', q)),
+  sessions: guardQuery('sessions', (q) => runQuery('sessions', q)),
+  context: guardQuery('context', (q) => runQuery('context', q)),
   // For tests and for the queries module's tests.
   createSchema: plain((handle) => { createSchema(handle); return { ok: true }; }),
   createIndexes: plain((handle) => { createIndexes(handle); return { ok: true }; }),

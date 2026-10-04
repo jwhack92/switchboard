@@ -13,6 +13,11 @@
 // Rows are seeded through applyChunk with hand-built chunk messages (the path
 // a worker message takes). Nothing here needs the parser, the worker or the
 // queries module to exist: the queries module is replaced by a stub.
+//
+// The five queries are asynchronous (they normally run in the query worker).
+// Here ctx.createQueryWorker always throws, which is the "worker cannot start"
+// case: the facade then runs them inline on the store's own handle, against
+// the stub. The worker itself is test/token-usage-query-worker.test.js.
 
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -125,6 +130,7 @@ function makeHarness() {
       projectsDir: dirs.projectsDir,
       dataDir: dirs.dataDir,
       appVersion: '0.0.0-test',
+      createQueryWorker: () => { throw new Error('no query worker in this test'); },
       broadcast: (channel, payload) => sent.push({ channel, payload, at: clock.now() }),
     }, extra || {});
   };
@@ -228,31 +234,50 @@ const GARBAGE = [undefined, null, 0, 42, NaN, '', 'x', '../../etc/passwd', true,
 
 function isError(r) { return !!r && typeof r === 'object' && typeof r.error === 'string' && r.error.length > 0; }
 
-// Every export, every garbage argument: nothing may throw.
-function callEverything(t, skip) {
+function isThenable(r) { return !!r && typeof r === 'object' && typeof r.then === 'function'; }
+
+// Every export, every garbage argument: nothing may throw, and a query's
+// Promise may not reject (it resolves to an object, whatever it was given).
+async function callEverything(t, skip) {
   let calls = 0;
+  const promised = [];
+  const call = (name, args, label) => {
+    let r;
+    assert.doesNotThrow(() => { r = t[name](...args); }, label);
+    if (QUERY_NAMES.includes(name)) assert.ok(isThenable(r), label + ' returns a Promise');
+    if (isThenable(r)) promised.push({ label, p: r });
+    calls++;
+  };
   for (const name of Object.keys(t)) {
     if (typeof t[name] !== 'function' || (skip && skip.includes(name))) continue;
     for (const g of GARBAGE) {
-      assert.doesNotThrow(() => t[name](g), name + '(' + String(typeof g) + ')');
-      assert.doesNotThrow(() => t[name](g, g, g), name + ' with three garbage arguments');
-      calls += 2;
+      call(name, [g], name + '(' + String(typeof g) + ')');
+      call(name, [g, g, g], name + ' with three garbage arguments');
     }
-    assert.doesNotThrow(() => t[name](), name + '()');
-    calls++;
+    call(name, [], name + '()');
+  }
+  for (const { label, p } of promised) {
+    let v;
+    try { v = await p; } catch (err) { assert.fail(label + ' rejected: ' + (err && err.message)); }
+    assert.ok(v && typeof v === 'object', label + ' resolves to an object');
+    assert.ok(v.scan && typeof v.scan === 'object', label + ' carries scan');
   }
   return calls;
 }
 
-function assertUnavailable(t, label) {
+// `except`: names not checked here. rescan() on a store that is off because of
+// a FAILURE is the "Try again" path (it re-runs init), checked by the caller.
+async function assertUnavailable(t, label, except) {
   for (const name of LIFECYCLE.concat(QUERY_NAMES)) {
     // init and enable are the way back, and disable on a store that is already
     // off is a legitimate request (it writes the flag): all three are checked by the caller.
     if (name === 'init' || name === 'enable' || name === 'disable') continue;
-    const r = t[name]({});
+    if (except && except.includes(name)) continue;
+    const r = await t[name]({});
     assert.ok(isError(r), label + ': ' + name + ' returns { error }, got ' + JSON.stringify(r));
   }
   assert.equal(t.status().state, 'disabled', label);
+  assert.equal(t.status().files, null, label + ': no file count while the store is not open');
   assert.equal(t._handle(), null, label);
 }
 
@@ -280,7 +305,16 @@ const SCENARIOS = {
     assert.equal(scan.phase, 'idle');
     assert.equal(scan.backfillDone, null);
     for (const key of ['state', 'reason', 'phase', 'done', 'total', 'backfillDone', 'lastScanMs', 'lastCatchupMs',
-      'filesWithErrors', 'filesMissing', 'linesSkipped', 'parseVersion', 'pricesVersion']) assert.ok(key in scan, key);
+      'filesWithErrors', 'filesMissing', 'linesSkipped', 'parseVersion', 'pricesVersion',
+      'reasonCode', 'files', 'queryMode']) assert.ok(key in scan, key);
+    assert.equal(scan.reasonCode, null, 'an open store has no reason code');
+    assert.equal(scan.files, 0, 'files is the row count of the files table');
+    assert.equal(scan.queryMode, 'worker', 'no query has been asked yet: the worker is where the next one goes');
+    const O = H.mainRow(SID_O);
+    const C = H.mainRow(SID_C, { birthtime_ms: 2000 });
+    H.apply(H.chunk(O, [H.cand('m1', O)]));
+    H.apply(H.chunk(C, [H.cand('m2', C)]));
+    assert.equal(t.status().files, 2);
     // A second init in the same process changes nothing and keeps the generation.
     const g = t._gen();
     const before = JSON.stringify(H.master());
@@ -746,7 +780,7 @@ const SCENARIOS = {
     return { zone: Intl.DateTimeFormat().resolvedOptions().timeZone, r1: H.resp('r1').local_day };
   },
 
-  killSwitch(H) {
+  async killSwitch(H) {
     const { t } = H;
     fs.mkdirSync(H.dirs.dataDir, { recursive: true });
     fs.writeFileSync(H.offFile, '');
@@ -759,7 +793,9 @@ const SCENARIOS = {
     assert.equal(workers.made.length, 0, 'no worker is started');
     assert.equal(ctx.clock.count(), 0, 'no timer is armed');
     assert.deepEqual([t.status().state, t.status().reason], ['disabled', 'disabled by token-usage.off']);
-    assertUnavailable(t, 'flag file present');
+    assert.equal(t.status().reasonCode, 'kill-switch');
+    await assertUnavailable(t, 'flag file present');
+    assert.equal(t.status().state, 'disabled', 'rescan() does not open a store the kill switch turned off');
 
     // enable(): removes the flag and runs init again, no relaunch.
     assert.deepEqual(t.enable(), { ok: true, state: 'ok' });
@@ -780,10 +816,13 @@ const SCENARIOS = {
     assert.equal(fs.existsSync(H.offFile), true);
     assert.equal(workers.last.terminated, true);
     assert.equal(ctx.clock.count(), 0, 'every timer is cleared');
-    assertUnavailable(t, 'after disable');
+    await assertUnavailable(t, 'after disable');
     assert.equal(t.status().reason, 'disabled by token-usage.off');
-    assert.equal(t.summary({}).error, 'Token store unavailable: disabled by token-usage.off');
-    assert.equal(t.summary({}).scan.state, 'disabled');
+    assert.equal(t.status().reasonCode, 'kill-switch');
+    assert.equal((await t.summary({})).error, 'Token store unavailable: disabled by token-usage.off');
+    assert.equal((await t.summary({})).scan.state, 'disabled');
+    assert.equal((await t.summary({})).scan.reasonCode, 'kill-switch');
+    assert.equal(ctx.clock.count(), 0, 'a refused query leaves no timer behind');
     ctx.clock.advance(3600000);
     assert.equal(workers.made.length, 1, 'nothing respawns while disabled');
     // A stray chunk from the terminated worker is ignored.
@@ -802,12 +841,13 @@ const SCENARIOS = {
     assert.deepEqual(H.all('SELECT message_id FROM responses').map((x) => x.message_id), ['m1'], 'the data is still there');
   },
 
-  noThrow(H) {
+  async noThrow(H) {
     const { t } = H;
     const out = {};
     // Before init.
-    out.before = callEverything(t);
-    assertUnavailable(t, 'before init');
+    out.before = await callEverything(t);
+    await assertUnavailable(t, 'before init');
+    assert.equal(t.status().reasonCode, null, 'not initialised is neither the kill switch nor a failure');
     assert.ok(isError(t.init()), 'init() with no ctx');
     assert.ok(isError(t.init({ log: console })), 'init without projectsDir');
     assert.ok(isError(t.enable()), 'enable before init');
@@ -820,7 +860,7 @@ const SCENARIOS = {
     // Running, with garbage (the calls that would change the store's state on
     // purpose are exercised in their own scenarios).
     const { ctx } = H.start();
-    out.running = callEverything(t, ['disable', 'rescan', 'close', 'shutdown', 'init', 'enable']);
+    out.running = await callEverything(t, ['disable', 'rescan', 'close', 'shutdown', 'init', 'enable']);
     assert.equal(t.status().state, 'ok', 'garbage arguments do not turn the store off: ' + t.status().reason);
     for (const g of GARBAGE) assert.ok(isError(t.init(g)) || t.init(g).ok === true);
     assert.equal(t.status().state, 'ok');
@@ -836,13 +876,13 @@ const SCENARIOS = {
 
     // After disable.
     assert.deepEqual(t.disable(), { ok: true, state: 'disabled' });
-    out.disabled = callEverything(t, ['enable', 'init']);
-    assertUnavailable(t, 'after disable');
+    out.disabled = await callEverything(t, ['enable', 'init']);
+    await assertUnavailable(t, 'after disable');
     assert.equal(fs.existsSync(H.offFile), true);
     return out;
   },
 
-  dbPathIsDirectory(H) {
+  async dbPathIsDirectory(H) {
     const { t } = H;
     fs.mkdirSync(H.dbFile, { recursive: true });
     const ctx = H.ctx();
@@ -851,14 +891,22 @@ const SCENARIOS = {
     assert.ok(isError(r), JSON.stringify(r));
     assert.equal(t.status().state, 'disabled');
     assert.equal(t.status().reason, r.error);
-    assertUnavailable(t, 'db path is a directory');
-    callEverything(t, ['enable', 'init', 'disable']);
+    assert.equal(t.status().reasonCode, 'failure');
+    // "Try again" on a store that still cannot open: an { error }, never a throw.
+    let again;
+    assert.doesNotThrow(() => { again = t.enable(); });
+    assert.ok(isError(again), 'enable: ' + JSON.stringify(again));
+    assert.doesNotThrow(() => { again = t.rescan(); });
+    assert.ok(isError(again), 'rescan: ' + JSON.stringify(again));
+    assert.equal(t.status().reasonCode, 'failure');
+    await assertUnavailable(t, 'db path is a directory');
+    await callEverything(t, ['enable', 'init', 'disable']);
     assert.equal(fs.statSync(H.dbFile).isDirectory(), true, 'the directory is left alone');
     assert.equal(ctx.clock.count(), 0);
     return { error: r.error, files: H.listData() };
   },
 
-  queriesFacade(H) {
+  async queriesFacade(H) {
     const { t } = H;
     const sessionInfo = () => ({ title: 'x' });
     const ctx = H.ctx({ sessionInfo, ctxDir: 'C:/ctx', handoffsDir: 'C:/handoffs' });
@@ -867,11 +915,17 @@ const SCENARIOS = {
     queriesStub = { throws: Object.assign(new Error("Cannot find module './token-usage-queries'"), { code: 'MODULE_NOT_FOUND' }) };
     assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
     for (const name of QUERY_NAMES) {
-      let r;
-      assert.doesNotThrow(() => { r = t[name]({}); });
+      let p;
+      assert.doesNotThrow(() => { p = t[name]({}); });
+      assert.ok(isThenable(p), name + ' returns a Promise');
+      const r = await p;
       assert.match(r.error, /Cannot find module/, name);
+      assert.equal(r.scan.state, 'ok', name + ': an error answer carries scan too');
+      assert.equal(r.scan.queryMode, 'inline');
     }
     assert.equal(t.status().state, 'ok', 'a broken queries module does not disable the store');
+    assert.equal(t.status().queryMode, 'inline', 'the query worker could not start');
+    assert.equal(ctx.logs.filter((l) => l.includes('query worker is not available')).length, 1, 'logged once');
 
     // Broken in other ways.
     const broken = [
@@ -886,8 +940,9 @@ const SCENARIOS = {
       queriesStub = { exports: exp };
       assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
       for (const name of QUERY_NAMES) {
-        let r;
-        assert.doesNotThrow(() => { r = t[name]({}); });
+        let p;
+        assert.doesNotThrow(() => { p = t[name]({}); });
+        const r = await p;
         assert.ok(isError(r), name + ' -> ' + JSON.stringify(r));
       }
       assert.equal(t.status().state, 'ok');
@@ -903,11 +958,11 @@ const SCENARIOS = {
     } } };
     assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
     for (const name of QUERY_NAMES) {
-      const r = t[name]({ from: '2026-10-01' });
+      const r = await t[name]({ from: '2026-10-01' });
       assert.equal(r.name, name);
       assert.deepEqual(r.q, { from: '2026-10-01' });
       assert.equal(r.scan.state, 'ok');
-      const bad = t[name]({ bad: true });
+      const bad = await t[name]({ bad: true });
       assert.equal(bad.error, 'bad request: ' + name);
       assert.equal(bad.scan.state, 'ok');
     }
@@ -923,7 +978,7 @@ const SCENARIOS = {
     // A reopened handle gets fresh query statements.
     t.close();
     assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
-    t.summary({});
+    await t.summary({});
     assert.equal(seen.calls, 2);
     assert.equal(seen.db, t._handle());
   },
@@ -1033,7 +1088,7 @@ const SCENARIOS = {
     assert.equal(workers.last.of('walk').pop().mode, 'backfill');
   },
 
-  corruptAtRunTime(H) {
+  async corruptAtRunTime(H) {
     // A statement that fails with a corruption code at any time takes the same
     // path as a corrupt file at open. The failure is injected from inside the
     // chunk transaction, carrying the code better-sqlite3 would report.
@@ -1066,9 +1121,28 @@ const SCENARIOS = {
     assert.doesNotThrow(() => { r = t.applyChunk(H.chunk(O, [poisoned('SQLITE_IOERR_SHORT_READ')])); });
     assert.equal(r.error, 'database disk image is malformed');
     assert.deepEqual([t.status().state, t.status().reason], ['disabled', 'database disk image is malformed']);
-    assertUnavailable(t, 'after a second corruption');
+    assert.equal(t.status().reasonCode, 'failure');
+    await assertUnavailable(t, 'after a second corruption', ['rescan']);
     assert.equal(workers.last.terminated, true);
     assert.equal(ctx.clock.count(), 0);
+
+    // "Try again" through Rebuild: rescan() on a store that is off because of
+    // a failure re-runs init and then rebuilds.
+    const made = workers.made.length;
+    const g2 = t._gen();
+    let again;
+    assert.doesNotThrow(() => { again = t.rescan(); });
+    assert.deepEqual(again, { ok: true });
+    assert.deepEqual([t.status().state, t.status().reasonCode], ['ok', null]);
+    assert.ok(t._gen() > g2);
+    assert.ok(workers.made.length > made, 'a scanner worker is started again');
+    assert.equal(workers.last.workerData.gen, t._gen());
+    assert.equal(H.n('responses'), 0);
+    assert.equal(H.meta('backfill_done'), '');
+    H.hello(workers.last);
+    assert.equal(workers.last.of('walk').pop().mode, 'backfill');
+    assert.deepEqual(t.rescan(), { error: 'rescan already running' });
+    assert.equal(fs.existsSync(H.offFile), false);
   },
 
   writeFailure(H) {
@@ -1083,6 +1157,7 @@ const SCENARIOS = {
     let r;
     assert.doesNotThrow(() => { workers.last.emit('message', H.chunk(O, [H.cand('m2', O), c])); });
     assert.deepEqual([t.status().state, t.status().reason], ['disabled', 'disk is full']);
+    assert.equal(t.status().reasonCode, 'failure');
     assert.doesNotThrow(() => { r = t.noteChanged(O.rel_path); });
     assert.equal(r.error, 'Token store unavailable: disk is full');
     assert.equal(workers.last.terminated, true);
@@ -1095,9 +1170,12 @@ const SCENARIOS = {
     } finally {
       db.close();
     }
-    // enable() is the way back without a relaunch.
+    // enable() is the way back without a relaunch ("Try again": no flag file,
+    // so there is nothing to remove; it re-runs init).
     assert.deepEqual(t.enable(), { ok: true, state: 'ok' });
     assert.equal(H.n('responses'), 1);
+    assert.deepEqual([t.status().state, t.status().reasonCode, t.status().files], ['ok', null, 1]);
+    assert.equal(fs.existsSync(H.offFile), false);
   },
 
   snapshot(H) {
@@ -1129,10 +1207,18 @@ function childMain() {
   const fn = SCENARIOS[name];
   assert.equal(typeof fn, 'function', 'unknown scenario ' + name);
   const H = makeHarness();
-  const out = fn(H);
-  const responses = invariantsAfter(H);
-  fs.writeSync(1, '\nRESULT ' + JSON.stringify({ out: out === undefined ? null : out, responses }) + '\n');
-  process.exit(0);
+  // Scenarios that ask a query are async; the rest return at once.
+  Promise.resolve()
+    .then(() => fn(H))
+    .then((out) => {
+      const responses = invariantsAfter(H);
+      fs.writeSync(1, '\nRESULT ' + JSON.stringify({ out: out === undefined ? null : out, responses }) + '\n');
+      process.exit(0);
+    })
+    .catch((err) => {
+      process.stderr.write((err && err.stack) || String(err));
+      process.exit(1);
+    });
 }
 
 // -------------------------------------------------------------- parent half ----

@@ -1,15 +1,19 @@
 {
   "version": "2026-09-25",
-  "source": "claude-api skill, model table cached 2026-09-25 (SKILL.md 'Current Models'; shared/models.md; shared/prompt-caching.md:144; shared/model-migration.md:1684, :2029). First-party API list prices, re-checked against the skill on 2026-10-03. The live pricing page was not fetched.",
+  "source": "claude-api skill, model table cached 2026-09-25 (SKILL.md 'Current Models'; shared/models.md; shared/prompt-caching.md:144; shared/model-migration.md:1684, :2029). First-party API list prices, re-checked against the skill on 2026-10-03. The live pricing page was not fetched. claude-mythos-5-1, claude-opus-4-7, claude-opus-4-6 and claude-sonnet-4-6 were added on 2026-10-03 from the same skill table (base prices from SKILL.md 'Current Models'; read ratios from shared/model-migration.md:1684 and shared/prompt-caching.md:144, :156).",
   "unit": "baseUsd is US dollars per million base input tokens. read is the cache-read price as a multiple of base input. Output x5, 5-minute cache write x1.25 and 1-hour cache write x2 are the same for every model and live in token-prices.js; a row may override them with output / write5m / write1h.",
   "models": {
     "claude-fable-5-1": { "baseUsd": 10, "read": 0.025 },
+    "claude-mythos-5-1": { "baseUsd": 10, "read": 0.025 },
     "claude-fable-5": { "baseUsd": 10, "read": 0.1 },
     "claude-opus-5-5": { "baseUsd": 4, "read": 0.05 },
     "claude-opus-5": { "baseUsd": 5, "read": 0.1 },
     "claude-opus-4-8": { "baseUsd": 5, "read": 0.1 },
+    "claude-opus-4-7": { "baseUsd": 5, "read": 0.1 },
+    "claude-opus-4-6": { "baseUsd": 5, "read": 0.1 },
     "claude-sonnet-5-5": { "baseUsd": 2, "read": 0.1 },
     "claude-sonnet-5": { "baseUsd": 2, "read": 0.1 },
+    "claude-sonnet-4-6": { "baseUsd": 3, "read": 0.1 },
     "claude-haiku-4-5": { "baseUsd": 1, "read": 0.1 }
   }
 }
