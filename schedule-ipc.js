@@ -82,7 +82,7 @@ Default permission-mode is \`acceptEdits\`. Always include at least \`Read\` and
 - The slug must be kebab-case, short, and descriptive
 - The prompt in the body must be fully self-contained — it runs without any conversation history
 - If the \`.claude/commands/\` directory doesn't exist, create it
-- After saving, tell the user: "Your scheduled task is saved! It will appear in Switchboard's brain tab with a schedule icon. You can enable/disable it or edit the schedule from there."
+- After saving, tell the user: "Your scheduled task is saved! It will appear in Switchboard's brain tab with a schedule icon. Switchboard imports it the next time it starts, switched off: turn it on in the schedule list when you want it to run."
 - If the user wants to see existing schedules, list any \`schedule-*.md\` files in \`.claude/commands/\`
 `;
 
@@ -96,7 +96,7 @@ Welcome! This session will help you create a **scheduled task** that runs automa
 - The schedule file gets saved to this project's \`.claude/commands/\` directory as a command — so it can also be run manually from any Claude session using \`/schedule-<name>\`
 - Once saved, it appears in the **brain tab** with a clock icon where you can edit it directly
 - To edit, you can also ask use this schedule claude session to ask to edit existing commands.
-- Switchboard runs matching schedules automatically in the background — each run creates a session grouped under the task's slug
+- Switchboard imports a new schedule file the next time it starts, switched off; once you turn it on in the schedule list it runs in the background — each run creates a session grouped under the task's slug
 
 ### What you can configure
 - **The prompt** — what Claude should do each time the task runs
