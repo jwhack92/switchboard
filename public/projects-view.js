@@ -4023,7 +4023,15 @@ async function showNewProjectDialog({ name: initialName = '', folders: initialFo
     else showProjectOverview();
     if (result.errors?.length) {
       alert(`Project created, but some worktrees could not be made:\n\n${result.errors.join('\n')}\n\nAttach them again from the project settings.`);
+      // Its folders need attention first, and the session's folder may be one
+      // of the worktrees that was not made: no session is started.
+      return;
     }
+    // A new project opens with a session in it (dialogs.js openFirstSession):
+    // the same launch as Claude on the project's + menu, shown in place of the
+    // overview, which stays one click away.
+    const created = findTreeProject(result.project?.id);
+    if (created) await openFirstSession(launchTargetFor(created), { runtime: 'claude' });
   }
 
   q('#np-add-folder').onclick = async () => addFolder(await window.api.browseFolder());

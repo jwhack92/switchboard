@@ -336,6 +336,57 @@ async function showResumeSessionDialog(session) {
 // Settings viewer is in settings-panel.js (openSettingsViewer / closeSettingsViewer)
 // Global settings button & add project button bindings are in app.js (need DOM refs)
 
+// --- A new project opens with a session in it ---
+// Jason: "When you start a new project a session should automatically open in
+// that project". Both ways of making one end in openFirstSession: Add project
+// on the sidebar (below) and New project on the Projects tab (projects-view.js).
+
+/**
+ * The folder row an Add produced, out of the cached project list, or null.
+ * `added` is add-project's reply ({ folder, projectPath }). The folder name is
+ * the key; the second pass ignores case because on Windows a path typed in
+ * another case lands in the folder that already exists under its own spelling.
+ */
+function findAddedProject(projects, added) {
+  const list = Array.isArray(projects) ? projects : [];
+  const folder = added && typeof added.folder === 'string' ? added.folder : '';
+  const projectPath = added && typeof added.projectPath === 'string' ? added.projectPath : '';
+  if (!folder && !projectPath) return null;
+  const exact = list.find(p => p && ((folder && p.folder === folder) || (projectPath && p.projectPath === projectPath)));
+  if (exact) return exact;
+  const lower = folder.toLowerCase();
+  return (lower && list.find(p => p && typeof p.folder === 'string' && p.folder.toLowerCase() === lower)) || null;
+}
+
+/**
+ * True when the added folder already has sessions: a hidden project that was
+ * added back. It is shown again and no session is started in it. Pass the
+ * list that includes archived sessions, so a project whose history is all
+ * archived still counts as having one.
+ */
+function addedProjectHasSessions(projects, added) {
+  const found = findAddedProject(projects, added);
+  return !!found && Array.isArray(found.sessions) && found.sessions.length > 0;
+}
+
+/**
+ * Start Claude in `target` with the folder's default settings: what "Claude"
+ * on a project's + menu does. Never throws and resolves to whether the launch
+ * was handed over: the project exists either way, and a session that could
+ * not be started must not look like a failed Add.
+ */
+async function openFirstSession(target, { runtime = null } = {}) {
+  try {
+    const options = await resolveDefaultSessionOptions(target);
+    if (runtime) options.runtime = runtime;
+    await launchNewSession(target, options);
+    return true;
+  } catch (err) {
+    console.error('[auto-open] no session was started in the new project:', err);
+    return false;
+  }
+}
+
 function showAddProjectDialog() {
   const overlay = document.createElement('div');
   overlay.className = 'add-project-overlay';
@@ -386,6 +437,12 @@ function showAddProjectDialog() {
     close();
 
     await loadProjects();
+    // A folder that is new here opens with a session in it. One that already
+    // has sessions (a hidden project added back) is only shown again.
+    if (!addedProjectHasSessions(cachedAllProjects, result)) {
+      const added = findAddedProject(cachedAllProjects, result);
+      await openFirstSession({ projectPath: (added && added.projectPath) || result.projectPath });
+    }
   }
 
   dialog.querySelector('.add-project-browse-btn').onclick = async () => {
