@@ -400,6 +400,18 @@ function showAddProjectDialog() {
     document.removeEventListener('keydown', onKey);
   }
 
+  // Cancel, Escape and a click outside the dialog go through dismiss(): the
+  // user sent the dialog away. While the request is out that cannot take the
+  // Add back (main has it, and the project is made), but it does mean no
+  // session: before, the reply opened one after the user had cancelled. Found
+  // in review; Jason: "Fix both now". The dialog closing itself after a good
+  // reply calls close(), which is not a dismissal.
+  let dismissed = false;
+  function dismiss() {
+    dismissed = true;
+    close();
+  }
+
   // One Add at a time. The dialog and its Enter listener stay up until main
   // has answered, so a second Enter or click in that gap sent the request again
   // and, now that an Add opens a session, started two. The flag is what stops
@@ -439,8 +451,10 @@ function showAddProjectDialog() {
     // path main settled on (the typed one with its slashes and any trailing
     // separator put right). Jason, on a folder Switchboard already knows,
     // listed or hidden, with or without sessions: "No session". That one is
-    // only shown again.
-    if (result.created === true) await openFirstSession({ projectPath: result.projectPath });
+    // only shown again. An Add the user dismissed while the request was out
+    // gets no session either: the project is in the list just reloaded, and
+    // that is all.
+    if (result.created === true && !dismissed) await openFirstSession({ projectPath: result.projectPath });
   }
 
   dialog.querySelector('.add-project-browse-btn').onclick = async () => {
@@ -448,12 +462,12 @@ function showAddProjectDialog() {
     if (folder) pathInput.value = folder;
   };
 
-  dialog.querySelector('.add-project-cancel-btn').onclick = close;
+  dialog.querySelector('.add-project-cancel-btn').onclick = dismiss;
   addBtn.onclick = addProject;
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) dismiss(); });
 
   function onKey(e) {
-    if (e.key === 'Escape') close();
+    if (e.key === 'Escape') dismiss();
     if (e.key === 'Enter') addProject();
   }
   document.addEventListener('keydown', onKey);

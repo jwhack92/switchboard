@@ -51,9 +51,13 @@ function deferred() {
 /** An element that accepts whatever the dialog does to it. */
 function fakeEl() {
   const kids = new Map();
+  const heard = [];
   return {
     className: '', innerHTML: '', textContent: '', value: '', style: {}, onclick: null, disabled: false,
-    appendChild() {}, remove() {}, focus() {}, addEventListener() {},
+    appendChild() {}, remove() {}, focus() {},
+    addEventListener(type, fn) { heard.push({ type, fn }); },
+    /** Send an event to the listeners the dialog put on this element. */
+    fire(type, event) { for (const l of heard) if (l.type === type) l.fn(event); },
     querySelector(sel) {
       if (!kids.has(sel)) kids.set(sel, fakeEl());
       return kids.get(sel);
@@ -115,6 +119,8 @@ function boot({ addReply, afterLoad = [], settings = {} } = {}) {
       dialog.querySelector('#add-project-path').value = typed;
       return dialog;
     },
+    /** The overlay behind the dialog that was opened last. */
+    overlay: () => created[created.length - 2],
     /** Press a key on the page: what the dialog's own keydown listener receives. */
     press(key) {
       for (const fn of [...keydown]) fn({ key, target: { matches: () => false } });
@@ -287,6 +293,75 @@ test('Add project pressed twice while the first is out: one add-project call and
   assert.equal(app.calls.addProject.length, 1);
   assert.equal(app.calls.loadProjects, 1);
   assert.equal(app.calls.launches.length, 1);
+  assert.equal(app.listeners(), 0);
+});
+
+// Dismissed while the request is out. Found in review: Cancel, Escape or a
+// click outside the dialog in that gap still got a session when main answered.
+// Jason, asked whether to close it: "Fix both now". The request cannot be
+// recalled, so the project is still made and the list still reloaded; only the
+// session is skipped.
+
+const ALPHA_REPLY = { ok: true, folder: 'C--work-alpha', projectPath: 'C:\\work\\alpha', created: true };
+
+/** Press Add and leave the request out: the dialog, the pending Add and the reply to settle. */
+async function addStillOut() {
+  const reply = deferred();
+  const app = boot({
+    addReply: () => reply.promise,
+    afterLoad: [{ folder: 'C--work-alpha', projectPath: 'C:\\work\\alpha', sessions: [] }],
+  });
+  const dialog = app.open('C:\\work\\alpha');
+  const pending = dialog.querySelector('.add-project-add-btn').onclick();
+  await settle();
+  assert.equal(app.calls.addProject.length, 1, 'the request is out');
+  assert.equal(app.listeners(), 1, 'and the dialog is still up');
+  return { app, dialog, pending, reply };
+}
+
+/** Dismiss the dialog with `how` while the request is out, then let main say it created the project. */
+async function dismissedWhileOut(how) {
+  const { app, dialog, pending, reply } = await addStillOut();
+  how(app, dialog);
+  assert.equal(app.listeners(), 0, 'the dialog is gone');
+  assert.equal(app.calls.loadProjects, 0, 'nothing happens until main answers');
+
+  reply.resolve(ALPHA_REPLY);
+  await pending;
+  await settle();
+  assert.equal(app.calls.addProject.length, 1, 'one add-project call');
+  assert.equal(app.calls.loadProjects, 1, 'the project was added, so the list is reloaded');
+  assert.equal(app.calls.launches.length, 0, 'and no session opens');
+  assert.deepEqual(app.calls.order, ['add', 'load']);
+}
+
+test('Add project, Cancel while the request is out: the list is reloaded and no session opens', async () => {
+  await dismissedWhileOut((app, dialog) => dialog.querySelector('.add-project-cancel-btn').onclick());
+});
+
+test('Add project, Escape while the request is out: the list is reloaded and no session opens', async () => {
+  await dismissedWhileOut((app) => app.press('Escape'));
+});
+
+test('Add project, a click outside the dialog while the request is out: the list is reloaded and no session opens', async () => {
+  await dismissedWhileOut((app) => app.overlay().fire('click', { target: app.overlay() }));
+});
+
+test('Add project that is not dismissed while the request is out still opens exactly one session', async () => {
+  const { app, dialog, pending, reply } = await addStillOut();
+  // Neither of these sends the dialog away: a click inside it, and another key.
+  app.overlay().fire('click', { target: dialog });
+  app.press('a');
+  assert.equal(app.listeners(), 1, 'the dialog is still up');
+
+  reply.resolve(ALPHA_REPLY);
+  await pending;
+  await settle();
+  assert.equal(app.calls.addProject.length, 1);
+  assert.equal(app.calls.loadProjects, 1);
+  assert.equal(app.calls.launches.length, 1, 'the dialog closing itself is not a dismissal');
+  assert.equal(app.calls.launches[0].project.projectPath, 'C:\\work\\alpha');
+  assert.deepEqual(app.calls.order, ['add', 'load', 'settings', 'launch']);
   assert.equal(app.listeners(), 0);
 });
 
@@ -520,6 +595,43 @@ test('add-project refuses what is not a folder, and writes nothing', (t) => {
   assert.deepEqual(main.calls.refreshed, []);
   assert.equal(main.calls.notified, 0);
   assert.equal(main.calls.saved, 0);
+});
+
+test('add-project refuses a path that is not a full path, and writes nothing', (t) => {
+  // path.resolve('alpha') is alpha inside the working folder of the process,
+  // which for the app is its own folder: a bare name that was a folder there
+  // was added as a project. Found in review; Jason: "Fix both now". The test
+  // stands in that position: it works from a folder where every one of these
+  // spellings IS a real folder, and the one it names is a hidden project, so
+  // an Add that got through would write the seed and the setting.
+  const scratch = bootMain(t);
+  const dir = scratch.dir('alpha');
+  const main = bootMain(t, { hidden: [dir] });
+  const typedWays = ['alpha', './alpha', '.' + path.sep + 'alpha', '.', '..', path.join('..', 'work', 'alpha')];
+  // On Windows a drive letter with no separator after it is relative too.
+  if (process.platform === 'win32') typedWays.push(path.parse(dir).root.slice(0, 2) + 'alpha');
+
+  const cwd = process.cwd();
+  process.chdir(scratch.work);
+  try {
+    for (const typed of typedWays) {
+      assert.equal(fs.statSync(path.resolve(typed)).isDirectory(), true, `${typed} is a real folder from here`);
+      assert.deepEqual(main.add(typed), { error: 'Enter the full path of the folder.' }, typed);
+    }
+  } finally {
+    process.chdir(cwd);   // before the temp folders are removed
+  }
+  assert.deepEqual(main.folders(), []);
+  assert.deepEqual(main.calls.refreshed, []);
+  assert.equal(main.calls.notified, 0);
+  assert.equal(main.calls.saved, 0);
+  assert.deepEqual(main.hidden(), [dir], 'still hidden');
+
+  // The same folder by its full path is taken.
+  const reply = main.add(dir);
+  assert.equal(reply.ok, true);
+  assert.equal(reply.projectPath, dir);
+  assert.deepEqual(main.hidden(), []);
 });
 
 // --- New project on the Projects tab (public/projects-view.js) ---

@@ -628,6 +628,11 @@ ipcMain.handle('add-project', (_event, typedPath) => {
     // here. path.resolve('') is the app's own folder, so an empty path is
     // refused before it gets there.
     if (typeof typedPath !== 'string' || !typedPath.trim()) return { error: 'Path is not a directory' };
+    // A path that is not a full one is refused as well. path.resolve('foo') is
+    // foo inside the app's own working folder, so a bare name that happened to
+    // be a folder there was added as a project. Found in review; Jason: "Fix
+    // both now". The Add dialog shows this text as it is.
+    if (!path.isAbsolute(typedPath)) return { error: 'Enter the full path of the folder.' };
     const projectPath = path.resolve(typedPath);
 
     // Validate the path exists and is a directory
