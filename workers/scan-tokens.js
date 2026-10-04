@@ -16,6 +16,8 @@ const { PARSE_VERSION, classifyPath, scanTranscript } = require('../token-usage-
  * Messages (design 3.4). Every one carries `gen`.
  *   worker -> main  { type: 'hello', gen, parseVersion }
  *   main -> worker  { type: 'walk', gen, mode: 'backfill'|'catchup', known: [files rows] }
+ *                     a known row: { rel_path, size, mtime_ms, head_hash, indexed_bytes, tail_hash[, missing] };
+ *                     size -1 = scan it whatever its size, missing = already marked gone by the store
  *   main -> worker  { type: 'scan', gen, files: [{ rel_path, prev }] }
  *   main -> worker  { type: 'ack', gen, rel_path, seq[, dropped] }
  *   worker -> main  { type: 'chunk', gen, rel_path, seq, last, fileRow, candidates, compactions,
@@ -395,11 +397,15 @@ function createScanner(opts) {
 
   // "Gone" means: known to the store, not seen by this walk, AND stat says
   // ENOENT. EACCES, EBUSY or a folder that could not be listed never count.
+  // A row the store has already marked missing (`missing: true`) is not looked
+  // at again: its rows are kept for good, so without this every walk would
+  // stat and report every deleted file once more, and the store would check
+  // and write each one again on the main thread.
   function findMissing(known, st) {
     const seen = new Set(st.seen);
     const missing = [];
-    for (const rel of known.keys()) {
-      if (seen.has(rel) || !transcriptRel(rel)) continue;
+    for (const [rel, row] of known) {
+      if (seen.has(rel) || row.missing === true || !transcriptRel(rel)) continue;
       if (st.failedDirs.some(d => rel.startsWith(d))) continue;
       try {
         io.statSync(abs(rel));

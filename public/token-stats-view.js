@@ -33,7 +33,9 @@ const TOK_HANDOFF_TRIGGER = 400000;
 const TOK_PAGE = 200;
 const TOK_MAX_LIMIT = 2000;        // the handlers' own ceiling for `limit`
 const TOK_MAX_COLUMNS = 120;       // more days than this are summed into wider buckets
-const TOK_REQUERY_MS = 5000;       // at most one re-query per 5 s while a scan runs
+const TOK_REQUERY_MS = 5000;       // at most one re-query per 5 s from change events, whatever their phase
+const TOK_STARTING_MS = 1000;      // a store that has not started yet is asked again after this long,
+const TOK_STARTING_TRIES = 10;     // this many times; then the off notice with Try again
 const TOK_SVG_NS = 'http://www.w3.org/2000/svg';
 const TOK_OTHER = '__other__';
 
@@ -128,7 +130,14 @@ function tokOutcome(settled) {
   if (scanOff || /token-usage\.off/.test(errText)) {
     const reason = clean((v.scan && v.scan.reason) || errText || 'unknown reason');
     const action = tokOffAction(v.scan && v.scan.reasonCode, reason);
-    return { kind: 'disabled', reason, action, killSwitch: action === 'enable', text: 'Token analytics is off: ' + reason + '.' };
+    const out = { kind: 'disabled', reason, action, killSwitch: action === 'enable', text: 'Token analytics is off: ' + reason + '.' };
+    // Not switched off and not broken, only not there yet: main runs the
+    // store's init a few seconds after launch, and until then it answers with
+    // no reasonCode and one of these two reasons. The load treats it as
+    // "starting" instead of offering a Try again that cannot work yet.
+    const code = v.scan ? v.scan.reasonCode : undefined;
+    if (scanOff && (code === null || code === undefined) && /^(not initialised|starting)$/i.test(reason)) out.starting = true;
+    return out;
   }
   if (errText) return { kind: 'error', reason: clean(errText), text: 'Token analytics unavailable: ' + clean(errText) + '.' };
   return { kind: 'ok', data: v };
@@ -261,10 +270,40 @@ function tokDateTime(ms) {
   return TOK_MONTHS[d.getMonth()] + ' ' + d.getDate() + ' ' + tokClock(ms);
 }
 
+// Rounded to cents FIRST and split afterwards: rounding the fraction on its own
+// turned 100 cents into ".00" without adding the dollar (12.999 read "$12.00").
 function tokUsd(n) {
-  const v = Number(n) || 0;
-  const whole = Math.floor(v);
-  return '$' + tokNum(whole) + '.' + tokPad2(Math.round((v - whole) * 100) % 100);
+  const cents = Math.round((Number(n) || 0) * 100);
+  if (!Number.isFinite(cents) || cents <= 0) return '$0.00';
+  return '$' + tokNum(Math.floor(cents / 100)) + '.' + tokPad2(cents % 100);
+}
+
+// A ratio as the price file writes it: at most four decimals, no trailing
+// zeros, so float noise never reaches the sentence (2.0000000001 reads "2").
+function tokRatio(n) { return String(Number(Number(n).toFixed(4))); }
+
+// The first sentence of the weighted card's tooltip. The ratios are the ones
+// main used for this very answer (weighted.ratios, and weighted.readRatios for
+// the models in range whose cache-read ratio is not the default), so an edit to
+// token-prices.json changes the sentence together with the numbers. A main
+// process that sends neither gets the sentence of design 5.4, which names the
+// two models that differed when it was written. Model ids are transcript text:
+// the caller puts the sentence in a title attribute, never in markup.
+function tokRatioSentence(w, version) {
+  const tail = ') as of ' + version + '. Not a bill.';
+  const r = w && w.ratios;
+  const complete = r && typeof r === 'object' &&
+    ['input', 'output', 'write5m', 'write1h', 'readDefault'].every(k => typeof r[k] === 'number' && isFinite(r[k]));
+  if (!complete) {
+    return 'Weighted by API price ratios (input 1, output 5, cache write 1.25 / 2 for 5 m / 1 h, cache read 0.1; ' +
+      '0.05 Opus 5.5, 0.025 Fable 5.1' + tail;
+  }
+  const others = (Array.isArray(w.readRatios) ? w.readRatios : [])
+    .filter(x => x && typeof x.model === 'string' && x.model && typeof x.read === 'number' && isFinite(x.read))
+    .map(x => tokRatio(x.read) + ' ' + x.model);
+  return 'Weighted by API price ratios (input ' + tokRatio(r.input) + ', output ' + tokRatio(r.output) +
+    ', cache write ' + tokRatio(r.write5m) + ' / ' + tokRatio(r.write1h) + ' for 5 m / 1 h, cache read ' +
+    tokRatio(r.readDefault) + (others.length ? '; ' + others.join(', ') : '') + tail;
 }
 
 // ── state ───────────────────────────────────────────────────────────────────
@@ -276,6 +315,7 @@ let tokMeasure = 'weighted';     // the chart's measure; the tables stay weighte
 let tokSort = 'weighted';
 let tokLimit = TOK_PAGE;
 let tokSelected = null;          // session id shown in "Context over time"
+let tokSessionRows = [];         // { id, tr } of the session rows now in the table
 // Render generations. A full load bumps all three; a header sort or Show more
 // bumps only the sessions one and a row click only the context one, so the
 // newest request for a section is the only one allowed to draw it.
@@ -290,6 +330,14 @@ let tokInFlight = false;
 let tokStale = false;
 let tokTooltipEl = null;
 let tokOffNotice = null;         // the "Token analytics is off" notice now showing, if any
+let tokOffNoteEl = null;         // the note line inside that notice, if it has one
+let tokOffBusy = 0;              // this window's own Enable / Try again / toolbar actions in flight
+let tokStartingEl = null;        // the "starting" line now showing, if any
+// Timers. Both are cleared by every redraw (tokClearTimers), and both check
+// that the tab is still showing before they do anything: nothing in this file
+// is told when the tab is left.
+let tokChangeTimer = null;       // the one trailing timer of the change-event floor
+let tokStartTimer = null;        // the wait before a starting store is asked again
 
 // ── DOM helpers ─────────────────────────────────────────────────────────────
 
@@ -368,11 +416,19 @@ function tokConfirm(message) {
   try { return typeof window.confirm === 'function' ? !!window.confirm(message) : false; } catch { return false; }
 }
 
+function tokClearTimers() {
+  if (tokChangeTimer !== null) { clearTimeout(tokChangeTimer); tokChangeTimer = null; }
+  if (tokStartTimer !== null) { clearTimeout(tokStartTimer); tokStartTimer = null; }
+}
+
 // ── skeleton ────────────────────────────────────────────────────────────────
 
 function tokBuildSkeleton(body) {
   tokClear(body);
   tokOffNotice = null;   // a Try again still in flight must not draw over this
+  tokOffNoteEl = null;
+  tokStartingEl = null;  // nor a starting try
+  tokClearTimers();
   const ui = {};
 
   const bar = tokEl('div', 'token-toolbar');
@@ -436,7 +492,7 @@ function tokBuildSkeleton(body) {
 
   ui.rebuild = tokEl('button', 'token-btn', 'Rebuild');
   ui.rebuild.type = 'button';
-  ui.rebuild.title = 'Throw away the token store and rescan every transcript';
+  ui.rebuild.title = 'Set the token store aside and rescan every transcript';
   ui.rebuild.addEventListener('click', tokRebuild);
   bar.appendChild(ui.rebuild);
 
@@ -512,24 +568,46 @@ function tokRenderScan(scan) {
   const scanning = s.phase === 'backfill' || s.phase === 'catchup';
   const done = Number(s.done) || 0, total = Number(s.total) || 0;
   tokUi.rebuild.disabled = scanning;
+  // The query worker could not start and main answers the queries itself: the
+  // only visible sign of it, and the reason the whole app feels slower.
+  const inline = s.queryMode === 'inline' ? ' · queries are running in the main process (slower)' : '';
   if (scanning) {
-    tokUi.status.textContent = 'Scanning transcripts… ' + tokNum(done) + ' / ' + tokNum(total);
+    tokUi.status.textContent = 'Scanning transcripts… ' + tokNum(done) + ' / ' + tokNum(total) + inline;
   } else {
     const at = s.lastScanMs ? ' · updated ' + tokClock(s.lastScanMs) : '';
-    tokUi.status.textContent = 'Scanned ' + tokNum(tokFileCount(s)) + ' files' + at;
+    tokUi.status.textContent = 'Scanned ' + tokNum(tokFileCount(s)) + ' files' + at + inline;
+  }
+  const notices = [];
+  // An open store with a reason: the scanner is not running (it died, never
+  // said hello, or could not start), so the totals below have stopped growing.
+  // Without this line the only hint is an ageing "updated HH:MM". The reason is
+  // main's text (it can carry a path): it is shown as text.
+  if (s.state === 'ok' && typeof s.reason === 'string' && s.reason.trim()) {
+    notices.push('Scanning is not running: ' + s.reason.trim().replace(/[.\s]+$/, '') + '. Totals may be out of date.');
   }
   // The bar and the "totals are partial" notice are for the first full scan
   // only: a catch-up touches a handful of files and the totals are already whole.
   if (s.phase === 'backfill') {
     tokUi.progress.style.display = '';
     tokUi.progressFill.style.width = (total > 0 ? Math.min(100, Math.max(1, (done / total) * 100)) : 1) + '%';
-    const want = 'Scanning transcripts (' + tokNum(done) + ' / ' + tokNum(total) + ' files). Totals are partial until the scan finishes.';
-    const have = tokUi.scanNotice.firstChild;
-    if (have) have.textContent = want; else tokNotice(tokUi.scanNotice, want);
+    notices.push('Scanning transcripts (' + tokNum(done) + ' / ' + tokNum(total) + ' files). Totals are partial until the scan finishes.');
   } else {
     tokUi.progress.style.display = 'none';
-    tokClear(tokUi.scanNotice);
   }
+  // Notices are updated in place, so a progress tick rewrites one text node
+  // instead of replacing the element.
+  const box = tokUi.scanNotice;
+  notices.forEach((want, i) => {
+    const have = box.children[i];
+    if (!have) {
+      const notice = tokEl('div', 'stats-refresh-error', want);
+      notice.setAttribute('role', 'status');
+      box.appendChild(notice);
+    } else if (have.textContent !== want) {
+      have.textContent = want;
+    }
+  });
+  while (box.children.length > notices.length) box.children[box.children.length - 1].remove();
 }
 
 // ── the load ────────────────────────────────────────────────────────────────
@@ -557,6 +635,8 @@ async function tokLoad(opts) {
 
   const gen = ++tokGen, sessGen = ++tokSessGen, ctxGen = ++tokCtxGen;
   tokLastQueryMs = Date.now();
+  // This load answers every change that was waiting for the floor.
+  tokClearTimers();
   tokInFlight = true;
   const ui = tokUi;
   if (!quiet) {
@@ -570,8 +650,16 @@ async function tokLoad(opts) {
   }
 
   const q = { from: range.from, to: range.to };
+  // `opened` tells the store that the tab was opened or that the user asked for
+  // this load (a range, Rebuild, Enable, Try again): it starts its "tab opened"
+  // catch-up walk only for those. Without the flag every refresh of an open tab
+  // looked like an opening and the whole projects tree was walked about once a
+  // minute. opts.quiet is the caller saying "nobody asked" (a change event, the
+  // stale reload); that is not the same as `quiet` above, because a reload from
+  // the off notice redraws everything and is still not an opening.
+  const summaryQ = opts.quiet ? q : { from: q.from, to: q.to, opened: true };
   const settled = await Promise.allSettled([
-    tokCall('getTokenStatsSummary', q),
+    tokCall('getTokenStatsSummary', summaryQ),
     tokCall('getTokenStatsModels', q),
     tokCall('getTokenStatsDaily', q),
     tokCall('getTokenStatsSessions', { from: q.from, to: q.to, sort: tokSort, limit: tokLimit }),
@@ -583,7 +671,10 @@ async function tokLoad(opts) {
 
   const out = settled.map(tokOutcome);
   const off = out.slice(0, 4).find(o => o.kind === 'disabled');
-  if (off) { tokRenderOff(body, off); return; }
+  if (off) {
+    if (off.starting) tokRenderStarting(body); else tokRenderOff(body, off);
+    return;
+  }
 
   const firstOk = out.slice(0, 4).find(o => o.kind === 'ok' && o.data.scan);
   tokRenderScan(firstOk ? firstOk.data.scan : null);
@@ -607,6 +698,9 @@ function tokRenderOff(body, outcome, note) {
   tokUi = null;
   tokScan = null;
   tokDaily = null;
+  tokStartingEl = null;
+  tokOffNoteEl = null;
+  tokClearTimers();
   tokHideTooltip();
   tokClear(body);
   const notice = tokEl('div', 'stats-refresh-error token-off');
@@ -619,9 +713,74 @@ function tokRenderOff(body, outcome, note) {
   if (action === 'enable') btn.addEventListener('click', tokEnable);
   else btn.addEventListener('click', () => tokRetry(body, notice, btn, outcome));
   notice.appendChild(btn);
-  if (note) notice.appendChild(tokEl('div', 'token-off-note', note));
   body.appendChild(notice);
   tokOffNotice = notice;
+  if (note) tokOffNote(note);
+}
+
+// The note line of the off notice now showing: what the last Enable or Try
+// again came back with. One line, replaced, never stacked. Returns false when
+// no off notice is showing.
+function tokOffNote(text) {
+  if (!tokOffNotice) return false;
+  if (tokOffNoteEl) { tokOffNoteEl.textContent = text; return true; }
+  tokOffNoteEl = tokEl('div', 'token-off-note', text);
+  tokOffNotice.appendChild(tokOffNoteEl);
+  return true;
+}
+
+// The store has not started yet (main runs its init a few seconds after
+// launch; tokOutcome's `starting`). An off notice with Try again would be
+// wrong twice: nothing is off, and the retry fails until init has run. So the
+// tab says it is starting and asks again by itself, a bounded number of times.
+function tokRenderStarting(body) {
+  tokUi = null;
+  tokScan = null;
+  tokDaily = null;
+  tokOffNotice = null;
+  tokOffNoteEl = null;
+  tokClearTimers();
+  tokHideTooltip();
+  tokSpinner(body, 'Token analytics is starting…');
+  const line = body.firstChild;
+  line.setAttribute('role', 'status');
+  tokStartingEl = line;
+  tokStartingWait(body, line, 0);
+}
+
+function tokStartingWait(body, line, tries) {
+  tokStartTimer = setTimeout(() => {
+    tokStartTimer = null;
+    // Redrawn meanwhile: that render owns the body. Left meanwhile: a tab that
+    // is not showing is not queried; coming back loads it afresh.
+    if (tokStartingEl !== line || !tokVisible()) return;
+    tokStartingTry(body, line, tries + 1);
+  }, TOK_STARTING_MS);
+}
+
+// One small question (the summary, not marked as an opening) instead of the
+// whole tab, so the line stays put between tries. Never throws.
+async function tokStartingTry(body, line, tries) {
+  try {
+    const range = tokRangeFor(tokRange, new Date(), tokCustomFrom, tokCustomTo);
+    const settled = (await Promise.allSettled([
+      tokCall('getTokenStatsSummary', range ? { from: range.from, to: range.to } : {}),
+    ]))[0];
+    if (tokStartingEl !== line) return;
+    const outcome = tokOutcome(settled);
+    if (outcome.kind === 'disabled' && outcome.starting) {
+      if (tries < TOK_STARTING_TRIES) tokStartingWait(body, line, tries);
+      // Still not there: the off notice, whose Try again and the store's next
+      // change event are the ways on from here.
+      else tokRenderOff(body, outcome);
+      return;
+    }
+    // Whatever it is now (running, switched off, failed, no handler), the full
+    // load draws it; this is the opening the user asked for, at last answered.
+    await loadTokenStats();
+  } catch (err) {
+    try { console.error('[token-stats] starting check failed', err); } catch {}
+  }
 }
 
 // Try again: ask main to open the store again (enableTokenStats re-runs its
@@ -632,7 +791,9 @@ async function tokRetry(body, notice, btn, outcome) {
   if (btn.disabled) return;
   btn.disabled = true;
   btn.textContent = 'Trying again…';
-  const settled = (await Promise.allSettled([tokCall('enableTokenStats')]))[0];
+  tokOffBusy++;
+  let settled;
+  try { settled = (await Promise.allSettled([tokCall('enableTokenStats')]))[0]; } finally { tokOffBusy--; }
   // The tab was redrawn while main was working (a sub-tab click, a change
   // event): that render is newer than this answer and owns the body now.
   if (tokOffNotice !== notice) return;
@@ -645,13 +806,22 @@ async function tokRetry(body, notice, btn, outcome) {
 }
 
 // A toolbar action's own failure is said in the status text, in the same
-// words the sections use.
-async function tokAction(name, after) {
-  const settled = (await Promise.allSettled([tokCall(name)]))[0];
+// words the sections use. `label` names the action for the off notice's note.
+async function tokAction(name, after, label) {
+  tokOffBusy++;
+  let settled;
+  try { settled = (await Promise.allSettled([tokCall(name)]))[0]; } finally { tokOffBusy--; }
   const outcome = tokOutcome(settled);
   if (outcome.kind === 'restart' || outcome.kind === 'error') {
-    if (tokUi) tokUi.status.textContent = outcome.text;
-    else { const body = tokBody(); if (body) tokNotice(body, outcome.text); }
+    if (tokUi) { tokUi.status.textContent = outcome.text; return; }
+    // No toolbar: the off notice was showing and this was its Enable. A bare
+    // notice in its place would be a dead end (no button, and nothing reloads
+    // the tab), so the store is asked what state it is in now: a failed open
+    // answers 'failure' and the notice comes back with Try again. What the
+    // action itself came back with goes under it.
+    await loadTokenStats();
+    const note = outcome.kind === 'error' ? (label || 'That') + ' failed: ' + outcome.reason + '.' : outcome.text;
+    if (!tokOffNote(note) && tokUi) tokUi.status.textContent = outcome.text;
     return;
   }
   if (after) after();
@@ -659,18 +829,29 @@ async function tokAction(name, after) {
 }
 
 function tokRebuild() {
-  if (!tokConfirm('Rebuild token analytics?\n\nThe token store is emptied and every transcript is scanned again. Transcripts are only read. Totals are partial until the scan finishes.')) return;
-  return tokAction('rescanTokenStats', () => { tokLimit = TOK_PAGE; });
+  // A rebuild counts only what is on disk now, so the kept history of deleted
+  // transcripts ("their history is kept", the footer) leaves the views. Jason:
+  // "Warn, and keep the old store aside": the store renames the old file
+  // instead of deleting it, and this text says both things before the click.
+  const missing = Number(tokScan && tokScan.filesMissing) || 0;
+  const gone = missing > 0
+    ? '\n\nThe history of ' + tokNum(missing) + (missing === 1 ? ' transcript file that is' : ' transcript files that are') +
+      ' no longer on disk will leave the views: a rebuild counts only the transcripts that are on disk now.'
+    : '';
+  if (!tokConfirm('Rebuild token analytics?\n\nA new token store is started and every transcript is scanned again. ' +
+    'Transcripts are only read. Totals are partial until the scan finishes.\n\n' +
+    'The old store is kept beside the new one as token-usage.db.before-rebuild-<time> (only the latest one is kept).' + gone)) return;
+  return tokAction('rescanTokenStats', () => { tokLimit = TOK_PAGE; }, 'Rebuild');
 }
 
 function tokDisable() {
   if (!tokConfirm('Turn token analytics off?\n\nScanning stops and the Tokens tab shows nothing until it is enabled again. What has been counted is kept. No restart is needed.')) return;
-  return tokAction('disableTokenStats');
+  return tokAction('disableTokenStats', null, 'Disable');
 }
 
 function tokEnable() {
   if (!tokConfirm('Turn token analytics on?\n\nSwitchboard starts reading transcripts again and catches up in the background.')) return;
-  return tokAction('enableTokenStats');
+  return tokAction('enableTokenStats', null, 'Enable');
 }
 
 // Registered ONCE, at script load: a preload listener cannot be removed, so
@@ -678,13 +859,42 @@ function tokEnable() {
 function tokOnChanged(info) {
   try {
     if (!info || typeof info !== 'object') return;
-    if (!tokVisible() || !tokUi) return;
-    tokRenderScan({ phase: info.phase, done: info.done, total: info.total });
-    const idle = info.phase === 'idle';
-    if (idle || Date.now() - tokLastQueryMs >= TOK_REQUERY_MS) loadTokenStats({ quiet: true });
+    // A tab that is not showing is not queried, and a refresh that was waiting
+    // for it is dropped: coming back loads the tab afresh.
+    if (!tokVisible()) { tokClearTimers(); return; }
+    if (tokUi) {
+      tokRenderScan({ phase: info.phase, done: info.done, total: info.total });
+    } else if (!tokOffNotice || tokOffBusy) {
+      // Nothing to refresh: the starting line has its own timer, and while this
+      // window's own Enable or Try again is in flight its answer redraws the tab.
+      return;
+    }
+    // With the off notice showing, the event is the only news that the store
+    // is back (its init finished, or it was enabled from another window).
+    tokRefreshSoon();
   } catch (err) {
     try { console.error('[token-stats] change event failed', err); } catch {}
   }
+}
+
+// One floor for every change event, whatever its phase: the store sends an
+// idle event after every applied chunk while sessions run, and each re-query is
+// four or five queries plus a rebuilt table (focus, tooltips and hover go with
+// it). Inside the floor ONE trailing timer is armed, so the last change is
+// still picked up; any load that starts meanwhile clears it (tokLoad), because
+// that load already holds the change.
+function tokRefreshSoon() {
+  const wait = Math.min(TOK_REQUERY_MS, TOK_REQUERY_MS - (Date.now() - tokLastQueryMs));
+  if (wait <= 0) { loadTokenStats({ quiet: true }); return; }
+  if (tokChangeTimer !== null) return;
+  tokChangeTimer = setTimeout(() => {
+    tokChangeTimer = null;
+    // The same conditions as the event itself, checked again now: the tab may
+    // have been left, or turned into the starting line, since the timer was set.
+    if (!tokVisible()) return;
+    if (!tokUi && (!tokOffNotice || tokOffBusy)) return;
+    loadTokenStats({ quiet: true });
+  }, wait);
 }
 
 // ── headline ────────────────────────────────────────────────────────────────
@@ -717,8 +927,7 @@ function tokRenderHeadline(container, outcome) {
 
   const w = data.weighted || {};
   const version = w.pricesVersion || (data.scan && data.scan.pricesVersion) || 'unknown date';
-  let tip = 'Weighted by API price ratios (input 1, output 5, cache write 1.25 / 2 for 5 m / 1 h, cache read 0.1; ' +
-    '0.05 Opus 5.5, 0.025 Fable 5.1) as of ' + version + '. Not a bill.';
+  let tip = tokRatioSentence(w, version);
   const unpriced = Array.isArray(w.unpricedModels) ? w.unpricedModels : [];
   // Dollars live in the tooltip only. With an unpriced model in range the sum
   // is a floor, and it says so.
@@ -943,6 +1152,7 @@ async function tokReloadSessions() {
 }
 
 function tokRenderSessions(container, outcome) {
+  tokSessionRows = [];
   const data = tokGuard(container, outcome);
   if (!data) return;
   const rows = Array.isArray(data.rows) ? data.rows : [];
@@ -981,6 +1191,7 @@ function tokRenderSessions(container, outcome) {
   const tbody = tokEl('tbody');
   for (const r of rows) {
     const tr = tokEl('tr', 'token-session-row' + (r.sessionId === tokSelected ? ' selected' : ''));
+    tokSessionRows.push({ id: r.sessionId, tr });
     tr.tabIndex = 0;
     const select = () => tokSelectSession(r.sessionId);
     tr.addEventListener('click', select);
@@ -1034,6 +1245,10 @@ async function tokSelectSession(sessionId) {
   if (!tokUi || !sessionId) return;
   const ui = tokUi;
   tokSelected = sessionId;
+  // The highlight moves with the click. The class is otherwise set only when
+  // the table is built, so until the next render the old row stayed lit while
+  // the chart showed another session.
+  for (const row of tokSessionRows) row.tr.classList.toggle('selected', row.id === sessionId);
   const ctxGen = ++tokCtxGen;
   tokSpinner(ui.context, 'Loading context history…');
   const settled = (await Promise.allSettled([tokCall('getTokenStatsContext', { sessionId })]))[0];
@@ -1091,8 +1306,14 @@ function tokRenderContext(container, outcome) {
   const sx = (t) => L + ((t - t0) / (t1 - t0)) * plotW;
   const sy = (v) => T + plotH - (Math.max(0, Math.min(v, yMax)) / yMax) * plotH;
 
+  // What the session holds, which is more than what is drawn when main
+  // down-sampled the series. A main process that sends no totalPoints leaves
+  // the drawn points as the only count there is.
+  const responses = typeof data.totalPoints === 'number' && isFinite(data.totalPoints) && data.totalPoints > points.length
+    ? data.totalPoints : points.length;
+
   const svg = tokSvg('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'token-ctx-svg', role: 'img' });
-  svg.setAttribute('aria-label', 'Context tokens over time: ' + points.length + ' responses, peak ' +
+  svg.setAttribute('aria-label', 'Context tokens over time: ' + responses + ' responses, peak ' +
     formatTokens(points.reduce((a, p) => Math.max(a, p.ctx), 0)));
 
   // Grid and axes: recessive, drawn first.
@@ -1125,10 +1346,14 @@ function tokRenderContext(container, outcome) {
   for (const c of compactions) {
     const x = sx(c.t);
     const g = tokSvg('g', { class: 'token-ctx-compaction' });
-    const text = formatTokens(c.pre) + ' → ' + formatTokens(c.post);
+    // A boundary that carried no count is stored as null, and isFinite(null) is
+    // true: it would be drawn as a drop to 0 and labelled "450K → 0". Without
+    // both sizes the compaction is a mark with no numbers.
+    const sized = typeof c.pre === 'number' && typeof c.post === 'number' && isFinite(c.pre) && isFinite(c.post);
+    const text = sized ? formatTokens(c.pre) + ' → ' + formatTokens(c.post) : 'size not recorded';
     g.appendChild(tokSvg('title', {}, 'Compaction' + (c.trigger ? ' (' + c.trigger + ')' : '') + ' at ' + tokDateTime(c.t) + ': ' + text));
     g.appendChild(tokSvg('line', { x1: x.toFixed(1), x2: x.toFixed(1), y1: T, y2: T + plotH, class: 'token-ctx-compaction-line' }));
-    if (isFinite(c.pre) && isFinite(c.post)) {
+    if (sized) {
       g.appendChild(tokSvg('line', { x1: x.toFixed(1), x2: x.toFixed(1), y1: sy(c.pre).toFixed(1), y2: sy(c.post).toFixed(1), class: 'token-ctx-compaction-drop' }));
       if (x - lastLabelX >= 84) {
         const right = x + 90 > W - R;
@@ -1188,7 +1413,11 @@ function tokRenderContext(container, outcome) {
     tip.appendChild(tokEl('div', 'token-tooltip-head', tokDateTime(p.t)));
     tip.appendChild(tokEl('div', '', 'Context ' + formatTokens(p.ctx) + ' (' + tokNum(p.ctx) + ')'));
     tip.appendChild(tokEl('div', '', 'Output ' + formatTokens(p.out) + (p.fin === 0 || p.fin === false ? ' (not finalised)' : '')));
-    if (data.model) tip.appendChild(tokEl('div', 'token-tooltip-dim', data.model));
+    // The point's own model: a session can switch models, and data.model is
+    // only the last response's. A main process that sends none per point
+    // leaves the reply's as the fallback.
+    const model = p.model || data.model;
+    if (model) tip.appendChild(tokEl('div', 'token-tooltip-dim', model));
     tip.style.display = '';
     const vw = typeof window !== 'undefined' && window.innerWidth ? window.innerWidth : 1200;
     tip.style.left = Math.max(8, Math.min(e.clientX + 14, vw - 240)) + 'px';
@@ -1197,8 +1426,8 @@ function tokRenderContext(container, outcome) {
   svg.addEventListener('mouseleave', hide);
   wrap.appendChild(svg);
 
-  const parts = [tokNum(points.length) + ' responses', tokNum(compactions.length) + ' compactions', tokNum(handoffs.length) + ' handoffs'];
-  if (data.downsampled) parts.push('down-sampled');
+  const parts = [tokNum(responses) + ' responses', tokNum(compactions.length) + ' compactions', tokNum(handoffs.length) + ' handoffs'];
+  if (data.downsampled) parts.push(responses > points.length ? 'down-sampled to ' + tokNum(points.length) + ' points' : 'down-sampled');
   wrap.appendChild(tokEl('div', 'token-caption', parts.join(' · ')));
   container.appendChild(wrap);
 }
@@ -1235,6 +1464,6 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     TOK_NEEDS_RESTART, TOK_ALL_FROM,
     formatTokens, tokNum, tokDayKey, tokParseDay, tokDayLabel, tokRangeFor, tokOutcome, tokOffAction, tokFileCount,
-    tokNearestIndex, tokStepPath, tokBucketDays, tokYTicks, tokXTicks, tokCounterValue,
+    tokNearestIndex, tokStepPath, tokBucketDays, tokYTicks, tokXTicks, tokCounterValue, tokUsd, tokRatioSentence,
   };
 }

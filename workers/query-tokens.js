@@ -8,15 +8,24 @@ const { parentPort, workerData, isMainThread } = require('worker_threads');
  *
  * One long-lived worker, `workerData = { dbPath, signal[, ctxDir, handoffsDir, busyTimeoutMs] }`.
  * It opens the store READ-ONLY (it never creates the file and never writes),
- * and requires ../token-usage-queries and ../token-prices itself, so both are
- * re-read at every spawn: a fix to a query takes effect with the Rebuild
- * button and no app restart.
+ * and requires ../token-usage-queries and ../token-prices itself, so THIS
+ * thread's copy of both is re-read at every spawn: the SQL and the arithmetic
+ * of a query are new after the next spawn of this worker (Disable then Enable
+ * on the Tokens tab, a worker that died, or Rebuild, which also empties the
+ * store) with no app restart.
+ * That is half of the queries module. The main process loads its own copy of
+ * ../token-usage-queries (token-usage.js: decorateResult and wireRequest on
+ * every answer, and every query when the fallback runs them inline) and of
+ * ../token-prices (scan.pricesVersion, and the inline fallback). Main's copies
+ * are loaded once, at the first Tokens query of the process, and change only
+ * with an app restart. A fix to a field both sides touch therefore runs new
+ * here and old there until the restart.
  *
  * Messages.
  *   worker -> main  { type: 'hello', ok: true }
  *   worker -> main  { type: 'hello', ok: false, error }      the store could not be opened
  *   main -> worker  { type: 'query', id, name, q, now }      now = the store's clock, for "today"
- *   worker -> main  { type: 'result', id, result, ms }       result: the queries module's answer, or { error }
+ *   worker -> main  { type: 'result', id, result, ms }       result: the queries module's answer, or { error[, code] }
  *   main -> worker  { type: 'close' }
  *   worker -> main  { type: 'closed' }
  *
@@ -178,6 +187,9 @@ function createResponder(opts) {
       result = answer(msg);
     } catch (err) {
       result = { error: 'query failed: ' + errText(err) };
+      // With its code, as the queries module's own guard does: the store reads
+      // it to tell a corrupt file (which it renames away) from any other failure.
+      if (err && typeof err.code === 'string' && err.code) result.code = err.code;
     }
     const sent = post({ type: 'result', id: msg.id, result, ms: Date.now() - started });
     // An answer that cannot be cloned must still be an answer.

@@ -9,7 +9,9 @@ const path = require('path');
  *
  * Every function is synchronous and returns the design section 4 shape WITHOUT
  * the `scan` field (token-usage.js adds it), or { error: 'bad request: ...' }.
- * Nothing here throws: a database failure comes back as { error: 'query failed: ...' }.
+ * Nothing here throws: a database failure comes back as { error: 'query failed: ...' },
+ * with the failure's `code` when it has one (the store reads it: a corrupt file
+ * is recovered wherever it shows itself).
  *
  * Two halves, because the queries run in a worker thread (workers/query-tokens.js)
  * and three lookups cannot cross a thread boundary:
@@ -22,6 +24,15 @@ const path = require('path');
  * decorateResult itself, so the worker path (query there, decorate in main) and
  * the inline path (both here) give the same answer by construction.
  * wireRequest(q) is the copy of a request that is safe to post to the worker.
+ *
+ * Who loads this file, and when an edit to it is in effect (two copies):
+ *  - the query worker requires it at each spawn, so createQueries and the SQL
+ *    are new after the worker's next spawn (Disable then Enable, a worker that
+ *    died, or Rebuild), with no app restart;
+ *  - the main process (token-usage.js) requires it lazily, at the first Tokens
+ *    query of the process, for decorateResult, wireRequest and the inline
+ *    fallback. That copy changes only with an app restart.
+ * Saving the file in the running checkout reloads the windows and neither copy.
  *
  * Rules this file keeps, and why:
  *  - It only reads. Every statement is a prepared SELECT over the `responses`
@@ -50,7 +61,8 @@ const path = require('path');
  * Fields beyond the design shape (additions only): `cache_write_5m`,
  * `cache_write_1h`, `responses` and `unfinalized` wherever a counter set is
  * returned; `weighted` on `byKind`; `weighted` (the summary block) and `priced`
- * on the models reply; counters and `slugs` on the daily `other`; `dir` on the
+ * on the models reply; `ratios` and `readRatios` in that weighted block (the
+ * ratios the figure was computed with, for the tab's tooltip); counters and `slugs` on the daily `other`; `dir` on the
  * sessions request; `model` on a context point; `contextWindowSource` and
  * `totalPoints` on the context reply.
  */
@@ -592,7 +604,13 @@ function createQueries(db, deps) {
         const res = fn(q);
         return decorates ? decorateResult(name, res, lookups) : res;
       } catch (err) {
-        return { error: 'query failed: ' + (err && err.message ? err.message : String(err)) };
+        const out = { error: 'query failed: ' + (err && err.message ? err.message : String(err)) };
+        // The code goes with the error: the store renames a corrupt file away
+        // and rebuilds it wherever the damage shows, and a page that only a
+        // query reads shows it here and nowhere else. The message alone does
+        // not say which failure it was.
+        if (err && typeof err.code === 'string' && err.code) out.code = err.code;
+        return out;
       }
     };
   }
@@ -653,6 +671,30 @@ function createQueries(db, deps) {
         return p.weightedTokens(row, w);
       },
       /**
+       * The ratios this table weighs with, for the tab to SAY how the figure
+       * was computed (it used to name them in a fixed sentence, which an edit
+       * to the price file overtook): the model-independent ones, taken as the
+       * weights of a model that has no row, and the cache-read ratio of every
+       * model in the answer whose ratio is not the default one.
+       */
+      ratios(perModel) {
+        const base = p.weightsFor('', table) || {};
+        const ratios = {
+          input: num(base.input),
+          output: num(base.output),
+          write5m: num(base.write5m),
+          write1h: num(base.write1h),
+          readDefault: num(base.read),
+        };
+        const readRatios = [];
+        for (const [key, m] of perModel) {
+          const read = m.w ? m.w.read : null;
+          if (typeof read === 'number' && Number.isFinite(read) && read !== ratios.readDefault) readRatios.push({ model: key, read });
+        }
+        readRatios.sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
+        return { ratios, readRatios };
+      },
+      /**
        * USD over per-model weighted sums. Unpriced models add nothing and are
        * named, so the figure is a lower bound ("≥") when the list is not empty.
        * null when there is usage and not one model has a price: "≥ $0" says
@@ -702,6 +744,7 @@ function createQueries(db, deps) {
       m.weighted = m.acc.weighted;
     }
     const money = pr.usd(perModel);
+    const said = pr.ratios(perModel);
     return {
       totals,
       byKind,
@@ -712,6 +755,8 @@ function createQueries(db, deps) {
         usd: money.usd,
         unpricedModels: money.unpricedModels,
         pricesVersion: pr.version,
+        ratios: said.ratios,
+        readRatios: said.readRatios,
       },
     };
   }

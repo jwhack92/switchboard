@@ -311,6 +311,16 @@ async function waitFor(what, fn, ms) {
   }
 }
 
+// A walk has ended AND the secondary indexes are there. They are built one per
+// timer turn after the walk's `done`, so a snapshot taken the moment the phase
+// is idle would count however many happened to exist.
+function walkSettled(t) {
+  const s = t.status();
+  if (!s.backfillDone || s.phase !== 'idle') return null;
+  const row = t._handle().prepare("SELECT value FROM meta WHERE key = 'indexes_built'").get();
+  return row && row.value === '1' ? s : null;
+}
+
 function assertInside(file, dir) {
   const f = path.resolve(file).toLowerCase();
   assert.ok(f.startsWith(path.resolve(dir).toLowerCase() + path.sep), 'the store opened ' + file + ', outside ' + dir);
@@ -433,12 +443,13 @@ async function scenarioPipeline() {
   facts.range = range;
 
   // The Tokens tab being opened starts the first walk without waiting for the
-  // 10 s deferred start (it runs when the worker has said hello).
-  const asked = t.summary(range);
+  // 10 s deferred start (it runs when the worker has said hello). The tab says
+  // that it is an opening (`opened: true`); its quiet refreshes do not walk.
+  const asked = t.summary({ from: range.from, to: range.to, opened: true });
   assert.equal(typeof asked.then, 'function', 'a query returns a Promise');
   facts.firstSummary = await asked;
   facts.walksHeld = releaseWalk();
-  await waitFor('the backfill', () => { const s = t.status(); return s.backfillDone && s.phase === 'idle'; });
+  await waitFor('the backfill', () => walkSettled(t));
 
   // All eight asked at once, as the Tokens tab does, then awaited.
   const queries = async () => {
@@ -508,7 +519,7 @@ async function scenarioPipeline() {
   t._handle().exec('CREATE TABLE e2e_marker (x)');
   facts.rebuild = { rescan: t.rescan() };
   facts.rebuild.markerGone = t._handle().prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'e2e_marker'").get().n === 0;
-  await waitFor('the rebuild', () => { const s = t.status(); return s.backfillDone && s.phase === 'idle'; });
+  await waitFor('the rebuild', () => walkSettled(t));
   assertInside(t._handle().name, dirs.dataDir);
   facts.rebuild.chunks = takeChunks();
   facts.rebuild.snap = snapshot(t._handle());
@@ -570,10 +581,11 @@ async function scenarioWalk() {
   assert.deepEqual(facts.init, { ok: true, state: 'ok' });
   assertInside(t._handle().name, dirs.dataDir);
   const range = { from: t.localDay(base - 2 * 86400000), to: t.localDay(Date.now() + 86400000) };
-  const idle = () => { const s = t.status(); return s.backfillDone && s.phase === 'idle' ? s : null; };
+  const idle = () => walkSettled(t);
   const fileRow = (rel) => t._handle().prepare('SELECT * FROM files WHERE rel_path = ?').get(rel);
+  const opening = { from: range.from, to: range.to, opened: true };    // what the tab sends when it is opened
 
-  await t.summary(range);
+  await t.summary(opening);
   const first = await waitFor('the backfill', idle);
   facts.before = snapshot(t._handle());
 
@@ -586,7 +598,7 @@ async function scenarioWalk() {
   // The walk is requested in the same turn as the call; the answer (and its
   // scan object) arrives later, from the query worker, when a walk this small
   // may already be over.
-  const opened = t.summary(range);
+  const opened = t.summary(opening);
   facts.summaryThatWalks = t.status().phase;
   facts.summaryAnswer = await opened;
   const second = await waitFor('the catch-up walk', () => { const s = idle(); return s && s.lastCatchupMs !== first.lastCatchupMs ? s : null; });

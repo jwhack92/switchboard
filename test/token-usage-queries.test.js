@@ -838,7 +838,8 @@ function runParent() {
     assert.deepEqual(e.summary.totals, { input: 0, output: 0, cache_write: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, responses: 0, unfinalized: 0 });
     assert.equal(e.summary.byKind.main.input, 0);
     assert.equal(e.summary.byKind.workflow.weighted, 0);
-    assert.deepEqual(e.summary.weighted, { tokens: 0, usd: 0, unpricedModels: [], pricesVersion: '2026-09-25' });
+    assert.deepEqual(e.summary.weighted, { tokens: 0, usd: 0, unpricedModels: [], pricesVersion: '2026-09-25',
+      ratios: { input: 1, output: 5, write5m: 1.25, write1h: 2, readDefault: 0.1 }, readRatios: [] });
     assert.deepEqual(e.models.models, []);
     assert.deepEqual(e.models.byType, { input: 0, output: 0, cache_write: 0, cache_read: 0 });
     assert.equal(e.daily.days.length, 30);
@@ -954,6 +955,55 @@ function runParent() {
     const b = q.summary({ from: '2026-10-01', to: '2026-10-03' });
     assert.equal(b.weighted.tokens, 20, 'a price edit shows at the next query');
     assert.equal(b.weighted.pricesVersion, 'v2');
+  });
+
+  test('weighted.ratios and weighted.readRatios come from the price table in use', () => {
+    // The Tokens tab's tooltip says how the weighted figure was computed. It
+    // named the ratios in a fixed sentence that the price file had already
+    // overtaken (review-renderer R9); the reply now carries them.
+    const { createQueries } = require('../token-usage-queries');
+    const real = require('../token-prices');
+    const base = { kind: 'main', input: 10, output: 1, cache_write: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 100, thinking: null, responses: 1, unfinalized: 0 };
+    const rows = ['claude-fable-5-1', 'claude-opus-5-5', 'claude-opus-5-5-20260101', 'claude-sonnet-5', 'claude-free-read-1', 'mystery-model-9']
+      .map((model) => ({ ...base, model }));
+    const db = { prepare: () => ({ all: () => rows }) };
+    // A table passed in, not the file beside the module.
+    let table = { version: 't1', models: {
+      'claude-fable-5-1': { baseUsd: 10, read: 0.025 },
+      'claude-opus-5-5': { baseUsd: 4, read: 0.05 },
+      'claude-sonnet-5': { baseUsd: 2, read: 0.1 },         // the default: not listed
+      'claude-free-read-1': { baseUsd: 1, read: 0 },        // 0 is a ratio like any other
+      'claude-not-in-range': { baseUsd: 1, read: 0.5 },     // no response in the range: not listed
+    } };
+    const prices = { ...real, loadPriceTable: () => table };
+    const q = createQueries(db, { prices, now: () => Date.parse(NOW_ISO) });
+    const range = { from: '2026-10-01', to: '2026-10-03' };
+
+    const a = q.summary(range);
+    assert.equal(a.weighted.pricesVersion, 't1');
+    assert.deepEqual(a.weighted.ratios, { input: 1, output: 5, write5m: 1.25, write1h: 2, readDefault: 0.1 });
+    assert.deepEqual(a.weighted.readRatios, [
+      { model: 'claude-fable-5-1', read: 0.025 },
+      { model: 'claude-free-read-1', read: 0 },
+      { model: 'claude-opus-5-5', read: 0.05 },             // the alias and the dated id are one model
+    ], 'the models in the range whose read ratio is not the default, by name');
+    // The same numbers the weighted total was computed with.
+    const expected = 6 * (10 + 5) + 100 * (0.025 + 0.05 + 0.05 + 0.1 + 0 + 0.1);
+    assert.equal(a.weighted.tokens, Math.round(expected));
+    assert.deepEqual(q.models(range).weighted, a.weighted, 'the models reply carries the same block');
+
+    // An edit to the table shows at the next query, in the sentence as in the numbers.
+    table = { version: 't2', models: { 'claude-opus-5-5': { baseUsd: 4, read: 0.2 } } };
+    const b = q.summary(range);
+    assert.equal(b.weighted.pricesVersion, 't2');
+    assert.deepEqual(b.weighted.readRatios, [{ model: 'claude-opus-5-5', read: 0.2 }]);
+    assert.deepEqual(b.weighted.ratios, a.weighted.ratios);
+
+    // A missing price file: the model-independent ratios, nothing to list.
+    table = real.loadPriceTable(path.join(os.tmpdir(), 'no-such-token-prices-' + process.pid + '.json'));
+    const c = q.summary(range);
+    assert.equal(c.weighted.pricesVersion, 'unavailable');
+    assert.deepEqual([c.weighted.ratios, c.weighted.readRatios], [a.weighted.ratios, []]);
   });
 
   // --- the two ends of the thread boundary (the queries run in a worker) ---

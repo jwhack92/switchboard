@@ -273,7 +273,8 @@ const SCENARIOS = {
     t.noteChanged(a);
     clock.advance(3000);
     assert.equal(w.posted.length, 0, 'nothing is posted before the worker has said hello');
-    clock.advance(60000);
+    // 28 s in all: a worker with no hello after 30 s is replaced (scenario scannerNotRunning).
+    clock.advance(20000);
     assert.equal(w.posted.length, 0);
     H.hello(w);
     // hello releases the deferred walk (its 10 s have passed) and re-arms the flush.
@@ -338,26 +339,33 @@ const SCENARIOS = {
     assert.equal(walks().length, 3);
     H.done(w);
 
-    // Tokens tab opened (summary): a walk only when the last one is older than 60 s.
+    // Tokens tab opened (a summary request that says so with opened: true): a
+    // walk only when the last one is older than 60 s.
     clock.advance(60000);
-    assert.equal((await t.summary({})).name, 'summary');
+    assert.equal((await t.summary({ opened: true })).name, 'summary');
     assert.equal(walks().length, 3, 'exactly 60 s old: not yet');
     // The query worker is asked for beside the scan worker, never beside this file.
     assert.deepEqual(H.queryWorkerPaths, [path.join('C:/app/workers', 'query-tokens.js')]);
     assert.equal(t.status().queryMode, 'inline');
     clock.advance(1);
-    const asked = t.summary({});
+    // The tab's quiet refreshes carry no flag (review V1: taken for openings,
+    // they walked the tree about once a minute while a session was writing).
+    for (const q of [{}, undefined, null, { from: '2026-10-01' }, { opened: false }, { opened: 1 }, { opened: 'true' }, 'opened', 42]) {
+      assert.equal((await t.summary(q)).name, 'summary');
+    }
+    assert.equal(walks().length, 3, 'a refresh is not an opening: only opened === true walks');
+    const asked = t.summary({ opened: true });
     assert.equal(walks().length, 4, 'the walk is requested in the same turn as the call, not when the answer arrives');
     const s = await asked;
     assert.equal(s.scan.phase, 'catchup');
     assert.equal(s.scan.queryMode, 'inline');
-    await t.summary({});
-    await t.models({});
+    await t.summary({ opened: true });
+    await t.models({ opened: true });
     assert.equal(walks().length, 4, 'not while one is running, and only from summary');
     H.done(w);
-    await t.summary({});
+    await t.summary({ opened: true });
     assert.equal(walks().length, 4, 'and not within 60 s of the last one');
-    for (const name of ['models', 'daily', 'sessions', 'context']) { clock.advance(61000); await t[name]({}); }
+    for (const name of ['models', 'daily', 'sessions', 'context']) { clock.advance(61000); await t[name]({ opened: true }); }
     assert.equal(walks().length, 4, 'the other queries never trigger a walk');
     assert.equal(H.queryWorkerPaths.length, 1, 'a query worker that could not start is not tried again per query');
 
@@ -366,8 +374,11 @@ const SCENARIOS = {
     const running = walks().length;
     assert.ok(running >= 5);
     assert.equal(workers.made.length, 1);
-    clock.advance(1200000);
+    clock.advance(300000);                      // past the next tick
     assert.equal(w.terminated, true, 'the silent worker is terminated');
+    // Checked 5 s later and no further: the replacement is a stub that never
+    // says hello, and it would itself be replaced after 30 s.
+    clock.advance(5000);
     assert.equal(workers.made.length, 2, 'and replaced');
     assert.equal(walks().length, running, 'no second walk was stacked on the silent one');
   },
@@ -426,8 +437,10 @@ const SCENARIOS = {
     assert.equal(t.noteChanged(a).queued, true);
     assert.equal(ctx.logs.filter((l) => l.includes('scanner stopped')).length, 1, 'logged once');
 
-    // Once the hour has moved on, the 10-minute tick starts it again.
-    clock.advance(1800000 + 240000);
+    // Once the hour has moved on, the 10-minute tick starts it again: the tick
+    // at 60 minutes, then the 120 s backoff. Stopped exactly there: the hello
+    // follows at once, as a worker without one is replaced after 30 s.
+    clock.advance(1800000 - 156000 + 120000);
     assert.equal(made(), 5);
     H.hello(workers.last);
     assert.equal(t.status().reason, null);
@@ -478,6 +491,116 @@ const SCENARIOS = {
     assert.equal(r.ok, true, 'the chunk is stored even though the ack could not be posted');
   },
 
+  scannerNotRunning(H) {
+    // A scanner that is not running must be visible (review S1, V3, C3): the
+    // store is fine, so scan.state stays 'ok', and scan.reason says why nothing
+    // is being scanned. It is null again as soon as a worker says hello.
+    const { t } = H;
+    const { workers, clock, ctx } = H.start({ noHello: true });
+    const made = () => workers.made.length;
+    const reason = () => t.status().reason;
+    const a = H.rel(SID);
+    H.touch(a);
+
+    // 1. A worker that starts and never says hello: replaced after 30 s.
+    const silent = workers.last;
+    assert.equal(reason(), null, 'starting is not a failure');
+    clock.advance(29999);
+    assert.deepEqual([silent.terminated, reason(), made()], [false, null, 1]);
+    clock.advance(1);
+    assert.equal(silent.terminated, true, 'no hello in 30 s: the worker is given up');
+    assert.equal(t.status().state, 'ok');
+    assert.match(reason(), /no hello within 30 s/);
+    assert.ok(ctx.logs.some((l) => l.startsWith('warn: [token-usage] scanner worker stopped (no hello within 30 s)')), ctx.logs.join('\n'));
+    clock.advance(4999);
+    assert.equal(made(), 1);
+    clock.advance(1);
+    assert.equal(made(), 2, 'respawned with the usual backoff');
+    assert.match(reason(), /no hello within 30 s/, 'still not running until the new one says hello');
+    H.hello(silent);                                    // a late hello from the one that was given up
+    assert.match(reason(), /no hello/, 'is ignored');
+    H.hello(workers.last);
+    assert.equal(reason(), null, 'hello clears it');
+    assert.equal(workers.last.of('walk').length, 1, 'and the walk that was waiting is requested');
+    const timers = clock.count();
+    clock.advance(60000);
+    assert.equal(made(), 2, 'a worker that said hello is not replaced by the hello timer');
+    assert.ok(clock.count() <= timers);
+    H.done(workers.last, 'backfill');
+
+    // 2. The first death says so at once, not only after three respawns.
+    workers.last.emit('exit', 1);
+    assert.equal(t.status().state, 'ok');
+    assert.match(reason(), /scanner worker stopped \(exit code 1\)/);
+    assert.equal((t.status().reason || '').length > 0, true);
+    clock.advance(30000);                               // second respawn inside the hour: 30 s
+    assert.equal(made(), 3);
+    assert.match(reason(), /exit code 1/);
+    H.hello(workers.last);
+    assert.equal(reason(), null);
+    H.done(workers.last);
+
+    // 3. A Rebuild whose new worker stays silent is not left latched.
+    assert.deepEqual(t.rescan(), { ok: true });
+    assert.equal(made(), 4);
+    assert.deepEqual(t.rescan(), { error: 'rescan already running' });
+    clock.advance(30000);
+    assert.equal(workers.last.terminated, true);
+    assert.match(reason(), /no hello within 30 s/);
+    assert.deepEqual(t.rescan(), { ok: true }, 'Rebuild can be asked again');
+    assert.equal(made(), 5);
+    H.hello(workers.last);
+    assert.equal(reason(), null);
+    assert.equal(workers.last.of('walk').pop().mode, 'backfill');
+    H.done(workers.last, 'backfill');
+    assert.deepEqual(t.rescan(), { ok: true }, 'and again once the backfill is done');
+    H.hello(workers.last);
+    H.done(workers.last, 'backfill');
+    assert.equal(made(), 6);
+  },
+
+  scannerSilent(H) {
+    // A worker that has been posted a request (a scan here, no walk running)
+    // and has sent nothing for 10 minutes is treated as gone at the catch-up
+    // tick. One that answers is left alone.
+    const { t } = H;
+    const { workers, clock } = H.start();
+    const w = workers.last;
+    const a = H.rel(SID);
+    H.touch(a);
+    clock.advance(10000);
+    H.done(w, 'backfill');
+
+    // Healthy: the scan is answered, ten minutes pass, nothing happens to it.
+    t.noteChanged(a);
+    clock.advance(3000);
+    assert.equal(w.of('scan').length, 1);
+    w.emit('message', H.chunk(a, ['m1']));
+    clock.advance(600000 - 13000);                      // the first tick
+    assert.equal(w.of('walk').length, 2);
+    H.done(w);                                          // answered in the same instant
+    assert.deepEqual([w.terminated, workers.made.length, t.status().reason], [false, 1, null]);
+
+    // Stuck: a scan is posted and nothing ever comes back. No walk is running.
+    t.noteChanged(a);
+    assert.equal(t.flush().scanned, 1);
+    assert.equal(w.of('scan').length, 2);
+    assert.equal(t.status().phase, 'idle');
+    clock.advance(599999);
+    assert.deepEqual([w.terminated, t.status().reason], [false, null]);
+    const walksBefore = w.of('walk').length;
+    clock.advance(1);                                   // the next tick: 10 minutes of silence since the post
+    assert.equal(w.terminated, true, 'the silent worker is given up');
+    assert.equal(w.of('walk').length, walksBefore, 'and no walk is stacked on it');
+    assert.equal(t.status().state, 'ok');
+    assert.match(t.status().reason, /no message for 10 minutes/);
+    clock.advance(5000);
+    assert.equal(workers.made.length, 2);
+    H.hello(workers.last);
+    assert.equal(t.status().reason, null);
+    assert.equal(workers.last.of('walk').length, 1, 'what the dead worker was asked is picked up by a walk');
+  },
+
   workerMessages(H) {
     const { t } = H;
     const { workers, clock } = H.start();
@@ -515,6 +638,15 @@ const SCENARIOS = {
     w.emit('message', { type: 'done', gen: g, mode: 'backfill', seen: [a], missing: [] });
     assert.ok(H.meta('backfill_done'));
     assert.equal(t.status().phase, 'idle');
+
+    // A chunk refused for its path is answered too (dropped): the worker waits
+    // for one ack per chunk and would otherwise wait for ever.
+    const acks = w.of('ack').length;
+    const outside = '../outside/' + SID + '.jsonl';
+    assert.doesNotThrow(() => w.emit('message', H.chunk(outside, ['z1'])));
+    assert.deepEqual(w.of('ack').slice(acks), [{ type: 'ack', gen: g, rel_path: outside, seq: 0, dropped: true }]);
+    assert.equal(H.n('responses'), 3);
+    assert.equal(H.n('files'), 1);
 
     // Garbage on the channel never throws and never disables the store.
     for (const m of [null, undefined, 'x', 42, [], {}, { type: 'nope', gen: g }, { type: 'chunk' }, { type: 'chunk', gen: g },
@@ -612,6 +744,8 @@ function parentMain() {
     catchup: 'startup walk on the deferred start, catch-up every 10 minutes, and from summary() after 60 s',
     respawnBackoff: 'worker exit: respawn after 5 s, 30 s, 120 s, at most 3 per hour; shutdown does not respawn',
     spawnFails: 'a worker that cannot start or cannot be posted to never throws into the caller',
+    scannerNotRunning: 'a scanner that is not running shows in scan.reason: no hello in 30 s, the first death; a Rebuild is not left latched',
+    scannerSilent: 'a worker posted a scan that sends nothing for 10 minutes is given up at the catch-up tick; one that answers is not',
     workerMessages: 'worker messages: chunks are acked after commit; a stale-gen chunk, progress or done is dropped',
     broadcast: 'token-stats-changed is sent at most once per second',
   };

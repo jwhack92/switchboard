@@ -394,6 +394,57 @@ test('done.missing lists only known paths that are not on disk', async () => {
     [mainRel(S2), subRel(S2, 'gone'), `gone-slug/${S3}.jsonl`, mainRel(S3)].sort());
 });
 
+test('a path the store has already marked missing is not reported, and not stat\'ed, again', async () => {
+  const dir = projectsDir();
+  place(dir, mainRel(S1), usageLines('m1', S1, 1));
+  const stats = [];
+  const io = {
+    readdirSync: (p, o) => fs.readdirSync(p, o),
+    statSync(p) { stats.push(p); return fs.statSync(p); },
+  };
+  // The store sends its mark with the row (and size -1, as for any row it
+  // wants looked at again if the file is there).
+  const marked = { rel_path: mainRel(S2), size: -1, mtime_ms: 1, head_hash: 'v1:x', indexed_bytes: 10, tail_hash: 'y', missing: true };
+  const newlyGone = { rel_path: mainRel(S3), size: 10, mtime_ms: 1, head_hash: 'v1:x', indexed_bytes: 10, tail_hash: 'y' };
+  for (let walk = 0; walk < 2; walk++) {
+    stats.length = 0;
+    const t = inThread(dir, { fs: io });
+    t.scanner.handle({ type: 'walk', gen: 1, mode: 'catchup', known: [marked, newlyGone] });
+    const done = await t.finished;
+    assert.deepStrictEqual(done.missing, [mainRel(S3)], 'only the one the store does not know about yet');
+    assert.ok(!stats.includes(under(dir, mainRel(S2))), 'the marked path costs no stat');
+    assert.ok(stats.includes(under(dir, mainRel(S3))));
+  }
+});
+
+test('a marked file that is back on disk is scanned, even with the same size and mtime as its row', async () => {
+  const dir = projectsDir();
+  const abs = place(dir, mainRel(S1), PAD + usageLines('m1', S1, 2));
+  place(dir, mainRel(S2), PAD + usageLines('m2', S2, 2));
+  const rowOf = (rel) => scanTranscript(under(dir, rel), null, dir).fileRow;
+  const back = rowOf(mainRel(S1));
+  const untouched = rowOf(mainRel(S2));
+  assert.strictEqual(back.size, fs.statSync(abs).size);
+
+  // Control: with the stored size and no mark, the catch-up shortcut skips both.
+  let t = inThread(dir);
+  t.scanner.handle({ type: 'walk', gen: 1, mode: 'catchup', known: [back, untouched] });
+  await t.finished;
+  assert.deepStrictEqual(t.posted.filter(m => m.type === 'chunk'), []);
+
+  // Marked missing: the store sends size -1, which never equals a real size.
+  t = inThread(dir);
+  t.scanner.handle({ type: 'walk', gen: 1, mode: 'catchup', known: [{ ...back, size: -1, missing: true }, untouched] });
+  const done = await t.finished;
+  const chunks = t.posted.filter(m => m.type === 'chunk');
+  assert.deepStrictEqual(chunks.map(c => c.rel_path), [mainRel(S1)], 'the file that came back is posted; the store clears its mark on that chunk');
+  assert.strictEqual(chunks[0].fullRescan, false, 'unchanged bytes: it resumes, nothing is counted twice');
+  assert.deepStrictEqual(chunks[0].candidates, []);
+  assert.strictEqual(chunks[0].last, true);
+  assert.deepStrictEqual(done.missing, []);
+  assert.ok(done.seen.includes(mainRel(S1)));
+});
+
 test('EACCES and EBUSY never count as gone; a file that cannot be stat\'ed is still seen', async () => {
   const dir = projectsDir();
   place(dir, mainRel(S1), usageLines('m1', S1, 1));

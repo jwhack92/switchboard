@@ -17,11 +17,17 @@
 //   - the five queries return a Promise that always resolves, to the answer or
 //     to { error, scan }; it never rejects.
 // The store is derived data: a corrupt file is renamed away and rebuilt, a
-// schema or parser change deletes the file and rebuilds. It never migrates and
-// never refuses to start.
+// schema or parser change (or the Rebuild button) sets the file aside as
+// token-usage.db.before-rebuild-<ms> and rebuilds. It never migrates and never
+// refuses to start.
 //
 // It does not require electron, the parser, or (at load time) the queries
 // module: log, broadcast, the worker and the clock arrive through init(ctx).
+// The queries module and the price module ARE loaded by this process, lazily,
+// at the first Tokens query (decorateResult, wireRequest, the inline fallback,
+// scan.pricesVersion), and that copy is then as frozen as this file: an edit
+// to either reaches the main process only with an app restart. The query
+// worker loads its own copy of both at each spawn (see its header).
 
 const fs = require('fs');
 const os = require('os');
@@ -31,6 +37,7 @@ const SCHEMA_VERSION = 1;
 
 const DB_FILE = 'token-usage.db';
 const OFF_FILE = 'token-usage.off';
+const KEPT_MARK = '.before-rebuild-';   // token-usage.db.before-rebuild-<epoch ms>: the store a rebuild replaced
 
 const QUIET_MS = 3000;                  // flush after 3 s without a new event ...
 const MAX_WAIT_MS = 10000;              // ... or 10 s after the first pending event
@@ -44,6 +51,7 @@ const RESPAWN_WINDOW_MS = 60 * 60 * 1000;
 const RESPAWN_MAX = 3;
 const RESPAWN_DELAYS_MS = [5000, 30000, 120000];
 const WORKER_SILENT_MS = 10 * 60 * 1000;
+const SCAN_HELLO_MS = 30000;            // no hello by then: the scanner did not start, it is replaced
 const CHANGED_SESSIONS_MAX = 500;
 const KINDS = new Set(['main', 'subagent', 'workflow']);
 const OFF_REASON = 'disabled by ' + OFF_FILE;
@@ -125,16 +133,21 @@ CREATE TABLE IF NOT EXISTS compactions (
 `;
 
 // Created only after the first backfill: a bulk load without seven secondary
-// indexes is cheaper (design 2.3).
-const INDEXES_SQL = `
-CREATE INDEX IF NOT EXISTS idx_resp_session_ts ON responses (session_id, ts_ms);
-CREATE INDEX IF NOT EXISTS idx_resp_day_slug   ON responses (local_day, slug);
-CREATE INDEX IF NOT EXISTS idx_resp_ts         ON responses (ts_ms);
-CREATE INDEX IF NOT EXISTS idx_resp_model      ON responses (model);
-CREATE INDEX IF NOT EXISTS idx_resp_file       ON responses (file_id);
-CREATE INDEX IF NOT EXISTS idx_sight_file      ON sightings (file_id);
-CREATE INDEX IF NOT EXISTS idx_comp_session    ON compactions (session_id, ts_ms);
-`;
+// indexes is cheaper (design 2.3). One statement each, because after a backfill
+// they are built one per timer turn (startIndexBuild): all seven in one call
+// held the main thread for 1.1-1.4 s on the real-size store. The two the
+// cascade's statements need come first, so a full rescan stops scanning the
+// whole table as early as possible.
+const INDEX_STATEMENTS = [
+  'CREATE INDEX IF NOT EXISTS idx_resp_file       ON responses (file_id)',
+  'CREATE INDEX IF NOT EXISTS idx_sight_file      ON sightings (file_id)',
+  'CREATE INDEX IF NOT EXISTS idx_resp_session_ts ON responses (session_id, ts_ms)',
+  'CREATE INDEX IF NOT EXISTS idx_resp_day_slug   ON responses (local_day, slug)',
+  'CREATE INDEX IF NOT EXISTS idx_resp_ts         ON responses (ts_ms)',
+  'CREATE INDEX IF NOT EXISTS idx_resp_model      ON responses (model)',
+  'CREATE INDEX IF NOT EXISTS idx_comp_session    ON compactions (session_id, ts_ms)',
+];
+const INDEXES_SQL = INDEX_STATEMENTS.join(';\n') + ';';
 
 const DROP_SQL = `
 DROP TABLE IF EXISTS responses;
@@ -244,6 +257,7 @@ let worker = null;
 let workerReady = false;      // hello seen
 let parseVersion = null;
 let lastWorkerMsgMs = 0;
+let unansweredSinceMs = null; // when the oldest walk or scan was posted that no worker message has followed
 let respawnTimes = [];
 let walk = null;              // { mode, startedMs } while a walk is running
 let walkWanted = false;
@@ -268,6 +282,8 @@ const waiting = new Map();    // id -> { id, name, q, resolve, timer, sentTo }
 const pending = new Set();          // rel paths waiting for the next flush
 const cascadePending = new Set();   // the subset queued by the 3.3 cascade
 const cycleRescanned = new Set();   // file ids fully rescanned in this cascade cycle
+const cycleExtraReset = new Set();  // file ids that have had their one extra reset in this cycle
+const cycleQueuedBy = new Map();    // rel_path -> Set of the file ids whose full rescan queued it in this cycle
 const passes = new Map();           // rel_path -> { next, fileId, fullRescan }
 const changedSessions = new Set();
 const seenLogs = new Set();
@@ -278,8 +294,10 @@ let maxTimer = null;
 let deferredTimer = null;
 let catchupTimer = null;
 let respawnTimer = null;
+let helloTimer = null;        // armed at every scanner spawn, cancelled by its hello
 let broadcastTimer = null;
 let tzTimer = null;
+let indexTimer = null;        // the chain that builds the secondary indexes, one per timer turn
 let lastBroadcastMs = -Infinity;
 
 // ------------------------------------------------------- guards and logging ----
@@ -305,9 +323,13 @@ function logOnce(level, msg) {
   logAt(level, msg);
 }
 
+function isCorruptCode(code) {
+  return typeof code === 'string'
+    && (code.startsWith('SQLITE_CORRUPT') || code.startsWith('SQLITE_NOTADB') || code.startsWith('SQLITE_IOERR'));
+}
+
 function isCorrupt(err) {
-  const code = err && typeof err.code === 'string' ? err.code : '';
-  return code.startsWith('SQLITE_CORRUPT') || code.startsWith('SQLITE_NOTADB') || code.startsWith('SQLITE_IOERR');
+  return isCorruptCode(err ? err.code : null);
 }
 
 function unavailable() {
@@ -458,7 +480,7 @@ function prepareAll() {
   S.delSightings = db.prepare('DELETE FROM sightings WHERE file_id = ?');
   S.delCompactions = db.prepare('DELETE FROM compactions WHERE file_id = ?');
   S.resetFile = db.prepare('UPDATE files SET indexed_bytes = 0, head_hash = NULL, tail_hash = NULL WHERE id = ?');
-  S.known = db.prepare('SELECT rel_path, size, mtime_ms, head_hash, indexed_bytes, tail_hash, scan_error FROM files');
+  S.known = db.prepare('SELECT rel_path, size, mtime_ms, head_hash, indexed_bytes, tail_hash, scan_error, missing_since FROM files');
   S.fileStats = db.prepare(
     'SELECT COUNT(*) AS files, COUNT(scan_error) AS errs, COUNT(missing_since) AS missing,\n' +
     '  COALESCE(SUM(lines_skipped), 0) AS skipped, MAX(last_scan_ms) AS lastScan FROM files');
@@ -502,14 +524,65 @@ function quarantine() {
   }
 }
 
-// Delete and rebuild (schema or parser change, Rebuild). Deleting is cheaper
-// than DROP on a 60 MB file; the DROP is only the fallback for a file that could
-// not be deleted, so a rebuild can never be refused.
+// A rebuild mirrors what is on disk now, so the rows of transcripts that have
+// since been deleted would be gone for good (decision: "Keep them, marked
+// missing"). The store being replaced is therefore set aside as
+// token-usage.db.before-rebuild-<epoch ms>, and only the latest one is kept.
+// `complete` says the main file holds everything (the write-ahead log was
+// folded in): a file renamed without its log would be kept incomplete. Returns
+// false when the store was not kept; the caller then deletes it, as a rebuild
+// always did, and the warn line here is the only trace.
+function keepOldStore(complete) {
+  const name = DB_FILE + KEPT_MARK + Date.now();
+  let why = 'its write-ahead log could not be folded into the main file';
+  let kept = false;
+  if (complete) {
+    try {
+      // A log that is still there with bytes in it belongs to this file.
+      if (fs.statSync(dbPath + '-wal').size > 0) complete = false;
+    } catch { /* no log left: what a clean close leaves */ }
+  }
+  if (complete) {
+    try {
+      fs.renameSync(dbPath, path.join(dataDir, name));
+      kept = true;
+    } catch (err) {
+      why = errMsg(err);
+    }
+  }
+  if (!kept) {
+    logAt('warn', '[token-usage] rebuild: the previous store could not be kept (' + why + '); it is deleted instead');
+    return false;
+  }
+  logAt('info', '[token-usage] rebuild: the previous store is kept as ' + name);
+  try {
+    for (const other of fs.readdirSync(dataDir)) {
+      if (!other.startsWith(DB_FILE + KEPT_MARK) || other === name) continue;
+      try { fs.unlinkSync(path.join(dataDir, other)); } catch { /* tried again at the next rebuild */ }
+    }
+  } catch { /* the folder could not be listed: an older copy stays until the next rebuild */ }
+  return true;
+}
+
+// Set aside and rebuild (schema or parser change, Rebuild). Renaming, like the
+// delete it replaces, is cheaper than DROP on a 60 MB file; the delete is the
+// fallback for a file that could not be kept, and the DROP for one that could
+// not be deleted either, so a rebuild can never be refused.
 function wipeAndReopen() {
-  closeQueryWorker();       // its open handle would make the delete fail on Windows
+  // First, and confirmed: on Windows the query worker's open handle makes the
+  // rename fail, and a reader makes the checkpoint below wait out the busy timeout.
+  const readerClosed = closeQueryWorker();
+  let complete = false;
+  if (db && readerClosed) {
+    try {
+      const r = db.pragma('wal_checkpoint(TRUNCATE)');
+      complete = Array.isArray(r) && r.length > 0 && r[0].busy === 0;
+    } catch { /* not complete: the store is deleted, not kept */ }
+  }
   closeDbQuiet();
   gen++;
-  removeDbFiles();
+  keepOldStore(complete);
+  removeDbFiles();          // the main file when it was not kept; what is left of its -wal and -shm either way
   db = new Database(dbPath);
   applyPragmas();
   db.exec(DROP_SQL);
@@ -621,6 +694,10 @@ function initImpl(c) {
   openStore();
   state = 'ok';
   lastError = null;
+  // The info lines (this one, a walk's start and end, the query worker's
+  // hello) are what the log shows of a healthy store: without them "all is
+  // well" and "init never ran" look the same.
+  logAt('info', '[token-usage] opened ' + dbPath + ' schema ' + SCHEMA_VERSION + ', ' + fileCount() + ' files');
 
   spawnWorker();
   // 6. Deferred: the zone recompute, then the startup walk. Not inline, so the
@@ -641,6 +718,8 @@ function terminateWorker() {
   const w = worker;
   worker = null;            // cleared first, so the exit event of this worker is ignored
   workerReady = false;
+  unansweredSinceMs = null;
+  cancel(helloTimer); helloTimer = null;
   if (!w) return;
   try {
     const p = w.terminate();
@@ -648,15 +727,23 @@ function terminateWorker() {
   } catch { /* already gone */ }
 }
 
+// What the cascade guard remembers lives for one cycle (see cascade()).
+function endCascadeCycle() {
+  cycleRescanned.clear();
+  cycleExtraReset.clear();
+  cycleQueuedBy.clear();
+}
+
 // Drop everything in flight: used before the store is deleted, renamed or closed.
 function dropInFlight() {
   clearFlushTimers();
   pending.clear();
   cascadePending.clear();
-  cycleRescanned.clear();
+  endCascadeCycle();
   passes.clear();
   catchupNeeded = false;
   cancel(respawnTimer); respawnTimer = null;
+  cancel(indexTimer); indexTimer = null;    // the store it was building for is about to go
   terminateWorker();
   walk = null;
   phase = 'idle';
@@ -734,19 +821,35 @@ function disableImpl() {
   pumpQueries();
   fs.mkdirSync(dataDir, { recursive: true });
   fs.writeFileSync(path.join(dataDir, OFF_FILE), 'Token analytics disabled ' + iso(Date.now()) + '\n');
+  // Not through the one-per-second limit: this is one click, and the scanner
+  // that would have sent the next message has just been stopped. Another
+  // window's Tokens tab learns from this that the store was switched.
+  sendBroadcast();
   return { ok: true, state: 'disabled' };
 }
 
+// Also what the tab's "Try again" calls, with no confirm. So the flag file is
+// removed ONLY when the store is off because of the kill switch (the confirmed
+// Enable button). Off after a failure, a flag made by hand meanwhile stays:
+// init then finds it and reports the kill switch, as reopenAfterFailure does.
 function enableImpl() {
   if (!ctx || !dataDir) return unavailable();
-  try {
-    fs.unlinkSync(path.join(dataDir, OFF_FILE));
-  } catch (err) {
-    if (!err || err.code !== 'ENOENT') throw err;
+  if (reasonCode() === 'kill-switch') {
+    try {
+      fs.unlinkSync(path.join(dataDir, OFF_FILE));
+    } catch (err) {
+      // Answered, not thrown: a throw here goes through the write-path guard
+      // and would turn "off by the kill switch" into a failure, whose Try
+      // again can only fail the same way while the flag is still there.
+      if (!err || err.code !== 'ENOENT') {
+        return { error: 'Token store unavailable: could not remove ' + OFF_FILE + ' (' + errMsg(err) + ')' };
+      }
+    }
   }
   if (state === 'ok' && db && !stopped) return { ok: true, state: 'ok' };
   closeImpl();
   const r = initImpl(ctx);
+  sendBroadcast();          // on or still off, every window's tab should look again
   if (r && r.error) return r;
   return { ok: true, state: state === 'ok' ? 'ok' : 'disabled' };
 }
@@ -899,6 +1002,19 @@ function inlineAnswer(name, q) {
   return withScan(res, name, 'inline');
 }
 
+// A query does not throw: the queries module (and the query worker) answer
+// { error, code }. So a damaged page that only a query reads never reaches
+// fail(), and the store would go on answering "malformed" for ever while
+// saying it is fine. The code is looked at here instead, and a corruption code
+// takes the same path as on the write path: rename, new generation, backfill;
+// once per init. Called AFTER the answer has been handed over: recovery asks
+// every waiting query again, and this one has had its answer.
+function recoverIfCorrupt(res) {
+  if (state !== 'ok' || !res || typeof res !== 'object' || typeof res.error !== 'string' || !isCorruptCode(res.code)) return;
+  logOnce('error', '[token-usage] a query failed on a corrupt store (' + res.code + '): ' + res.error);
+  recoverCorrupt(res.error);
+}
+
 // What only this thread can add to the worker's answer: titles, project paths
 // and labels, isRunning.
 function workerAnswer(name, res) {
@@ -1039,6 +1155,7 @@ function onQueryWorkerMessage(cur, msg) {
     cancel(cur.helloTimer);
     cur.helloTimer = null;
     cur.ready = true;
+    logAt('info', '[token-usage] query worker ready');
     pumpQueries();
     return;
   }
@@ -1046,6 +1163,7 @@ function onQueryWorkerMessage(cur, msg) {
     const entry = waiting.get(msg.id);
     if (!entry || entry.sentTo !== cur) return;
     settle(entry, workerAnswer(entry.name, msg.result));
+    recoverIfCorrupt(msg.result);
   }
 }
 
@@ -1111,7 +1229,10 @@ function pumpQueries() {
   if (stopped) { failWaiting('Token store unavailable: shut down'); return; }
   if (queryInline) {
     for (const entry of Array.from(waiting.values())) {
-      if (entry.sentTo === null) settle(entry, inlineAnswer(entry.name, entry.q));
+      if (entry.sentTo !== null || !waiting.has(entry.id)) continue;
+      const out = inlineAnswer(entry.name, entry.q);
+      settle(entry, out);
+      recoverIfCorrupt(out);
     }
     return;
   }
@@ -1155,9 +1276,18 @@ function spawnWorker() {
     worker = w;
     workerReady = false;
     lastWorkerMsgMs = clock.now();
+    unansweredSinceMs = null;
     w.on('message', (m) => safely('worker message', () => onWorkerMessage(w, m)));
     w.on('error', (e) => safely('worker error', () => onWorkerGone(w, 'error: ' + errMsg(e))));
     w.on('exit', (code) => safely('worker exit', () => onWorkerGone(w, 'exit code ' + code)));
+    // A thread that starts and never runs its file sends no error and no exit.
+    // Nothing is posted to a worker before its hello, so nothing else would
+    // ever notice: no walk, no scan, and a Rebuild left "already running".
+    cancel(helloTimer);
+    helloTimer = later(SCAN_HELLO_MS, 'scanner hello', () => {
+      helloTimer = null;
+      if (worker === w && !workerReady) onWorkerGone(w, 'no hello within ' + (SCAN_HELLO_MS / 1000) + ' s');
+    });
     return true;
   } catch (err) {
     // A scanner that cannot start costs the live numbers, not the store.
@@ -1175,11 +1305,17 @@ function onWorkerGone(w, why) {
   if (w !== worker) return;
   worker = null;
   workerReady = false;
+  unansweredSinceMs = null;
+  cancel(helloTimer); helloTimer = null;
   try {
     const p = w.terminate();
     if (p && typeof p.catch === 'function') p.catch(() => {});
   } catch { /* already gone */ }
   logAt('warn', '[token-usage] scanner worker stopped (' + why + ')');
+  // Said at the FIRST death, not only when the respawns are used up: until a
+  // worker says hello again nothing is scanned, and the Tokens tab shows
+  // scan.reason so that frozen totals are not taken for current ones.
+  scannerError = 'scanner worker stopped (' + why + ')';
   walk = null;
   phase = 'idle';
   passes.clear();           // the offsets of unfinished passes were never committed
@@ -1212,6 +1348,8 @@ function post(msg) {
   if (!worker) return false;
   try {
     worker.postMessage(msg);
+    // The oldest request this worker has answered with nothing at all (catchupTick).
+    if ((msg.type === 'walk' || msg.type === 'scan') && unansweredSinceMs === null) unansweredSinceMs = clock.now();
     return true;
   } catch (err) {
     logOnce('warn', '[token-usage] could not post to the scanner worker: ' + errMsg(err));
@@ -1222,6 +1360,7 @@ function post(msg) {
 function onWorkerMessage(w, msg) {
   if (w !== worker || !msg || typeof msg !== 'object') return;
   lastWorkerMsgMs = clock.now();
+  unansweredSinceMs = null;
   if (msg.type === 'hello') { onHello(msg); return; }
   if (msg.type === 'chunk') { applyChunkImpl(msg); return; }
   if (msg.gen !== gen) return;      // progress and done of an older generation
@@ -1236,6 +1375,7 @@ function onWorkerMessage(w, msg) {
 }
 
 function onHello(msg) {
+  cancel(helloTimer); helloTimer = null;
   const pv = Number.isInteger(msg.parseVersion) ? msg.parseVersion
     : Number.isInteger(msg.parse_version) ? msg.parse_version : null;
   if (pv === null) {
@@ -1263,15 +1403,26 @@ function onHello(msg) {
 // and mtime" shortcut, so its size is sent as -1 (never equal to a real size).
 // The hashes and offset stay as stored, so the worker's resume gate still
 // decides resume vs full rescan.
+// A row marked missing is sent the same way, with its mark. The mark is what
+// lets the worker leave the path alone: without it every walk reported every
+// deleted file again, and every `done` stat'ed and wrote each one again on this
+// thread, for as long as the row is kept (which is until a Rebuild). The -1 is
+// for the file that comes back: it is scanned even if its size and mtime are
+// what the row says, and the chunk that scan posts clears the mark.
 function knownFiles() {
-  return S.known.all().map((r) => ({
-    rel_path: r.rel_path,
-    size: (r.head_hash === null || r.scan_error !== null) ? -1 : r.size,
-    mtime_ms: r.mtime_ms,
-    head_hash: r.head_hash,
-    indexed_bytes: r.indexed_bytes,
-    tail_hash: r.tail_hash,
-  }));
+  return S.known.all().map((r) => {
+    const missing = r.missing_since !== null;
+    const k = {
+      rel_path: r.rel_path,
+      size: (r.head_hash === null || r.scan_error !== null || missing) ? -1 : r.size,
+      mtime_ms: r.mtime_ms,
+      head_hash: r.head_hash,
+      indexed_bytes: r.indexed_bytes,
+      tail_hash: r.tail_hash,
+    };
+    if (missing) k.missing = true;
+    return k;
+  });
 }
 
 function requestWalk() {
@@ -1279,7 +1430,7 @@ function requestWalk() {
   if (!worker || !workerReady || walk) { walkWanted = true; return false; }
   const mode = getMeta('backfill_done') ? 'catchup' : 'backfill';
   const now = clock.now();
-  cycleRescanned.clear();   // a walk is a new root event for the cascade guard
+  endCascadeCycle();        // a walk is a new root event for the cascade guard
   if (!post({ type: 'walk', gen, mode, known: knownFiles() })) { walkWanted = true; return false; }
   walk = { mode, startedMs: now };
   walkWanted = false;
@@ -1288,8 +1439,17 @@ function requestWalk() {
   progressDone = 0;
   progressTotal = 0;
   if (mode === 'backfill' && !getMeta('backfill_started')) setMeta('backfill_started', iso(Date.now()));
+  logAt('info', '[token-usage] ' + walkName(mode) + ' started');
   scheduleBroadcast();
   return true;
+}
+
+function walkName(mode) { return mode === 'backfill' ? 'backfill' : 'catch-up'; }
+
+// Rows in `files`, for a log line. A log line must not be what fails an open or
+// a walk: a store that cannot be read shows itself at the next real statement.
+function fileCount() {
+  try { return S.fileStats.get().files || 0; } catch { return '?'; }
 }
 
 function onDone(msg) {
@@ -1307,16 +1467,39 @@ function onDone(msg) {
   const stamp = iso(Date.now());
   setMeta('last_catchup', stamp);
   if (mode === 'backfill') setMeta('backfill_done', stamp);
-  if (getMeta('indexes_built') !== '1') {
-    createIndexes(db);
-    setMeta('indexes_built', '1');
-  }
+  if (getMeta('indexes_built') !== '1') startIndexBuild();
+  logAt('info', '[token-usage] ' + walkName(mode) + ' done ' + fileCount() + ' files'
+    + (walk ? ' in ' + (Math.max(0, clock.now() - walk.startedMs) / 1000).toFixed(1) + ' s' : ''));
   walk = null;
   phase = 'idle';
   rescanRunning = false;
   lastWalkMs = clock.now();
   scheduleBroadcast();
   if (walkWanted) requestWalk();
+}
+
+// The secondary indexes after a backfill: ONE statement per timer turn, so the
+// main thread (which carries every terminal's output) is held for one index at
+// a time, about 0.3 s at most on the real-size store, instead of all seven.
+// Nothing depends on them meanwhile: queries and the cascade are only slower.
+// indexes_built is set after the last one and nowhere else, so a quit, a
+// Rebuild or a failure between two steps leaves the flag empty and the next
+// `done` starts again (IF NOT EXISTS skips what is already there). The chain
+// belongs to one generation and is cancelled wherever in-flight work is dropped.
+function startIndexBuild() {
+  if (indexTimer !== null) return;      // a chain is already running
+  const forGen = gen;
+  const step = (i) => {
+    indexTimer = null;
+    if (forGen !== gen || state !== 'ok' || !db || stopped) return;
+    db.exec(INDEX_STATEMENTS[i]);
+    if (i + 1 < INDEX_STATEMENTS.length) {
+      indexTimer = later(0, 'index build', () => step(i + 1));
+      return;
+    }
+    setMeta('indexes_built', '1');
+  };
+  indexTimer = later(0, 'index build', () => step(0));
 }
 
 // --------------------------------------------------------------- write path ----
@@ -1412,9 +1595,19 @@ function compactionParams(c, fileId) {
 // Full rescan of file F (design 3.3). The responses F owns may also sit in a
 // continuation that is unchanged on disk and would never be scanned again, so
 // every other file that sighted them is reset and queued. Returns the paths to
-// queue. Guard against a ping-pong between two files that each own rows the
-// other sighted: a file already fully rescanned in this cycle is left alone.
-function cascade(fileId) {
+// queue, and which of them used their extra reset.
+//
+// A file that was already fully rescanned in this cycle was applied BEFORE the
+// rows were deleted just now, so what it holds of them is gone again: a
+// continuation and then its original both touched in one flush leave the shared
+// row with the original's placeholder line (review A3). Such a file is reset
+// ONE more time per cycle. Past that the guard applies, and it applies at once
+// to the file whose own rescan queued this one: two files that each own rows the
+// other sighted would queue each other for ever, and going straight back cannot
+// settle them (whichever is rescanned last deletes what the other added). So a
+// file is fully rescanned at most twice per cycle.
+// It only reads the cycle sets: they move after the commit, in applyChunkImpl.
+function cascade(fileId, rel) {
   const affected = S.cascadeAffected.all(fileId, fileId);
   S.delResponses.run(fileId);
   S.delSightings.run(fileId);
@@ -1422,22 +1615,26 @@ function cascade(fileId) {
   // F's own stored offset describes rows that no longer exist: reset it too, so
   // a quit before the last chunk can never resume past the deleted bytes.
   S.resetFile.run(fileId);
-  const queue = [];
+  const out = { queue: [], extra: [] };
+  const queuedBy = cycleQueuedBy.get(rel);
   for (const a of affected) {
     if (cycleRescanned.has(a.id)) {
-      logOnce('warn', '[token-usage] cascade: ' + a.rel_path + ' was already rescanned in this cycle; not queued again');
-      continue;
+      if (cycleExtraReset.has(a.id) || (queuedBy && queuedBy.has(a.id))) {
+        logOnce('warn', '[token-usage] cascade: ' + a.rel_path + ' was already rescanned in this cycle; not queued again');
+        continue;
+      }
+      out.extra.push(a.id);
     }
     S.resetFile.run(a.id);
-    queue.push(a.rel_path);
+    out.queue.push(a.rel_path);
   }
-  return queue;
+  return out;
 }
 
 // One chunk = one transaction (better-sqlite3 transactions are synchronous, so
 // BEGIN is never held across an event-loop turn; the handle also serves queries).
 function applyChunkRows(a) {
-  const out = { fileId: null, fullRescan: false, queue: [], written: 0, rejected: 0, sessions: [] };
+  const out = { fileId: null, fullRescan: false, queue: [], extra: [], written: 0, rejected: 0, sessions: [] };
   if (a.seq === 0) {
     const before = a.before;
     S.insertFile.run({
@@ -1451,7 +1648,11 @@ function applyChunkRows(a) {
     });
     out.fileId = before ? before.id : S.fileByPath.get(a.rel).id;
     out.fullRescan = a.fullRescan;
-    if (a.fullRescan && before) out.queue = cascade(out.fileId);
+    if (a.fullRescan && before) {
+      const c = cascade(out.fileId, a.rel);
+      out.queue = c.queue;
+      out.extra = c.extra;
+    }
   } else {
     out.fileId = a.pass.fileId;
     out.fullRescan = a.pass.fullRescan;
@@ -1514,7 +1715,14 @@ function applyChunkImpl(msg) {
   if (msg.gen !== gen) return { dropped: 'stale gen' };
   const fileRow = msg.fileRow && typeof msg.fileRow === 'object' ? msg.fileRow : null;
   const rel = normRel(typeof msg.rel_path === 'string' ? msg.rel_path : (fileRow ? fileRow.rel_path : null));
-  if (!rel) return { error: 'bad request: a chunk needs rel_path' };
+  if (!rel) {
+    // Refused, but answered: the worker posts one chunk at a time and waits for
+    // its ack, so a refusal without one would stop it for good. (A stale
+    // generation above needs none: the worker ignores acks of another
+    // generation and releases its own wait when the generation moves.)
+    ack(msg, true);
+    return { error: 'bad request: a chunk needs rel_path' };
+  }
 
   if (msg.discarded === true) {
     // The file changed while it was being read: write nothing, retry at the next flush.
@@ -1565,7 +1773,11 @@ function applyChunkImpl(msg) {
   if (last) passes.delete(rel);
   else passes.set(rel, { next: seq + 1, fileId: res.fileId, fullRescan: res.fullRescan });
   if (seq === 0 && res.fullRescan) cycleRescanned.add(res.fileId);
+  for (const id of res.extra) cycleExtraReset.add(id);
   for (const q of res.queue) {
+    let by = cycleQueuedBy.get(q);
+    if (!by) { by = new Set(); cycleQueuedBy.set(q, by); }
+    by.add(res.fileId);
     cascadePending.add(q);
     queuePath(q);
   }
@@ -1627,13 +1839,13 @@ function flushImpl() {
     return { ok: true, scanned: 0, missing: 0, waiting: true };
   }
 
-  // One cascade cycle rescans a file at most once: the cycle ends at the first
-  // flush that carries no cascade-queued path.
+  // One cascade cycle resets a file at most twice (see cascade()): the cycle
+  // ends at the first flush that carries no cascade-queued path.
   let carriesCascade = false;
   for (const rel of pending) {
     if (cascadePending.has(rel)) { carriesCascade = true; break; }
   }
-  if (!carriesCascade) cycleRescanned.clear();
+  if (!carriesCascade) endCascadeCycle();
 
   const batch = Array.from(pending);
   pending.clear();
@@ -1672,8 +1884,16 @@ function catchupTick() {
   armCatchupTimer();
   if (!hasWorkerConfig()) return;
   if (!worker) { scheduleRespawn(); return; }
-  if (walk && clock.now() - lastWorkerMsgMs > WORKER_SILENT_MS) {
+  const now = clock.now();
+  if (walk && now - lastWorkerMsgMs > WORKER_SILENT_MS) {
     onWorkerGone(worker, 'no message for 10 minutes during a walk');
+    return;
+  }
+  // The same for a scan request, which has no `walk` state: a request was
+  // posted, and since then the worker has sent nothing for 10 minutes. A
+  // healthy worker answers the walk of every tick, so this cannot age.
+  if (unansweredSinceMs !== null && now - unansweredSinceMs >= WORKER_SILENT_MS) {
+    onWorkerGone(worker, 'no message for 10 minutes after a request');
     return;
   }
   if (!walk) requestWalk();
@@ -1782,7 +2002,11 @@ function runQuery(name, q) {
   if (state !== 'ok' || !db) return Object.assign(unavailable(), { scan: scanForAnswer() });
   // After shutdown() the store stays readable until close(), on this thread:
   // the app is quitting and no worker is started for that.
-  if (stopped || queryInline) return inlineAnswer(name, q);
+  if (stopped || queryInline) {
+    const out = inlineAnswer(name, q);
+    recoverIfCorrupt(out);
+    return out;
+  }
   if (waiting.size >= WAITING_MAX) {
     return { error: 'Token store busy: ' + WAITING_MAX + ' queries are already waiting', scan: scanForAnswer() };
   }
@@ -1799,9 +2023,17 @@ function runQuery(name, q) {
   });
 }
 
+// The tab says which loads are an opening (or something the user asked for:
+// a range change, Rebuild, Enable, Try again) with `opened: true`. Its quiet
+// refreshes, one every few seconds while a session writes, carry no flag: taken
+// for openings they walked the whole projects tree about once a minute.
+function isOpening(q) {
+  try { return !!q && typeof q === 'object' && q.opened === true; } catch { return false; }
+}
+
 function summaryImpl(q) {
   // "Tokens tab opened": a catch-up walk if the last one is older than 60 s.
-  if (state === 'ok' && !stopped && !walk && clock.now() - lastWalkMs > CATCHUP_ON_OPEN_MS) {
+  if (isOpening(q) && state === 'ok' && !stopped && !walk && clock.now() - lastWalkMs > CATCHUP_ON_OPEN_MS) {
     try { requestWalk(); } catch (err) { logOnce('warn', '[token-usage] catch-up on open failed: ' + errMsg(err)); }
   }
   return runQuery('summary', q);

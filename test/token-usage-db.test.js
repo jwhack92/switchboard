@@ -600,6 +600,236 @@ const SCENARIOS = {
     assert.equal(H.file(other.rel_path).indexed_bytes, 0, 'a new cycle queues the other file again');
   },
 
+  cascadeContinuationFirst(H) {
+    // verify-accounting A3. A continuation and then its original are both fully
+    // rescanned in ONE cycle (one flush carried both, the continuation's event
+    // first; a touch is enough, the files need not change). The original's
+    // rescan deletes the shared row and stores its own placeholder line; the
+    // finalised line lives only in the continuation, which was rescanned a
+    // moment earlier. It has to be rescanned once more or the row keeps the
+    // placeholder until a Rebuild.
+    const { t } = H;
+    const { ctx, workers } = H.start({ worker: true });
+    const O = H.mainRow(SID_O, { birthtime_ms: 1000 });
+    const C = H.mainRow(SID_C, { birthtime_ms: 2000 });
+    H.touch(O.rel_path);
+    H.touch(C.rel_path);
+    const oMsg = (o) => H.chunk(O, [
+      H.cand('shared', O, { finalized: 0, stop_reason: null, output: 3, ts_ms: T0 + 100 }),
+      H.cand('only-o', O, { output: 50, ts_ms: T0 + 110 })], o);
+    // Every counter of the finalised line differs from the placeholder's, so a
+    // row that kept the placeholder cannot pass for the right one.
+    const cMsg = (o) => H.chunk(C, [
+      H.cand('shared', C, { output: 500, ts_ms: T0 + 200, input: 11, cache_write: 21, cache_write_5m: 19, cache_write_1h: 2,
+        cache_read: 1001, thinking: 9, model: 'claude-fable-5-1' }),
+      H.cand('only-c', C, { output: 70, ts_ms: T0 + 210 })], o);
+    H.apply(oMsg());
+    H.apply(cMsg());
+    const oId = H.file(O.rel_path).id;
+    assert.deepEqual([H.resp('shared').file_id, H.resp('shared').finalized, H.resp('shared').output], [oId, 1, 500]);
+    const before = H.dump();
+    const scans = () => workers.last.of('scan');
+    const base = scans().length;
+
+    t.noteChanged(C.rel_path);
+    t.noteChanged(O.rel_path);
+    ctx.clock.advance(3000);
+    assert.equal(scans().length, base + 1);
+    assert.deepEqual(scans().pop().files.map((f) => f.rel_path), [C.rel_path, O.rel_path], 'one batch, the continuation first');
+    H.apply(cMsg({ fullRescan: true }));
+    assert.deepEqual(H.dump(), before, 'the continuation owns nothing the original sighted: nothing moved yet');
+    H.apply(oMsg({ fullRescan: true }));
+    assert.deepEqual([H.resp('shared').finalized, H.resp('shared').output], [0, 3], 'the placeholder, until the copy is applied again');
+    let c = H.file(C.rel_path);
+    assert.deepEqual([c.indexed_bytes, c.head_hash, c.tail_hash], [0, null, null],
+      'the continuation is reset once more although it was rescanned in this cycle');
+
+    ctx.clock.advance(3000);
+    assert.equal(scans().length, base + 2);
+    const again = scans().pop();
+    assert.deepEqual(again.files.map((f) => f.rel_path), [C.rel_path]);
+    assert.deepEqual([again.files[0].prev.head_hash, again.files[0].prev.indexed_bytes], [null, 0], 'sent with its reset row');
+    H.apply(cMsg({ fullRescan: true }));
+    assert.deepEqual(H.dump(), before, 'every row and every counter is back');
+    c = H.file(C.rel_path);
+    assert.deepEqual([c.indexed_bytes, c.head_hash], [5000, C.head_hash]);
+    assert.equal(H.file(O.rel_path).indexed_bytes, 5000, 'the original is not queued back');
+    ctx.clock.advance(60000);
+    assert.equal(scans().length, base + 2, 'the cycle ends: nothing more is queued');
+    assert.equal(ctx.logs.filter((l) => l.includes('already rescanned in this cycle')).length, 0, 'the guard was never needed');
+    checkInvariants(t._handle());
+
+    // Equal to a fresh rebuild (Rebuild, then the files as a backfill delivers
+    // them: main files oldest first), for every column of every row.
+    const incremental = H.dump();
+    assert.deepEqual(t.rescan(), { ok: true });
+    assert.equal(H.n('responses'), 0);
+    H.apply(oMsg());
+    H.apply(cMsg());
+    assert.deepEqual(H.dump(), incremental, 'incremental state equals a fresh rebuild');
+    const shared = H.resp('shared');
+    assert.deepEqual([shared.model, shared.ts_ms, shared.input, shared.output, shared.cache_write, shared.cache_write_5m,
+      shared.cache_write_1h, shared.cache_read, shared.thinking, shared.finalized, shared.stop_reason],
+    ['claude-fable-5-1', T0 + 200, 11, 500, 21, 19, 2, 1001, 9, 1, 'end_turn']);
+  },
+
+  cascadeChain(H) {
+    // Three main files: O, its continuation C1, and C2 continuing C1 after a
+    // compaction (C2 shares rows with C1 and none with O). C2 and O are fully
+    // rescanned in one cycle, C2 first. O's rescan queues C1; C1's rescan
+    // deletes the row it owns, whose finalised line lives only in C2, and C2 was
+    // already rescanned in this cycle: it gets its one extra reset.
+    const { t } = H;
+    const { ctx, workers } = H.start({ worker: true });
+    const O = H.mainRow(SID_O, { birthtime_ms: 1000 });
+    const C1 = H.mainRow(SID_C, { birthtime_ms: 2000 });
+    const C2 = H.mainRow(SID_X, { birthtime_ms: 3000 });
+    for (const f of [O, C1, C2]) H.touch(f.rel_path);
+    const placeholder = { finalized: 0, stop_reason: null, output: 4 };
+    const oMsg = (o) => H.chunk(O, [H.cand('r-o', O, placeholder), H.cand('own-o', O)], o);
+    const c1Msg = (o) => H.chunk(C1, [H.cand('r-o', C1, { output: 250 }), H.cand('r-12', C1, placeholder)], o);
+    const c2Msg = (o) => H.chunk(C2, [H.cand('r-12', C2, { output: 900, cache_read: 77 }), H.cand('own-2', C2)], o);
+    H.apply(oMsg());
+    H.apply(c1Msg());
+    H.apply(c2Msg());
+    const ids = [O, C1, C2].map((f) => H.file(f.rel_path).id);
+    assert.deepEqual(['r-o', 'own-o', 'r-12', 'own-2'].map((m) => H.resp(m).file_id), [ids[0], ids[0], ids[1], ids[2]]);
+    assert.deepEqual([H.resp('r-o').output, H.resp('r-12').output], [250, 900]);
+    const before = H.dump();
+    const scans = () => workers.last.of('scan');
+    const base = scans().length;
+
+    t.noteChanged(C2.rel_path);
+    t.noteChanged(O.rel_path);
+    ctx.clock.advance(3000);
+    assert.deepEqual(scans().pop().files.map((f) => f.rel_path), [C2.rel_path, O.rel_path]);
+    H.apply(c2Msg({ fullRescan: true }));
+    H.apply(oMsg({ fullRescan: true }));
+    assert.equal(H.file(C1.rel_path).indexed_bytes, 0, 'C1 sighted a row O owns: reset and queued');
+    assert.equal(H.file(C2.rel_path).indexed_bytes, 5000, 'C2 sighted nothing of O');
+    ctx.clock.advance(3000);
+    assert.deepEqual(scans().pop().files.map((f) => f.rel_path), [C1.rel_path]);
+    H.apply(c1Msg({ fullRescan: true }));
+    assert.deepEqual([H.resp('r-12').finalized, H.resp('r-12').output], [0, 4]);
+    assert.equal(H.file(C2.rel_path).indexed_bytes, 0, 'the extra reset');
+    ctx.clock.advance(3000);
+    assert.equal(scans().length, base + 3);
+    assert.deepEqual(scans().pop().files.map((f) => f.rel_path), [C2.rel_path]);
+    H.apply(c2Msg({ fullRescan: true }));
+    assert.deepEqual(H.dump(), before);
+    ctx.clock.advance(60000);
+    assert.equal(scans().length, base + 3, 'the cycle ends');
+
+    assert.deepEqual(t.rescan(), { ok: true });
+    H.apply(oMsg());
+    H.apply(c1Msg());
+    H.apply(c2Msg());
+    assert.deepEqual(H.dump(), before, 'incremental state equals a fresh rebuild');
+  },
+
+  cascadeTerminates(H) {
+    // A ring of three agent files, each owning a row the next one sighted. No
+    // number of rescans settles it, so the cascade has to stop by itself: each
+    // file is reset at most twice in a cycle (once, and one extra), then the
+    // guard applies.
+    const { t } = H;
+    const { ctx, workers } = H.start({ worker: true });
+    // The startup walk first: a walk request starts a new cycle, and this test
+    // is about what happens inside one.
+    ctx.clock.advance(10000);
+    assert.equal(workers.last.of('walk').length, 1);
+    const A = H.agentRow(SID_O, 'agent-aaa');
+    const B = H.agentRow(SID_O, 'agent-bbb');
+    const C = H.agentRow(SID_O, 'agent-ccc');
+    const files = { [A.rel_path]: A, [B.rel_path]: B, [C.rel_path]: C };
+    const lines = { [A.rel_path]: ['x', 'z'], [B.rel_path]: ['y', 'x'], [C.rel_path]: ['z', 'y'] };
+    for (const rel of Object.keys(files)) H.touch(rel);
+    const pass = (rel, o) => H.chunk(files[rel], lines[rel].map((id) => H.cand(id, files[rel])), o);
+    H.apply(H.chunk(A, [H.cand('x', A)]));       // A owns x
+    H.apply(pass(B.rel_path));                   // B owns y, sights x
+    H.apply(pass(C.rel_path));                   // C owns z, sights y
+    H.apply(pass(A.rel_path));                   // A sights z
+    assert.deepEqual(['x', 'y', 'z'].map((m) => H.resp(m).agent_id), ['agent-aaa', 'agent-bbb', 'agent-ccc']);
+    const scans = () => workers.last.of('scan');
+    const base = scans().length;
+    const fullRescans = { [A.rel_path]: 0, [B.rel_path]: 0, [C.rel_path]: 0 };
+    const rescan = (rel) => { fullRescans[rel]++; H.apply(pass(rel, { fullRescan: true })); };
+
+    // Whatever the cascade queues is answered the way the worker answers a
+    // reset row: with a full rescan. 20 rounds is far past the bound.
+    rescan(A.rel_path);
+    const order = [];
+    for (let round = 0; round < 20; round++) {
+      const seen = scans().length;
+      ctx.clock.advance(3000);
+      for (const s of scans().slice(seen)) {
+        for (const f of s.files) {
+          assert.deepEqual([f.prev.head_hash, f.prev.indexed_bytes], [null, 0], 'only reset rows are queued');
+          order.push(f.rel_path);
+          rescan(f.rel_path);
+        }
+      }
+    }
+    assert.deepEqual(order, [B.rel_path, C.rel_path, A.rel_path, B.rel_path, C.rel_path], 'once round the ring, one extra each, then it stops');
+    assert.deepEqual(Object.values(fullRescans), [2, 2, 2], 'no file is fully rescanned more than twice in a cycle');
+    assert.equal(scans().length, base + 5);
+    ctx.clock.advance(600000 - 1 - 10000 - 20 * 3000);      // up to the 10-minute tick, not past it
+    assert.equal(scans().length, base + 5, 'nothing is left queued');
+    assert.equal(ctx.logs.filter((l) => l.includes('already rescanned in this cycle')).length, 1, 'the guard said so once');
+    for (const f of [A, B, C]) assert.equal(H.file(f.rel_path).indexed_bytes, 6000, f.rel_path + ' is left with its offset');
+    assert.equal(H.n('responses'), 3);
+    checkInvariants(t._handle());
+  },
+
+  missingMarks(H) {
+    // A file marked missing was reported again by every walk, and stat'ed and
+    // written again by every `done` (verify-concurrency V1: about 75 ms of main
+    // thread per 1,000 such files, every 10 minutes, for ever). The mark now
+    // travels with the known row, so the worker leaves the path alone; and the
+    // row is sent with size -1, so a file that comes back is looked at even if
+    // its size and mtime are what the row says.
+    const { t } = H;
+    const { ctx, workers } = H.start({ worker: true });
+    const w = workers.last;
+    const O = H.mainRow(SID_O);
+    const G = H.mainRow(SID_X, { birthtime_ms: 3000 });
+    H.touch(O.rel_path);
+    H.apply(H.chunk(O, [H.cand('m1', O)]));
+    H.apply(H.chunk(G, [H.cand('g1', G)]));
+    const knownRow = (fr, o) => Object.assign({ rel_path: fr.rel_path, size: fr.size, mtime_ms: fr.mtime_ms, head_hash: fr.head_hash,
+      indexed_bytes: fr.indexed_bytes, tail_hash: fr.tail_hash }, o);
+    const known = () => w.of('walk').pop().known.slice().sort((a, b) => (a.rel_path < b.rel_path ? -1 : 1));
+    const done = (missing) => w.emit('message', { type: 'done', gen: t._gen(), mode: 'catchup', seen: [O.rel_path], missing: missing || [] });
+
+    ctx.clock.advance(10000);
+    assert.equal(w.of('walk').length, 1);
+    assert.deepEqual(known(), [knownRow(O), knownRow(G)], 'no mark: the rows as stored');
+    done([G.rel_path]);                          // G is not on disk
+    const since = H.file(G.rel_path).missing_since;
+    assert.equal(since, ctx.clock.now());
+    assert.equal(t.status().filesMissing, 1);
+
+    // The next walk carries the mark, and a size that never matches a real one.
+    ctx.clock.advance(600000);
+    assert.equal(w.of('walk').length, 2);
+    assert.deepEqual(known(), [knownRow(O), knownRow(G, { size: -1, missing: true })]);
+    assert.equal('missing' in known()[0], false, 'a row that is not marked says nothing');
+    done();
+    assert.equal(H.file(G.rel_path).missing_since, since, 'nothing was reported, nothing was written');
+    assert.equal(H.n('responses'), 2, 'the rows of the missing file are kept');
+
+    // The file comes back with the bytes it had. The worker scans it (its
+    // known size was -1) and resumes; that chunk clears the mark.
+    H.touch(G.rel_path);
+    H.apply(H.chunk(G, []));
+    assert.equal(H.file(G.rel_path).missing_since, null);
+    assert.equal(t.status().filesMissing, 0);
+    assert.equal(H.n('responses'), 2);
+    ctx.clock.advance(600000);
+    assert.equal(w.of('walk').length, 3);
+    assert.deepEqual(known(), [knownRow(O), knownRow(G)], 'and the next walk sends it as any other row');
+  },
+
   generation(H) {
     const { t } = H;
     const { workers, ctx } = H.start({ worker: true });
@@ -841,6 +1071,100 @@ const SCENARIOS = {
     assert.deepEqual(H.all('SELECT message_id FROM responses').map((x) => x.message_id), ['m1'], 'the data is still there');
   },
 
+  enableAndTheFlag(H) {
+    // review S2: enable() is also what "Try again" calls, with no confirm. It
+    // removed the kill-switch file whatever state the store was in, so a flag
+    // made by hand while the store was off after a FAILURE was deleted by a
+    // click on Try again. It now removes the file only when the store is off
+    // because of the kill switch (the confirmed Enable button).
+    const { t } = H;
+    const { ctx, workers } = H.start({ worker: true });
+    const O = H.mainRow(SID_O);
+    H.apply(H.chunk(O, [H.cand('m1', O)]));
+    const bad = H.cand('m2', O);
+    Object.defineProperty(bad, 'model', { get() { throw new Error('disk is full'); } });
+    t.applyChunk(H.chunk(O, [bad]));
+    assert.deepEqual([t.status().state, t.status().reasonCode], ['disabled', 'failure']);
+    fs.writeFileSync(H.offFile, 'made by hand\n');
+
+    let r = t.enable();
+    assert.equal(r.error, 'Token store unavailable: disabled by token-usage.off', JSON.stringify(r));
+    assert.equal(fs.readFileSync(H.offFile, 'utf8'), 'made by hand\n', 'the flag is still there, untouched');
+    assert.deepEqual([t.status().state, t.status().reasonCode, t.status().reason], ['disabled', 'kill-switch', 'disabled by token-usage.off'],
+      'init found the flag: the tab now offers the confirmed Enable, not Try again');
+    assert.equal(t._handle(), null);
+    assert.equal(workers.made.length, 1, 'nothing was started');
+    assert.ok(isError(t.rescan()), 'Rebuild agrees');
+    assert.equal(fs.existsSync(H.offFile), true);
+
+    // Off because of the kill switch: enable() removes the flag, as before.
+    assert.deepEqual(t.enable(), { ok: true, state: 'ok' });
+    assert.equal(fs.existsSync(H.offFile), false);
+    assert.equal(H.n('responses'), 1);
+    assert.equal(workers.made.length, 2);
+
+    // disable() and enable() tell every window (review-renderer V2): another
+    // window's Tokens tab has no other way to learn the store was switched.
+    H.hello(workers.last);
+    ctx.clock.advance(5000);
+    let sent = ctx.sent.length;
+    assert.deepEqual(t.enable(), { ok: true, state: 'ok' });
+    assert.equal(ctx.sent.length, sent, 'enable on a running store changed nothing and says nothing');
+    assert.deepEqual(t.disable(), { ok: true, state: 'disabled' });
+    assert.equal(ctx.sent.length, sent + 1, 'disable is announced');
+    assert.deepEqual(ctx.sent[sent], { channel: 'token-stats-changed', at: ctx.clock.now(),
+      payload: { phase: 'idle', done: 0, total: 0, changedSessions: [] } });
+    assert.equal(ctx.clock.count(), 0, 'at once, with no timer left behind');
+    assert.deepEqual(t.enable(), { ok: true, state: 'ok' });
+    assert.equal(ctx.sent.length, sent + 2, 'enable is announced');
+    assert.equal(ctx.sent[sent + 1].channel, 'token-stats-changed');
+
+    // A flag that cannot be removed: { error }, and the store is still "off by
+    // the kill switch", not turned into a failure with a Try again that can
+    // only fail the same way.
+    assert.deepEqual(t.disable(), { ok: true, state: 'disabled' });
+    const realUnlink = fs.unlinkSync;
+    fs.unlinkSync = (p) => {
+      if (String(p).endsWith('token-usage.off')) throw Object.assign(new Error('EPERM: operation not permitted, unlink'), { code: 'EPERM' });
+      return realUnlink(p);
+    };
+    try {
+      assert.doesNotThrow(() => { r = t.enable(); });
+    } finally {
+      fs.unlinkSync = realUnlink;
+    }
+    assert.match(r.error, /token-usage\.off.*EPERM/);
+    assert.equal(fs.existsSync(H.offFile), true);
+    assert.deepEqual([t.status().state, t.status().reasonCode], ['disabled', 'kill-switch']);
+    assert.deepEqual(t.enable(), { ok: true, state: 'ok' });
+    assert.equal(H.n('responses'), 1);
+  },
+
+  healthyStartLogs(H) {
+    // review S5: a healthy first launch wrote no [token-usage] line at all, so
+    // the log could not tell "init ran and all is well" from "init never ran".
+    const { t } = H;
+    const { ctx, workers } = H.start({ worker: true });
+    const info = () => ctx.logs.filter((l) => l.startsWith('info: [token-usage] '));
+    assert.deepEqual(info(), ['info: [token-usage] opened ' + H.dbFile + ' schema ' + t.SCHEMA_VERSION + ', 0 files']);
+    const O = H.mainRow(SID_O);
+    ctx.clock.advance(10000);
+    assert.deepEqual(info().slice(1), ['info: [token-usage] backfill started']);
+    H.apply(H.chunk(O, [H.cand('m1', O)]));
+    ctx.clock.advance(2500);
+    workers.last.emit('message', { type: 'done', gen: t._gen(), mode: 'backfill', seen: [], missing: [] });
+    assert.deepEqual(info().slice(2), ['info: [token-usage] backfill done 1 files in 2.5 s']);
+    ctx.clock.advance(600000 - 12500);      // the 10-minute tick
+    ctx.clock.advance(300);
+    workers.last.emit('message', { type: 'done', gen: t._gen(), mode: 'catchup', seen: [], missing: [] });
+    assert.deepEqual(info().slice(3), ['info: [token-usage] catch-up started', 'info: [token-usage] catch-up done 1 files in 0.3 s']);
+    assert.deepEqual(ctx.logs.filter((l) => !l.startsWith('info: ')), [], 'and nothing at warn or error');
+    // The next open says how many files it already holds.
+    t.close();
+    assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
+    assert.equal(info().pop(), 'info: [token-usage] opened ' + H.dbFile + ' schema ' + t.SCHEMA_VERSION + ', 1 files');
+  },
+
   async noThrow(H) {
     const { t } = H;
     const out = {};
@@ -1034,6 +1358,7 @@ const SCENARIOS = {
     assert.ok(Date.parse(H.meta('backfill_done')) > 0);
     assert.equal(t.status().backfillDone, H.meta('backfill_done'));
     assert.equal(t.status().phase, 'idle');
+    ctx.clock.advance(0);         // the indexes are built one per timer turn (scenario indexChain)
     assert.equal(H.meta('indexes_built'), '1');
     assert.equal(H.master().filter((r) => r.type === 'index' && r.name.startsWith('idx_')).length, 7,
       'the secondary indexes are created after the first backfill');
@@ -1050,6 +1375,81 @@ const SCENARIOS = {
     // And Rebuild is allowed again.
     assert.deepEqual(t.rescan(), { ok: true });
     assert.equal(workers.made.length, 3);
+  },
+
+  indexChain(H) {
+    // The seven secondary indexes took 1.1-1.4 s in one block on the main
+    // thread at the end of a backfill (review C1). Jason: "One index per timer
+    // turn". The two the cascade needs come first.
+    const { t } = H;
+    const { ctx, workers } = H.start({ worker: true });
+    const idx = () => H.master().filter((r) => r.type === 'index' && r.name.startsWith('idx_')).map((r) => r.name);
+    const done = (mode) => workers.last.emit('message', { type: 'done', gen: t._gen(), mode: mode || 'backfill', seen: [], missing: [] });
+    const O = H.mainRow(SID_O);
+    H.apply(H.chunk(O, [H.cand('m1', O), H.cand('m2', O)]));
+    ctx.clock.advance(10000);
+    assert.equal(workers.last.of('walk').length, 1);
+
+    done();
+    assert.ok(H.meta('backfill_done'));
+    assert.deepEqual(idx(), [], 'nothing is built inside the done handler itself');
+    assert.equal(H.meta('indexes_built'), '');
+    const order = [];
+    for (let turn = 1; turn <= 7; turn++) {
+      assert.equal(ctx.clock.step(), true);
+      const now = idx();
+      assert.equal(now.length, turn, 'one index per timer turn (turn ' + turn + ': ' + now.join(',') + ')');
+      order.push(now.find((n) => !order.includes(n)));
+      assert.equal(H.meta('indexes_built'), turn === 7 ? '1' : '', 'the flag is set only after the last one (turn ' + turn + ')');
+      // Writes and reads between two steps work as before.
+      H.apply(H.chunk(O, [H.cand('w' + turn, O)]));
+      assert.equal(H.n('responses'), 2 + turn);
+      assert.equal(t.status().state, 'ok');
+    }
+    assert.deepEqual(order.slice(0, 2), ['idx_resp_file', 'idx_sight_file'], 'the cascade stops scanning first');
+    assert.deepEqual(order.slice().sort(), ['idx_comp_session', 'idx_resp_day_slug', 'idx_resp_file', 'idx_resp_model',
+      'idx_resp_session_ts', 'idx_resp_ts', 'idx_sight_file']);
+    // The next walk's done starts nothing: the flag is set.
+    const timers = ctx.clock.count();
+    done('catchup');
+    assert.equal(ctx.clock.count(), timers);
+
+    // A Rebuild in the middle of the chain cancels it: no step of the old
+    // generation runs against the new store.
+    assert.deepEqual(t.rescan(), { ok: true });
+    H.hello(workers.last);
+    H.apply(H.chunk(O, [H.cand('m1', O)]));
+    done();
+    for (let turn = 1; turn <= 3; turn++) assert.equal(ctx.clock.step(), true);
+    assert.equal(idx().length, 3);
+    assert.deepEqual(t.rescan(), { ok: true });
+    assert.deepEqual(idx(), [], 'a new, empty store');
+    ctx.clock.advance(20000);
+    assert.deepEqual(idx(), [], 'the chain died with the store it was building for');
+    assert.equal(H.meta('indexes_built'), '');
+
+    // A quit between two steps: the indexes built so far stay, the flag does
+    // not, and the next done carries on (IF NOT EXISTS).
+    H.hello(workers.last);
+    H.apply(H.chunk(O, [H.cand('m1', O)]));
+    done();
+    assert.equal(ctx.clock.step(), true);
+    assert.equal(ctx.clock.step(), true);
+    assert.deepEqual(idx().sort(), ['idx_resp_file', 'idx_sight_file']);
+    assert.deepEqual(t.close(), { ok: true });
+    assert.equal(ctx.clock.count(), 0, 'close leaves no step behind');
+    assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
+    assert.equal(idx().length, 2, 'opening a store whose flag is not set builds nothing inline');
+    assert.equal(H.meta('indexes_built'), '');
+    H.hello(workers.last);
+    ctx.clock.advance(10000);
+    assert.equal(workers.last.of('walk').pop().mode, 'catchup');
+    done('catchup');
+    assert.equal(idx().length, 2);
+    ctx.clock.advance(0);
+    assert.equal(idx().length, 7);
+    assert.equal(H.meta('indexes_built'), '1');
+    assert.equal(H.n('responses'), 1);
   },
 
   parseVersion(H) {
@@ -1086,6 +1486,100 @@ const SCENARIOS = {
     assert.equal(t.status().parseVersion, 2);
     assert.equal(workers.made.length, count + 1, 'and its hello does not rebuild again');
     assert.equal(workers.last.of('walk').pop().mode, 'backfill');
+  },
+
+  rebuildKeepsOld(H) {
+    // Jason: "Warn, and keep the old store aside". Every rebuild that used to
+    // delete the store (the Rebuild button, a changed parser version, a changed
+    // schema version) renames it to token-usage.db.before-rebuild-<epoch ms>
+    // instead, complete, and only the latest one is kept.
+    const { t } = H;
+    const { ctx, workers } = H.start({ worker: true });
+    const kept = () => H.listData().filter((f) => /^token-usage\.db\.before-rebuild-\d{13}$/.test(f));
+    // Reading a kept file (it is in WAL mode) leaves a -wal and a -shm beside
+    // it; they are named after it, so the next rebuild removes them with it.
+    const beside = () => H.listData().filter((f) => f.startsWith('token-usage.db.before-rebuild-') && !kept().includes(f));
+    const readKept = (name) => {
+      const old = new (require('better-sqlite3'))(path.join(H.dirs.dataDir, name), { readonly: true, fileMustExist: true });
+      try {
+        return {
+          ids: old.prepare('SELECT message_id FROM responses ORDER BY message_id').all().map((r) => r.message_id),
+          missing: old.prepare('SELECT rel_path FROM files WHERE missing_since IS NOT NULL').all().map((r) => r.rel_path),
+          check: old.pragma('integrity_check', { simple: true }),
+        };
+      } finally {
+        old.close();
+      }
+    };
+    const warns = () => ctx.logs.filter((l) => l.startsWith('warn: ') && l.includes('could not be kept'));
+    const O = H.mainRow(SID_O);
+    const G = H.mainRow(SID_X, { birthtime_ms: 3000 });
+    H.touch(O.rel_path);
+    H.apply(H.chunk(O, [H.cand('m1', O), H.cand('m2', O)]));
+    // G's transcript is not on disk any more: its rows are history only the store has.
+    H.apply(H.chunk(G, [H.cand('g1', G)]));
+    workers.last.emit('message', { type: 'done', gen: t._gen(), mode: 'backfill', seen: [O.rel_path], missing: [G.rel_path] });
+    assert.equal(t.status().filesMissing, 1);
+    assert.deepEqual(kept(), []);
+
+    // 1. The Rebuild button.
+    assert.deepEqual(t.rescan(), { ok: true });
+    assert.equal(H.n('responses'), 0, 'the store itself starts empty, as before');
+    let k = kept();
+    assert.equal(k.length, 1, H.listData().join(', '));
+    assert.deepEqual(beside(), [], 'one file: no -wal or -shm travels with it');
+    assert.deepEqual(readKept(k[0]), { ids: ['g1', 'm1', 'm2'], missing: [G.rel_path], check: 'ok' },
+      'the kept file opens read-only and holds every row of the old store, the write-ahead log included');
+    assert.ok(ctx.logs.some((l) => l.startsWith('info: [token-usage]') && l.includes(k[0])), 'the log names the kept file');
+
+    // 2. A changed parser version at the worker's hello. Only the latest is kept.
+    H.hello(workers.last, 1);
+    H.apply(H.chunk(O, [H.cand('n1', O)]));
+    workers.last.emit('message', { type: 'done', gen: t._gen(), mode: 'backfill', seen: [O.rel_path], missing: [] });
+    t.close();
+    assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
+    H.hello(workers.last, 2);
+    assert.equal(H.n('responses'), 0);
+    k = kept();
+    assert.equal(k.length, 1, 'never more than one: ' + k.join(', '));
+    assert.deepEqual(beside(), [], 'what the read above left beside the older copy went with it');
+    assert.deepEqual(readKept(k[0]).ids, ['n1'], 'and it is the store that was just replaced');
+
+    // 3. A changed schema version at open.
+    H.hello(workers.last, 2);
+    H.apply(H.chunk(O, [H.cand('s1', O), H.cand('s2', O)]));
+    t._handle().prepare("UPDATE meta SET value = '999' WHERE key = 'schema_version'").run();
+    t.close();
+    assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
+    assert.equal(H.n('responses'), 0);
+    k = kept();
+    assert.equal(k.length, 1);
+    assert.deepEqual(readKept(k[0]).ids, ['s1', 's2']);
+    assert.deepEqual(warns(), [], 'nothing to warn about so far');
+
+    // 4. The rename fails: the rebuild still happens, the way it did before
+    // (the file is deleted), and one warn line says the store was not kept.
+    H.hello(workers.last, 2);
+    H.apply(H.chunk(O, [H.cand('f1', O)]));
+    const realRename = fs.renameSync;
+    fs.renameSync = (from, to) => {
+      if (String(to).includes('before-rebuild')) throw Object.assign(new Error('EBUSY: resource busy or locked, rename'), { code: 'EBUSY' });
+      return realRename(from, to);
+    };
+    let r;
+    try {
+      assert.doesNotThrow(() => { r = t.rescan(); });
+    } finally {
+      fs.renameSync = realRename;
+    }
+    assert.deepEqual(r, { ok: true });
+    assert.equal(t.status().state, 'ok');
+    assert.equal(H.n('responses'), 0, 'rebuilt all the same');
+    assert.equal(H.meta('backfill_done'), '');
+    assert.equal(warns().length, 1, ctx.logs.join('\n'));
+    k = kept();
+    assert.equal(k.length, 1, 'the copy kept before is left alone');
+    assert.deepEqual(readKept(k[0]).ids, ['s1', 's2']);
   },
 
   async corruptAtRunTime(H) {
@@ -1145,6 +1639,64 @@ const SCENARIOS = {
     assert.equal(fs.existsSync(H.offFile), false);
   },
 
+  async queryCorrupt(H) {
+    // Corruption that only a QUERY reads (review C2): the queries module
+    // answers { error, code } instead of throwing, so the store has to look at
+    // the code. Here the queries run inline, against a stub that reports what
+    // better-sqlite3 reports for a damaged page.
+    const { t } = H;
+    let handles = 0;
+    let failWith = null;
+    queriesStub = { exports: { createQueries: () => {
+      const mine = ++handles;
+      const answer = (name) => () => (failWith && failWith.handle === mine
+        ? { error: 'query failed: ' + failWith.message, code: failWith.code }
+        : { name, handle: mine });
+      return { summary: answer('summary'), models: answer('models'), daily: answer('daily'), sessions: answer('sessions'), context: answer('context') };
+    } } };
+    const { ctx, workers } = H.start({ worker: true });
+    const O = H.mainRow(SID_O);
+    H.apply(H.chunk(O, [H.cand('m1', O)]));
+    workers.last.emit('message', { type: 'done', gen: t._gen(), mode: 'backfill', seen: [], missing: [] });
+    ctx.clock.advance(0);
+    assert.ok(H.meta('backfill_done'));
+    assert.equal((await t.summary({})).handle, 1);
+    const corruptFiles = () => H.listData().filter((f) => /^token-usage\.db\.corrupt-\d+$/.test(f));
+
+    // A failed query that is not corruption changes nothing.
+    failWith = { handle: 1, message: 'database is locked', code: 'SQLITE_BUSY' };
+    const busy = await t.summary({});
+    assert.deepEqual([busy.error, busy.code, busy.scan.state], ['query failed: database is locked', 'SQLITE_BUSY', 'ok']);
+    assert.equal(H.n('responses'), 1);
+    assert.deepEqual(corruptFiles(), []);
+
+    // The Tokens tab asks four at once; the first one meets the damage.
+    failWith = { handle: 1, message: 'database disk image is malformed', code: 'SQLITE_CORRUPT' };
+    const g = t._gen();
+    const answers = await Promise.all([t.summary({}), t.models({}), t.daily({}), t.sessions({})]);
+    assert.equal(answers[0].error, 'query failed: database disk image is malformed');
+    assert.deepEqual(answers.slice(1).map((a) => [a.error, a.name, a.handle]),
+      [[undefined, 'models', 2], [undefined, 'daily', 2], [undefined, 'sessions', 2]], 'the rest are answered by the new store');
+    assert.equal(t.status().state, 'ok', 'recovered: ' + t.status().reason);
+    assert.equal(corruptFiles().length, 1, 'one query, one renamed file: ' + H.listData().join(', '));
+    assert.ok(t._gen() > g, 'the generation is bumped');
+    assert.equal(H.n('responses'), 0, 'a fresh store');
+    assert.equal(H.meta('backfill_done'), '');
+    assert.equal(workers.made.length, 2);
+    assert.equal(workers.made[0].terminated, true);
+    H.hello(workers.last);
+    assert.equal(workers.last.of('walk').pop().mode, 'backfill', 'a backfill is requested');
+    assert.ok(ctx.logs.some((l) => l.startsWith('error: [token-usage]') && l.includes('malformed')), ctx.logs.join('\n'));
+
+    // Once per init, as on the write path: a second one turns the store off.
+    failWith = { handle: 2, message: 'disk I/O error', code: 'SQLITE_IOERR_SHORT_READ' };
+    const second = await t.summary({});
+    assert.equal(second.error, 'query failed: disk I/O error');
+    assert.deepEqual([t.status().state, t.status().reasonCode], ['disabled', 'failure']);
+    assert.equal(corruptFiles().length, 1);
+    assert.equal(ctx.clock.count(), 0);
+  },
+
   writeFailure(H) {
     // Any other failure on the write path turns the store off instead of
     // repeating on every event. The transaction is rolled back.
@@ -1182,11 +1734,12 @@ const SCENARIOS = {
     // Run twice on the same folder by the parent: the second init changes nothing.
     const { t } = H;
     const second = process.env.TOKEN_USAGE_ARG === 'second';
-    const { workers } = H.start({ worker: true });
+    const { ctx, workers } = H.start({ worker: true });
     if (!second) {
       const O = H.mainRow(SID_O);
       H.apply(H.chunk(O, [H.cand('m1', O), H.cand('m2', O)]));
       workers.last.emit('message', { type: 'done', gen: t._gen(), mode: 'backfill', seen: [], missing: [] });
+      ctx.clock.advance(0);       // the index chain: one statement per timer turn
     }
     const out = {
       master: H.master(),
@@ -1259,15 +1812,24 @@ function parentMain() {
     ownershipIsCommutative: 'ownership and counters are the same in either scan order',
     cascade: 'cascade: scan O, scan C, full-rescan O, flush; totals equal a fresh rebuild; O marked missing keeps its rows',
     cascadeGuard: 'cascade guard: mutual owners are rescanned at most once per cycle',
+    cascadeContinuationFirst: 'cascade: a continuation and then its original fully rescanned in one cycle end equal to a fresh rebuild',
+    cascadeChain: 'cascade: a file already rescanned in the cycle gets one extra reset when a later rescan deletes rows it sighted',
+    cascadeTerminates: 'cascade: a ring of owners stops by itself, no file fully rescanned more than twice in a cycle',
+    missingMarks: 'a file marked missing is sent with its mark and size -1: not reported again, and scanned if it comes back',
     generation: 'stale gen writes nothing; out-of-order seq is dropped with scan_error protocol; discarded pass writes nothing',
     killBetweenChunks: 'kill between chunks: the offset never advances without the last chunk; rows equal a single full scan',
+    enableAndTheFlag: 'enable() removes the flag file only when the kill switch turned the store off; disable() and enable() are broadcast',
+    healthyStartLogs: 'a healthy start logs: opened (path, schema, files), walk started (mode), done (mode, files, seconds)',
     killSwitch: 'kill switch: token-usage.off opens nothing; disable() and enable() work without a relaunch',
     noThrow: 'no export throws: garbage arguments, before init, after disable',
     dbPathIsDirectory: 'no export throws when the database path is a directory',
     queriesFacade: 'a missing or broken queries module yields { error }; a working one is delegated to with scan added',
     rebuild: 'Rebuild: gen bump, worker replaced, store emptied, backfill walk, second request refused while running',
     parseVersion: 'parse_version comes from hello; a changed parser rebuilds the store',
+    indexChain: 'the secondary indexes are built one per timer turn after a backfill; a Rebuild cancels the chain; the flag is set last',
+    rebuildKeepsOld: 'a rebuild keeps the store it replaces as token-usage.db.before-rebuild-<ms>, the latest only; a failed rename falls back to a delete',
     corruptAtRunTime: 'corruption at run time: renamed, generation bumped, rebuilt once, then disabled',
+    queryCorrupt: 'corruption that only a query meets is recovered the same way: one renamed file, a backfill; other query errors change nothing',
     writeFailure: 'a write-path failure disables the store without throwing and without the kill-switch file',
   };
   for (const name of Object.keys(simple)) {

@@ -327,6 +327,11 @@ function boot(opts = {}) {
     api[name] = (arg) => { calls.push([name, arg]); return knobs.respond(name, arg); };
   }
   for (const name of opts.missing || []) delete api[name];
+  // A fake clock for the view's timers and for its Date.now(): no real timer is
+  // left pending when a test ends (a 5 s one would hold the process open and
+  // then fire into a discarded DOM), and a test moves time with app.tick(ms).
+  // `new Date()` in the view stays real, so the day ranges are today's.
+  const clock = { now: Date.now(), timers: [], seq: 0 };
   const context = vm.createContext({
     window: { api, innerWidth: 1200, confirm: (m) => { confirms.push(m); return knobs.confirm; } },
     document: dom.document,
@@ -334,13 +339,31 @@ function boot(opts = {}) {
     statsViewerBody: dom.activityBody,
     escapeHtml: (s) => String(s),
     formatDate: () => '1m ago',
-    setTimeout, clearTimeout,
+    setTimeout: (fn, ms) => { const id = ++clock.seq; clock.timers.push({ id, at: clock.now + (Number(ms) || 0), fn }); return id; },
+    clearTimeout: (id) => { clock.timers = clock.timers.filter(t => t.id !== id); },
+    __now: () => clock.now,
   });
   const run = (js) => vm.runInContext(js, context);
+  run('Date.now = __now;');
   run(STATS_SOURCE);
   if (!opts.noTokenView) run(VIEW_SOURCE);
   const count = (name) => calls.filter(c => c[0] === name).length;
-  return { ...dom, run, calls, count, confirms, errors, listeners, knobs, api };
+  // Moves the fake clock forward, running every timer that falls due, in order.
+  const tick = async (ms) => {
+    const target = clock.now + ms;
+    for (;;) {
+      const due = clock.timers.filter(t => t.at <= target).sort((a, b) => a.at - b.at || a.id - b.id)[0];
+      if (!due) break;
+      clock.now = due.at;
+      clock.timers = clock.timers.filter(t => t !== due);
+      due.fn();
+      await flush();
+    }
+    clock.now = target;
+    await flush();
+  };
+  const args = (name) => calls.filter(c => c[0] === name).map(c => plain(c[1] === undefined ? null : c[1]));
+  return { ...dom, run, calls, count, args, confirms, errors, listeners, knobs, api, clock, tick };
 }
 
 async function openTokens(app) {
@@ -450,9 +473,11 @@ test('ok: toolbar, cards, chart, tables and footer; transcript text stays text',
   assert.equal(byClass(app.tokensBody, 'stats-spinner').length, 0);
   assert.equal(app.htmlWrites.length, 0, 'innerHTML was used');
 
-  // Default range is the last 30 local days, sent explicitly.
+  // Default range is the last 30 local days, sent explicitly. The summary
+  // request of an opening load also says so (opened: true); the others do not.
   const q = app.calls.find(c => c[0] === 'getTokenStatsSummary')[1];
-  assert.deepEqual(plain(q), tokRangeFor('30d', new Date()));
+  assert.deepEqual(plain(q), { ...tokRangeFor('30d', new Date()), opened: true });
+  assert.deepEqual(plain(app.calls.find(c => c[0] === 'getTokenStatsModels')[1]), tokRangeFor('30d', new Date()));
   const sq = app.calls.find(c => c[0] === 'getTokenStatsSessions')[1];
   assert.equal(sq.sort, 'weighted');
   assert.equal(sq.limit, 200);
@@ -834,7 +859,7 @@ test('render generation: a late response from an older range cannot overwrite a 
   button(app.tokensBody, '7d').fire('click');
   await flush();
   const last = app.calls.filter(c => c[0] === 'getTokenStatsSummary').pop()[1];
-  assert.deepEqual(plain(last), tokRangeFor('7d', new Date()));
+  assert.deepEqual(plain(last), { ...tokRangeFor('7d', new Date()), opened: true });
   assert.match(app.tokensBody.textContent, /NEW RANGE/);
 
   for (const release of pending) release();   // the 30d answers arrive now
@@ -857,12 +882,14 @@ test('onTokenStatsChanged is registered once, at script load, however often the 
   assert.equal(app.listeners.length, 1);
 });
 
-test('change events: re-query on idle, not more than every 5 s during a scan, never while hidden', async () => {
+test('change events: one 5 s floor for every phase, one trailing timer, never while hidden', async () => {
   const app = boot();
   const fire = app.listeners[0];
+  const idle = () => fire({ phase: 'idle', done: 9, total: 9 });
   fire({ phase: 'idle', done: 1, total: 1 });          // tab never opened
   await flush();
   assert.equal(app.count('getTokenStatsSummary'), 0);
+  assert.equal(app.clock.timers.length, 0);
 
   await openTokens(app);
   assert.equal(app.count('getTokenStatsSummary'), 1);
@@ -872,17 +899,85 @@ test('change events: re-query on idle, not more than every 5 s during a scan, ne
   assert.match(byClass(app.tokensBody, 'token-status')[0].textContent, /Scanning transcripts\u2026 3 \/ 9/);
   assert.equal(byClass(app.tokensBody, 'stats-spinner').length, 0);
 
-  fire({ phase: 'idle', done: 9, total: 9 });
+  // Idle events are held to the same floor (the store sends one after every
+  // applied chunk while sessions run): five of them inside 5 s re-query nothing
+  // now and arm ONE timer between them.
+  const firstRow = byClass(app.tokensBody, 'token-session-row')[0];
+  for (let i = 0; i < 5; i++) idle();
   await flush();
-  assert.equal(app.count('getTokenStatsSummary'), 2);
+  assert.equal(app.count('getTokenStatsSummary'), 1, 'an idle event inside 5 s must not re-query');
+  assert.equal(byClass(app.tokensBody, 'token-session-row')[0], firstRow, 'the rows were rebuilt inside the floor');
+  assert.equal(app.clock.timers.length, 1, 'one trailing timer for all of them');
+  assert.match(byClass(app.tokensBody, 'token-status')[0].textContent, /^Scanned /, 'the status line still follows every event');
+
+  await app.tick(4999);
+  assert.equal(app.count('getTokenStatsSummary'), 1);
+  await app.tick(1);
+  assert.equal(app.count('getTokenStatsSummary'), 2, 'the last change is picked up when the floor has passed');
+  assert.equal(app.clock.timers.length, 0);
   assert.equal(byClass(app.tokensBody, 'stats-spinner').length, 0, 'a live refresh does not flash spinners');
 
+  // Past the floor a change re-queries at once, with no timer.
+  await app.tick(5000);
+  idle();
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), 3);
+  assert.equal(app.clock.timers.length, 0);
+
+  // Any load answers a waiting change: the trailing timer is dropped with it.
+  idle();
+  await flush();
+  assert.equal(app.clock.timers.length, 1);
+  button(app.tokensBody, '7d').fire('click');
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), 4);
+  assert.equal(app.clock.timers.length, 0, 'a load must clear the trailing timer');
+  await app.tick(6000);
+  assert.equal(app.count('getTokenStatsSummary'), 4);
+
+  // A timer still waiting when the tab is left does not query a hidden tab.
+  idle();
+  await flush();
+  assert.equal(app.clock.timers.length, 0, 'past the floor: queried at once');
+  assert.equal(app.count('getTokenStatsSummary'), 5);
+  idle();
+  await flush();
+  assert.equal(app.clock.timers.length, 1);
   app.subtabs[0].fire('click');                        // Activity showing now
   await flush();
-  fire({ phase: 'idle', done: 9, total: 9 });
+  await app.tick(6000);
+  assert.equal(app.count('getTokenStatsSummary'), 5, 'the trailing timer fired into a hidden tab');
+  idle();
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), 5);
+  assert.equal(app.clock.timers.length, 0);
+  for (const bad of [null, undefined, 'x']) fire(bad);
+  assert.deepEqual(app.errors, []);
+});
+
+test('a change event while a slow load is in flight: one reload after it, not one per event', async () => {
+  const pending = [];
+  let slow = false;
+  const app = boot({ respond: (name) => (slow
+    ? new Promise(resolve => pending.push(() => resolve(okData()[METHODS[name]])))
+    : okData()[METHODS[name]]) });
+  await openTokens(app);
+  await app.tick(5000);
+  slow = true;
+  app.listeners[0]({ phase: 'idle', done: 1, total: 1 });      // past the floor: a quiet load starts and hangs
   await flush();
   assert.equal(app.count('getTokenStatsSummary'), 2);
-  for (const bad of [null, undefined, 'x']) fire(bad);
+  for (let i = 0; i < 3; i++) app.listeners[0]({ phase: 'idle', done: 1, total: 1 });
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), 2);
+  assert.equal(app.clock.timers.length, 1);
+  slow = false;
+  for (const release of pending) release();
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), 2, 'the answer of the slow load must not start another inside the floor');
+  await app.tick(5000);
+  assert.equal(app.count('getTokenStatsSummary'), 3);
+  assert.equal(app.clock.timers.length, 0);
   assert.deepEqual(app.errors, []);
 });
 
@@ -946,4 +1041,516 @@ test('context over time: step line, reference lines, compaction and handoff mark
   assert.equal(app.count('getTokenStatsContext'), 2);
   assert.equal(byTag(app.tokensBody, 'svg').length, 1);
   assert.equal(byClass(app.document.body, 'token-tooltip').length, 1);
+});
+
+// ── review fixes (fix-list R-1 to R-13) ─────────────────────────────────────
+
+const withContext = (over) => (name) => {
+  const d = okData();
+  if (name === 'getTokenStatsContext') return { ...d.context, ...over };
+  return d[METHODS[name]];
+};
+
+async function openContext(app) {
+  await openTokens(app);
+  byClass(app.tokensBody, 'token-session-row')[0].fire('click');
+  await flush();
+  return byTag(app.tokensBody, 'svg')[0];
+}
+
+test('R-1: the context tooltip names the hovered point\'s own model; the reply\'s model is only the fallback', async () => {
+  const base = okData().context.points;
+  // The session switched models: the reply's `model` is the LAST response's.
+  const app = boot({ respond: withContext({ model: 'claude-fable-5-1', points: [
+    { ...base[0], model: 'claude-opus-5-5' },
+    { ...base[1], model: 'claude-opus-<b>5</b>' },
+    { ...base[2] },                                    // an older main process: no model on the point
+  ] }) });
+  const svg = await openContext(app);
+  const tip = () => byClass(app.document.body, 'token-tooltip')[0].textContent;
+
+  svg.fire('mousemove', { clientX: 60, clientY: 100 });        // the first point
+  assert.match(tip(), /Context 100K \(100,000\)Output 500claude-opus-5-5$/);
+  svg.fire('mousemove', { clientX: 470, clientY: 100 });       // the second: a model id is text, never markup
+  assert.match(tip(), /Output 900claude-opus-<b>5<\/b>$/);
+  assert.equal(byTag(app.document.body, 'b').length, 0);
+  svg.fire('mousemove', { clientX: 880, clientY: 100 });       // the third has none of its own
+  assert.match(tip(), /Output 100 \(not finalised\)claude-fable-5-1$/);
+  assert.equal(app.htmlWrites.length, 0);
+  assert.deepEqual(app.errors, []);
+});
+
+test('R-2: tokUsd rounds to cents first, so .995 and up carries into the dollars', async () => {
+  const { tokUsd } = view;
+  const cases = [
+    [0, '$0.00'], [0.004, '$0.00'], [0.005, '$0.01'], [0.994, '$0.99'], [0.995, '$1.00'], [0.999, '$1.00'],
+    [12.5, '$12.50'], [12.994, '$12.99'], [12.995, '$13.00'], [12.999, '$13.00'],
+    [999.999, '$1,000.00'], [1234.5, '$1,234.50'], [1234.9963, '$1,235.00'], [1999.9999, '$2,000.00'],
+    [1234567.891, '$1,234,567.89'],
+  ];
+  for (const [n, want] of cases) assert.equal(tokUsd(n), want, String(n));
+  for (const bad of [null, undefined, NaN, 'x', -3, Infinity]) assert.equal(tokUsd(bad), '$0.00', String(bad));
+
+  // Through the card: the tooltip is where the dollars are read.
+  const app = boot({ respond: (name) => {
+    const d = okData();
+    d.summary.weighted.usd = 1234.9963;
+    return d[METHODS[name]];
+  } });
+  await openTokens(app);
+  assert.match(byClass(app.tokensBody, 'token-card-weighted')[0].title, /About \$1,235\.00 at list prices\./);
+});
+
+test('R-3: a compaction with no recorded size is a mark only: no drop to 0 and no numbers', async () => {
+  const at = (min) => Date.UTC(2026, 9, 3, 10, min);
+  const app = boot({ respond: withContext({ compactions: [
+    { t: at(20), trigger: 'auto', pre: 450000, post: 30000 },
+    { t: at(60), trigger: 'auto', pre: 450000, post: null },
+    { t: at(100), trigger: 'manual', pre: null, post: null },
+  ] }) });
+  const svg = await openContext(app);
+  const marks = byClass(svg, 'token-ctx-compaction');
+  assert.equal(marks.length, 3);
+  assert.equal(byClass(svg, 'token-ctx-compaction-line').length, 3, 'every compaction keeps its mark');
+  assert.equal(byClass(svg, 'token-ctx-compaction-drop').length, 1, 'a drop is drawn only between two recorded sizes');
+  assert.deepEqual(byClass(svg, 'token-ctx-mark-label').map(n => n.textContent), [`450K ${ARROW} 30K`]);
+  const titles = marks.map(g => byTag(g, 'title')[0].textContent);
+  assert.match(titles[0], new RegExp(`^Compaction \\(auto\\) at .*: 450K ${ARROW} 30K$`));
+  assert.match(titles[1], /^Compaction \(auto\) at .*: size not recorded$/);
+  assert.match(titles[2], /^Compaction \(manual\) at .*: size not recorded$/);
+  for (const t of titles.slice(1)) assert.equal(t.includes(ARROW), false, t);
+  assert.match(app.tokensBody.textContent, /3 compactions/);
+  assert.deepEqual(app.errors, []);
+});
+
+test('R-4: a down-sampled chart counts the responses of the session, not the points drawn', async () => {
+  const app = boot({ respond: withContext({ totalPoints: 2500, downsampled: true }) });
+  const svg = await openContext(app);
+  assert.equal(byClass(app.tokensBody, 'token-caption')[0].textContent,
+    '2,500 responses · 1 compactions · 1 handoffs · down-sampled to 3 points');
+  assert.match(svg.attrs['aria-label'], /^Context tokens over time: 2500 responses, peak 468K$/);
+
+  // Not down-sampled: the two numbers are the same and nothing more is said.
+  const whole = boot({ respond: withContext({ totalPoints: 3, downsampled: false }) });
+  await openContext(whole);
+  assert.equal(byClass(whole.tokensBody, 'token-caption')[0].textContent, '3 responses · 1 compactions · 1 handoffs');
+
+  // A main process that sends no totalPoints: the drawn points are all there is to count.
+  const old = boot({ respond: withContext({ downsampled: true }) });
+  await openContext(old);
+  assert.equal(byClass(old.tokensBody, 'token-caption')[0].textContent, '3 responses · 1 compactions · 1 handoffs · down-sampled');
+  // A total smaller than what is drawn is not believed.
+  const odd = boot({ respond: withContext({ totalPoints: 1, downsampled: false }) });
+  await openContext(odd);
+  assert.match(byClass(odd.tokensBody, 'token-caption')[0].textContent, /^3 responses/);
+});
+
+test('R-5: clicking a session row moves the highlight at once', async () => {
+  const app = boot({ respond: (name, arg) => {
+    const d = okData();
+    if (name === 'getTokenStatsContext') return { ...d.context, sessionId: arg.sessionId };
+    return d[METHODS[name]];
+  } });
+  await openTokens(app);
+  const rows = byClass(app.tokensBody, 'token-session-row');
+  const flags = () => rows.map(r => r.classList.contains('selected'));
+  assert.deepEqual(flags(), [false, false]);
+  rows[0].fire('click');
+  assert.deepEqual(flags(), [true, false], 'the highlight must not wait for the answer');
+  await flush();
+  assert.deepEqual(flags(), [true, false]);
+  rows[1].fire('click');
+  await flush();
+  assert.deepEqual(flags(), [false, true]);
+  assert.equal(app.count('getTokenStatsSessions'), 1, 'the table was not re-queried to move it');
+  assert.equal(byClass(app.tokensBody, 'token-session-row')[0], rows[0], 'the rows were not rebuilt to move it');
+  // And the next render of the table agrees with it.
+  app.run('loadStats()');
+  await flush();
+  assert.deepEqual(byClass(app.tokensBody, 'token-session-row').map(r => r.classList.contains('selected')), [false, true]);
+});
+
+test('R-6: an Enable that fails leaves a notice with a usable button and says what came back', async () => {
+  // enable() answers { error } with no scan when init throws; the store is then
+  // off because of a failure, which is what the queries say next.
+  let state = 'flag';
+  let enableAnswer = () => { state = 'failed'; return { error: 'unable to open <b>database</b> file' }; };
+  const app = boot({ respond: (name) => {
+    if (name === 'enableTokenStats') return enableAnswer();
+    if (state === 'flag') return offAnswer('disabled by token-usage.off', 'kill-switch');
+    if (state === 'failed') return offAnswer('unable to open <b>database</b> file', 'failure');
+    return okData()[METHODS[name]];
+  } });
+  await openTokens(app);
+  assert.deepEqual(byTag(app.tokensBody, 'button').map(b => b.textContent), ['Enable']);
+
+  button(app.tokensBody, 'Enable').fire('click');
+  await flush();
+  assert.equal(app.count('enableTokenStats'), 1);
+  assert.equal(app.count('getTokenStatsSummary'), 2, 'the tab asks the store what state it is in now');
+  assert.equal(app.tokensBody.children.length, 1);
+  assert.equal(app.tokensBody.children[0].attrs.role, 'status');
+  assert.equal(app.tokensBody.textContent,
+    'Token analytics is off: unable to open <b>database</b> file.Try againEnable failed: unable to open <b>database</b> file.');
+  assert.equal(byClass(app.tokensBody, 'token-off-note').length, 1);
+  assert.equal(byTag(app.tokensBody, 'b').length, 0, 'the reason is text');
+  assert.equal(app.htmlWrites.length, 0);
+
+  // The button is usable: this time the store opens.
+  enableAnswer = () => { state = 'ok'; return { ok: true, state: 'ok' }; };
+  const again = button(app.tokensBody, 'Try again');
+  assert.equal(again.disabled, undefined);
+  again.fire('click');
+  await flush();
+  assert.equal(app.count('enableTokenStats'), 2);
+  assert.equal(byClass(app.tokensBody, 'token-headline').length, 1);
+
+  // No handler for the action (an older main process): the notice and its
+  // button stay, with the restart sentence under them.
+  const old = boot({ respond: (name) => (name === 'enableTokenStats'
+    ? Promise.reject(new Error('No handler registered'))
+    : offAnswer('disabled by token-usage.off', 'kill-switch')) });
+  await openTokens(old);
+  button(old.tokensBody, 'Enable').fire('click');
+  await flush();
+  assert.equal(old.tokensBody.textContent, 'Token analytics is off: disabled by token-usage.off.Enable' + TOK_NEEDS_RESTART);
+  button(old.tokensBody, 'Enable').fire('click');
+  await flush();
+  assert.equal(old.count('enableTokenStats'), 2, 'the button still works');
+  assert.equal(byClass(old.tokensBody, 'token-off-note').length, 1, 'one note, not one per try');
+  assert.deepEqual(old.errors, []);
+  assert.deepEqual(app.errors, []);
+});
+
+test('R-8: opened: true goes with the opening and with what the user asked for, never with a quiet refresh', async () => {
+  const app = boot({ respond: (name) => (METHODS[name] ? okData()[METHODS[name]] : { ok: true }) });
+  await openTokens(app);
+  const last = () => app.args('getTokenStatsSummary').pop();
+  assert.equal(last().opened, true, 'opening the tab');
+
+  await app.tick(5000);
+  app.listeners[0]({ phase: 'idle', done: 1, total: 1 });
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), 2);
+  assert.deepEqual(last(), tokRangeFor('30d', new Date()), 'a quiet refresh carries no opened key at all');
+
+  app.listeners[0]({ phase: 'idle', done: 1, total: 1 });      // inside the floor: the trailing timer
+  await app.tick(5000);
+  assert.equal(app.count('getTokenStatsSummary'), 3);
+  assert.equal('opened' in last(), false, 'the trailing refresh is quiet too');
+
+  button(app.tokensBody, '90d').fire('click');
+  await flush();
+  assert.equal(last().opened, true, 'a range change');
+  button(app.tokensBody, 'Rebuild').fire('click');
+  await flush();
+  assert.equal(app.count('rescanTokenStats'), 1);
+  assert.equal(last().opened, true, 'Rebuild');
+  app.run('loadStats()');
+  await flush();
+  assert.equal(last().opened, true, 'the Stats tab clicked again');
+  // Only the summary request carries it.
+  for (const name of ['getTokenStatsModels', 'getTokenStatsDaily', 'getTokenStatsSessions']) {
+    for (const q of app.args(name)) assert.equal('opened' in q, false, name);
+  }
+});
+
+const startingAnswer = (reason = 'not initialised') => offAnswer(reason, null);
+
+test('R-9: tokOutcome marks a store that has not started; every other off state is unchanged', () => {
+  const of = (value) => tokOutcome({ status: 'fulfilled', value });
+  assert.equal(of(startingAnswer()).starting, true);
+  assert.equal(of(startingAnswer('starting')).starting, true);
+  assert.equal(of(startingAnswer()).kind, 'disabled');
+  assert.equal(of(offAnswer('not initialised')).starting, true, 'no reasonCode at all is "no code" too');
+  for (const v of [offAnswer('not initialised', 'failure'), offAnswer('starting', 'kill-switch'), offAnswer('closed', null),
+    offAnswer('database is corrupt', null), offAnswer('disabled by token-usage.off'), { error: 'Token store unavailable: not initialised' }]) {
+    assert.equal(!!of(v).starting, false, JSON.stringify(v));
+  }
+});
+
+test('R-9: a store that has not started shows a starting line and asks again each second until it answers', async () => {
+  let started = false;
+  const app = boot({ respond: (name) => (started ? okData()[METHODS[name]] : startingAnswer()) });
+  await openTokens(app);
+  assert.equal(app.tokensBody.children.length, 1);
+  assert.equal(app.tokensBody.textContent, 'Token analytics is starting…');
+  assert.equal(app.tokensBody.children[0].attrs.role, 'status');
+  assert.equal(byTag(app.tokensBody, 'button').length, 0, 'no Try again for a store that is only starting');
+  assert.equal(app.count('getTokenStatsSummary'), 1);
+  assert.equal(app.clock.timers.length, 1);
+
+  const line = app.tokensBody.children[0];
+  await app.tick(999);
+  assert.equal(app.count('getTokenStatsSummary'), 1);
+  await app.tick(1);
+  assert.equal(app.count('getTokenStatsSummary'), 2);
+  assert.equal(app.count('getTokenStatsModels'), 1, 'asking again is one small question, not the whole tab');
+  assert.equal(app.tokensBody.children[0], line, 'the line stays put between tries (no flicker)');
+  assert.equal(app.clock.timers.length, 1);
+
+  // A change event while the line shows starts nothing extra: the timer is a second away.
+  app.listeners[0]({ phase: 'backfill', done: 0, total: 10 });
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), 2);
+  assert.equal(app.clock.timers.length, 1);
+
+  started = true;
+  await app.tick(1000);
+  assert.equal(byClass(app.tokensBody, 'token-headline').length, 1, 'the tab draws itself once the store answers');
+  assert.equal(app.clock.timers.length, 0);
+  const sent = app.args('getTokenStatsSummary');
+  assert.equal(sent.length, 4);
+  assert.deepEqual(sent.map(q => q.opened === true), [true, false, false, true],
+    'the tries are quiet; the load that draws the tab is the opening the user asked for');
+  await app.tick(60000);
+  assert.equal(app.count('getTokenStatsSummary'), 4, 'nothing keeps polling afterwards');
+  assert.deepEqual(app.errors, []);
+});
+
+test('R-9: the tries are bounded, then the off notice with Try again; a change event brings that notice back to life', async () => {
+  let started = false;
+  const app = boot({ respond: (name) => (started ? okData()[METHODS[name]] : startingAnswer('starting')) });
+  await openTokens(app);
+  await app.tick(60000);
+  assert.equal(app.count('getTokenStatsSummary'), 11, 'one load and ten tries');
+  assert.equal(app.clock.timers.length, 0, 'no timer left after the last try');
+  assert.equal(app.tokensBody.textContent, 'Token analytics is off: starting.Try again');
+
+  // Events for a hidden tab reload nothing.
+  started = true;
+  app.subtabs[0].fire('click');
+  await flush();
+  app.listeners[0]({ phase: 'backfill', done: 0, total: 10 });
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), 11);
+  assert.equal(app.clock.timers.length, 0);
+
+  // Showing again with the off notice up: the store's first event reloads the tab.
+  started = false;
+  app.subtabs[1].fire('click');
+  await flush();
+  await app.tick(60000);
+  assert.equal(app.tokensBody.textContent, 'Token analytics is off: starting.Try again');
+  const before = app.count('getTokenStatsSummary');
+  started = true;
+  app.listeners[0]({ phase: 'backfill', done: 0, total: 10 });
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), before + 1);
+  assert.equal(byClass(app.tokensBody, 'token-headline').length, 1);
+  assert.equal('opened' in app.args('getTokenStatsSummary').pop(), false, 'a reload nobody asked for is not an opening');
+  assert.deepEqual(app.errors, []);
+});
+
+test('R-9: the starting timer does not fire into a tab that was left or redrawn', async () => {
+  const app = boot({ respond: () => startingAnswer() });
+  await openTokens(app);
+  assert.equal(app.clock.timers.length, 1);
+  app.subtabs[0].fire('click');                        // Activity
+  await flush();
+  await app.tick(30000);
+  assert.equal(app.count('getTokenStatsSummary'), 1, 'a hidden tab was queried');
+  assert.equal(app.clock.timers.length, 0);
+
+  // Coming back starts over, with one timer, not two.
+  app.subtabs[1].fire('click');
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), 2);
+  assert.equal(app.clock.timers.length, 1);
+  app.run('loadStats()');                              // redrawn while the timer waits
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), 3);
+  assert.equal(app.clock.timers.length, 1, 'the redraw must replace the timer, not add one');
+
+  // A try that is answered after the tab was redrawn draws nothing.
+  let release;
+  app.knobs.respond = (name) => (name === 'getTokenStatsSummary' && !release
+    ? new Promise(resolve => { release = resolve; }) : okData()[METHODS[name]]);
+  await app.tick(1000);                                // the try is in flight
+  assert.equal(typeof release, 'function');
+  app.run('loadStats()');
+  await flush();
+  assert.equal(byClass(app.tokensBody, 'token-headline').length, 1);
+  const writes = app.tokensBody.mutations;
+  const asked = app.count('getTokenStatsSummary');
+  release(startingAnswer());
+  await flush();
+  assert.equal(app.tokensBody.mutations, writes);
+  assert.equal(app.count('getTokenStatsSummary'), asked);
+  assert.deepEqual(app.errors, []);
+});
+
+test('R-9 / V2: with the off notice showing, a change event reloads a visible tab (Enable in another window)', async () => {
+  let off = true;
+  const app = boot({ respond: (name) => (off ? offAnswer('disabled by token-usage.off', 'kill-switch') : okData()[METHODS[name]]) });
+  await openTokens(app);
+  assert.deepEqual(byTag(app.tokensBody, 'button').map(b => b.textContent), ['Enable']);
+
+  // Inside the floor the reload waits for the trailing timer, like any other.
+  off = false;
+  app.listeners[0]({ phase: 'idle', done: 0, total: 0 });
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), 1);
+  assert.equal(app.clock.timers.length, 1);
+  await app.tick(5000);
+  assert.equal(app.count('getTokenStatsSummary'), 2);
+  assert.equal(byClass(app.tokensBody, 'token-headline').length, 1);
+
+  // And the other way: Disable in another window turns this tab into the notice.
+  off = true;
+  await app.tick(5000);
+  app.listeners[0]({ phase: 'idle', done: 0, total: 0 });
+  await flush();
+  assert.equal(app.tokensBody.textContent, 'Token analytics is off: disabled by token-usage.off.Enable');
+  assert.equal(app.clock.timers.length, 0);
+
+  // While this window's own Enable is in flight its answer decides, not the event.
+  let release;
+  app.api.enableTokenStats = () => { app.calls.push(['enableTokenStats']); return new Promise(resolve => { release = resolve; }); };
+  await app.tick(5000);
+  button(app.tokensBody, 'Enable').fire('click');
+  await flush();
+  const asked = app.count('getTokenStatsSummary');
+  app.listeners[0]({ phase: 'idle', done: 0, total: 0 });
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), asked, 'the event reloaded under an action in flight');
+  assert.equal(app.clock.timers.length, 0);
+  off = false;
+  release({ ok: true, state: 'ok' });
+  await flush();
+  assert.equal(app.count('getTokenStatsSummary'), asked + 1);
+  assert.equal(byClass(app.tokensBody, 'token-headline').length, 1);
+  assert.deepEqual(app.errors, []);
+});
+
+test('R-10: the weighted tooltip takes its ratios from the reply, and keeps the old sentence without them', async () => {
+  const { tokRatioSentence } = view;
+  const FIXED = 'Weighted by API price ratios (input 1, output 5, cache write 1.25 / 2 for 5 m / 1 h, cache read 0.1; ' +
+    '0.05 Opus 5.5, 0.025 Fable 5.1) as of 2026-09-25. Not a bill.';
+  const ratios = { input: 1, output: 5, write5m: 1.25, write1h: 2, readDefault: 0.1 };
+  assert.equal(tokRatioSentence({}, '2026-09-25'), FIXED);
+  assert.equal(tokRatioSentence(null, '2026-09-25'), FIXED);
+  assert.equal(tokRatioSentence({ ratios: { ...ratios, output: 'x' }, readRatios: [] }, '2026-09-25'), FIXED, 'a broken ratio is not printed');
+  assert.equal(tokRatioSentence({ ratios: { input: 1 } }, '2026-09-25'), FIXED);
+
+  assert.equal(tokRatioSentence({ ratios, readRatios: [] }, '2026-10-01'),
+    'Weighted by API price ratios (input 1, output 5, cache write 1.25 / 2 for 5 m / 1 h, cache read 0.1) as of 2026-10-01. Not a bill.');
+  assert.equal(tokRatioSentence({ ratios }, 'v'),
+    'Weighted by API price ratios (input 1, output 5, cache write 1.25 / 2 for 5 m / 1 h, cache read 0.1) as of v. Not a bill.');
+  const readRatios = [{ model: 'claude-opus-5-5', read: 0.05 }, { model: 'claude-fable-5-1', read: 0.025 },
+    { model: 'claude-mythos-5-1', read: 0.025 }, { model: '', read: 0.5 }, { model: 'x', read: 'y' }, null];
+  assert.equal(tokRatioSentence({ ratios: { ...ratios, write1h: 2.0000000001, output: 4 }, readRatios }, 'v'),
+    'Weighted by API price ratios (input 1, output 4, cache write 1.25 / 2 for 5 m / 1 h, cache read 0.1; ' +
+    '0.05 claude-opus-5-5, 0.025 claude-fable-5-1, 0.025 claude-mythos-5-1) as of v. Not a bill.');
+
+  // On the card. A model id comes from a transcript: it is a title attribute, never markup.
+  const app = boot({ respond: (name) => {
+    const d = okData();
+    d.summary.weighted.ratios = ratios;
+    d.summary.weighted.readRatios = [{ model: 'claude-<i>mythos</i>-5-1', read: 0.025 }];
+    return d[METHODS[name]];
+  } });
+  await openTokens(app);
+  const card = byClass(app.tokensBody, 'token-card-weighted')[0];
+  assert.match(card.title, /^Weighted by API price ratios \(input 1, output 5, cache write 1\.25 \/ 2 for 5 m \/ 1 h, cache read 0\.1; 0\.025 claude-<i>mythos<\/i>-5-1\) as of 2026-09-25\. Not a bill\.\nAbout \$12\.50 at list prices\.$/);
+  assert.equal(byTag(app.tokensBody, 'i').length, 0);
+  assert.equal(app.htmlWrites.length, 0);
+
+  // A main process that sends neither field: the sentence the design gives.
+  const old = boot();
+  await openTokens(old);
+  assert.ok(byClass(old.tokensBody, 'token-card-weighted')[0].title.startsWith(FIXED));
+});
+
+test('R-11: an open store whose scanner is not running says so above the headline', async () => {
+  let reason = 'scanner stopped: the worker exited more than 3 times in an <b>hour</b>.';
+  const app = boot({ respond: (name) => okData({ scan: { reason } })[METHODS[name]] });
+  await openTokens(app);
+  const box = byClass(app.tokensBody, 'token-scan-notice')[0];
+  assert.equal(box.children.length, 1);
+  assert.equal(box.children[0].attrs.role, 'status');
+  assert.equal(box.textContent,
+    'Scanning is not running: scanner stopped: the worker exited more than 3 times in an <b>hour</b>. Totals may be out of date.');
+  assert.equal(byTag(app.tokensBody, 'b').length, 0, 'the reason is text');
+  assert.equal(app.htmlWrites.length, 0);
+  const order = app.tokensBody.children;
+  assert.ok(order.indexOf(box) < order.indexOf(byClass(app.tokensBody, 'token-section-headline')[0]), 'above the headline');
+  assert.equal(byClass(app.tokensBody, 'token-headline').length, 1, 'the totals are still shown');
+
+  // A change event carries no reason: the notice stays, and is not doubled.
+  app.listeners[0]({ phase: 'idle', done: 1, total: 1 });
+  await flush();
+  assert.equal(box.children.length, 1);
+
+  // The scanner is back (the store clears the reason at the next hello).
+  reason = null;
+  app.run('loadStats()');
+  await flush();
+  assert.equal(byClass(app.tokensBody, 'token-scan-notice')[0].textContent, '');
+
+  // Healthy stores say nothing, whatever shape "no reason" takes.
+  for (const healthy of [null, '', '   ', undefined, 7]) {
+    const fine = boot({ respond: (name) => okData({ scan: { reason: healthy } })[METHODS[name]] });
+    await openTokens(fine);
+    assert.equal(byClass(fine.tokensBody, 'token-scan-notice')[0].textContent, '', String(healthy));
+  }
+
+  // A first scan that stopped half way: both facts, the scanner first.
+  const half = boot({ respond: (name) => okData({ scan: { reason: 'scanner failed to start: no worker', phase: 'backfill', done: 412, total: 3017 } })[METHODS[name]] });
+  await openTokens(half);
+  assert.deepEqual(byClass(half.tokensBody, 'token-scan-notice')[0].children.map(n => n.textContent), [
+    'Scanning is not running: scanner failed to start: no worker. Totals may be out of date.',
+    'Scanning transcripts (412 / 3,017 files). Totals are partial until the scan finishes.',
+  ]);
+  half.listeners[0]({ phase: 'backfill', done: 500, total: 3017 });
+  await flush();
+  assert.deepEqual(byClass(half.tokensBody, 'token-scan-notice')[0].children.map(n => n.textContent), [
+    'Scanning is not running: scanner failed to start: no worker. Totals may be out of date.',
+    'Scanning transcripts (500 / 3,017 files). Totals are partial until the scan finishes.',
+  ]);
+  assert.deepEqual(app.errors.concat(half.errors), []);
+});
+
+test('R-12: queries running in the main process are named in the status line', async () => {
+  const NOTE = ' · queries are running in the main process (slower)';
+  const app = boot({ respond: (name) => okData({ scan: { queryMode: 'inline' } })[METHODS[name]] });
+  await openTokens(app);
+  const status = () => byClass(app.tokensBody, 'token-status')[0].textContent;
+  assert.equal(status(), 'Scanned 3,017 files · updated 14:02' + NOTE);
+  // A change event carries no queryMode: the note stays while a scan runs too.
+  app.listeners[0]({ phase: 'catchup', done: 3, total: 9 });
+  assert.equal(status(), 'Scanning transcripts… 3 / 9' + NOTE);
+
+  for (const mode of ['worker', undefined, null, 'INLINE']) {
+    const fine = boot({ respond: (name) => okData({ scan: { queryMode: mode } })[METHODS[name]] });
+    await openTokens(fine);
+    assert.equal(byClass(fine.tokensBody, 'token-status')[0].textContent, 'Scanned 3,017 files · updated 14:02', String(mode));
+  }
+});
+
+test('R-13: the Rebuild confirm says the old store is kept aside, and what leaves the views when files are gone', async () => {
+  const app = boot({ respond: (name) => (METHODS[name] ? okData()[METHODS[name]] : { ok: true }) });
+  await openTokens(app);
+  app.knobs.confirm = false;
+  button(app.tokensBody, 'Rebuild').fire('click');
+  await flush();
+  assert.equal(app.confirms.length, 1);
+  assert.match(app.confirms[0], /^Rebuild token analytics\?/);
+  assert.match(app.confirms[0], /The old store is kept beside the new one as token-usage\.db\.before-rebuild-<time>/);
+  assert.match(app.confirms[0], /Transcripts are only read\./);
+  assert.equal(/no longer on disk/.test(app.confirms[0]), false, 'nothing is missing, so nothing is said about it');
+  assert.equal(app.count('rescanTokenStats'), 0);
+  assert.equal(/throw away/i.test(button(app.tokensBody, 'Rebuild').title), false, 'the button no longer says the store is thrown away');
+
+  for (const [n, want] of [[7, /The history of 7 transcript files that are no longer on disk will leave the views\b/],
+    [1, /The history of 1 transcript file that is no longer on disk will leave the views\b/],
+    [1234, /The history of 1,234 transcript files that are no longer on disk will leave the views\b/]]) {
+    const gone = boot({ respond: (name) => (METHODS[name] ? okData({ scan: { filesMissing: n } })[METHODS[name]] : { ok: true }) });
+    await openTokens(gone);
+    gone.knobs.confirm = false;
+    button(gone.tokensBody, 'Rebuild').fire('click');
+    await flush();
+    assert.match(gone.confirms[0], want);
+    assert.match(gone.confirms[0], /token-usage\.db\.before-rebuild-<time>/);
+  }
 });

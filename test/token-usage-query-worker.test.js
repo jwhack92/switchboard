@@ -384,6 +384,7 @@ const SCENARIOS = {
     assert.deepEqual(ctx2.logs.filter((l) => l.includes('query worker is not available')),
       ['warn: [token-usage] the query worker is not available (worker file missing): token queries run in the main process']);
     assert.deepEqual(ctx.logs.filter((l) => !l.startsWith('info: ')), [], 'the worker path logged nothing at warn or error');
+    assert.equal(ctx.logs.filter((l) => l === 'info: [token-usage] query worker ready').length, 1, 'and its hello is in the log, once per worker');
     t.close();
     return { queries: Object.keys(viaWorker).length, rows: seeded.rows.length };
   },
@@ -415,6 +416,28 @@ const SCENARIOS = {
     assert.equal(t._handle().prepare('SELECT COUNT(*) AS n FROM responses').get().n, 0);
     assert.equal(workers.made.length, 2, 'the query worker is started again: the store stays open');
 
+    // The old file was not deleted: it was renamed (which, on Windows, only
+    // works because the worker's connection was confirmed closed first) and it
+    // is complete, the rows that were still in the write-ahead log included.
+    const keptFiles = () => fs.readdirSync(H.dirs.dataDir).filter((n) => n.startsWith('token-usage.db.before-rebuild-'));
+    const keptCounts = (name) => {
+      const old = new (require('better-sqlite3'))(path.join(H.dirs.dataDir, name), { readonly: true, fileMustExist: true });
+      try {
+        return {
+          responses: old.prepare('SELECT COUNT(*) AS n FROM responses').get().n,
+          marker: old.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'rebuild_marker'").get().n,
+          check: old.pragma('integrity_check', { simple: true }),
+        };
+      } finally {
+        old.close();
+      }
+    };
+    let kept = keptFiles();
+    assert.equal(kept.length, 1, fs.readdirSync(H.dirs.dataDir).join(', '));
+    assert.match(kept[0], /^token-usage\.db\.before-rebuild-\d{13}$/);
+    assert.equal(String(fs.statSync(path.join(H.dirs.dataDir, kept[0]), { bigint: true }).ino), idBefore, 'the kept file IS the old store');
+    assert.deepEqual(keptCounts(kept[0]), { responses: seeded.rows.length, marker: 1, check: 'ok' });
+
     const answered = await inFlight;
     assert.equal(answered.error, undefined, 'the query that was in flight is asked again of the new worker');
     assert.equal(answered.totals.responses, 0);
@@ -433,6 +456,9 @@ const SCENARIOS = {
     assert.equal(H.closedFlag(workers.made[1]), 1);
     assert.equal(workers.made.length, 3);
     assert.equal((await t.summary(ALL)).totals.responses, 0);
+    kept = keptFiles();
+    assert.equal(kept.length, 1, 'only the latest is kept: ' + kept.join(', '));
+    assert.deepEqual(keptCounts(kept[0]), { responses: 2, marker: 0, check: 'ok' });
     assert.deepEqual(ctx.logs.filter((l) => l.startsWith('warn: ') || l.startsWith('error: ')), []);
     t.close();
     assert.equal(H.closedFlag(workers.made[2]), 1);
@@ -522,6 +548,81 @@ const SCENARIOS = {
     t.close();
   },
 
+  // Real worker. Pages of the responses table are damaged ON DISK while the
+  // store is open and idle, so only a query reads them (review C2). The worker's
+  // answer carries the code, the store renames the file away and asks for a
+  // backfill.
+  async realCorruptQuery(H) {
+    const { t } = H;
+    const { EventEmitter } = require('events');
+    const workers = realQueryWorkers();
+    const scanners = [];
+    const ctx = H.ctx({
+      createQueryWorker: workers.create,
+      workerPath: path.join(APP_DIR, 'workers', 'scan-tokens.js'),
+      createWorker: (workerPath, workerData) => {
+        const s = new EventEmitter();
+        s.workerData = workerData;
+        s.posted = [];
+        s.postMessage = (m) => { s.posted.push(m); };
+        s.terminate = () => Promise.resolve(0);
+        scanners.push(s);
+        return s;
+      },
+    });
+    assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
+    const hello = (s) => s.emit('message', { type: 'hello', gen: s.workerData.gen, parseVersion: 1 });
+    hello(scanners[0]);
+    // Enough rows that the table has leaf pages of its own.
+    const f = H.fileRow('proj-a/' + S1 + '.jsonl', 'main', 'proj-a', S1);
+    for (let i = 0; i < 6; i++) {
+      const rows = [];
+      for (let j = 0; j < 500; j++) rows.push(H.cand('r' + i + '-' + j, f, { output: 1 }));
+      H.apply(f, rows);
+    }
+    scanners[0].emit('message', { type: 'done', gen: t._gen(), mode: 'backfill', seen: [], missing: [] });
+    for (let i = 0; i < 100 && t._handle().prepare("SELECT value FROM meta WHERE key = 'indexes_built'").get().value !== '1'; i++) await sleep(10);
+    assert.equal((await t.summary(ALL)).totals.responses, 3000);
+    assert.equal(workers.made.length, 1);
+
+    // Fold the log into the main file, then overwrite every leaf page of the table.
+    t._handle().pragma('wal_checkpoint(TRUNCATE)');
+    const pageSize = t._handle().pragma('page_size', { simple: true });
+    const leaves = t._handle().prepare("SELECT pageno FROM dbstat WHERE name = 'responses' AND pagetype = 'leaf'").all().map((r) => r.pageno);
+    assert.ok(leaves.length > 10 && !leaves.includes(1), 'leaf pages: ' + leaves.length);
+    const junk = Buffer.alloc(pageSize, 0xab);
+    const fd = fs.openSync(H.dbFile, 'r+');
+    try {
+      for (const p of leaves) fs.writeSync(fd, junk, 0, pageSize, (p - 1) * pageSize);
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    const g = t._gen();
+    // What the Tokens tab asks when it loads: four at once.
+    const answers = await Promise.all([t.summary(ALL), t.models(ALL), t.daily(ALL), t.sessions(ALL)]);
+    const failed = answers.filter((a) => typeof a.error === 'string');
+    assert.ok(failed.length >= 1, 'the query that read the damaged pages says so');
+    for (const a of failed) {
+      assert.match(a.error, /^query failed: .*malformed/);
+      assert.match(a.code, /^SQLITE_CORRUPT/, 'the code crosses the thread boundary with the error');
+    }
+    for (const a of answers) if (a.error === undefined) assert.equal(a.totals ? a.totals.responses : 0, 0, 'or it was asked again of the new store');
+    assert.equal(t.status().state, 'ok', 'recovered: ' + t.status().reason);
+    assert.ok(t._gen() > g);
+    const kept = fs.readdirSync(H.dirs.dataDir).filter((n) => /^token-usage\.db\.corrupt-\d+$/.test(n));
+    assert.equal(kept.length, 1, 'one renamed file: ' + fs.readdirSync(H.dirs.dataDir).join(', '));
+    assert.equal(H.closedFlag(workers.made[0]), 1, 'the worker confirmed its connection closed before the rename');
+    assert.equal(t._handle().prepare('SELECT COUNT(*) AS n FROM responses').get().n, 0, 'a fresh store');
+    assert.equal(scanners.length, 2, 'the scanner is started again');
+    hello(scanners[1]);
+    assert.deepEqual(scanners[1].posted.filter((m) => m.type === 'walk').map((m) => m.mode), ['backfill'], 'a backfill is requested');
+    // Queries work again, against the new file.
+    const after = await t.summary(ALL);
+    assert.deepEqual([after.error, after.totals.responses, after.scan.queryMode, after.scan.reasonCode], [undefined, 0, 'worker', null]);
+    t.close();
+  },
+
   // Real worker. One that is killed is replaced, and the query it was working
   // on resolves to { error }.
   async realKilled(H) {
@@ -572,7 +673,7 @@ const SCENARIOS = {
     });
     assert.deepEqual(t.init(ctx), { ok: true, state: 'ok' });
     scanner.emit('message', { type: 'hello', gen: scanner.workerData.gen, parseVersion: 1 });
-    const first = await t.summary(ALL);       // opens the tab: asks for the walk
+    const first = await t.summary(Object.assign({ opened: true }, ALL));   // opens the tab: asks for the walk
     assert.equal(workers.made[0].workerPath, QW_PATH, 'with ctx.workerPath: query-tokens.js beside the scan worker');
     assert.equal(first.totals.responses, 0);
     assert.equal(t.status().phase, 'backfill');
@@ -1070,6 +1171,7 @@ function parentMain() {
     realRebuild: 'Rebuild with the query worker open really replaces the database file; queries work again afterwards',
     realKillSwitch: 'the kill switch, shutdown() and close() close the worker\'s connection: the file can be deleted afterwards',
     realCorruptRename: 'a corrupt store is renamed away although the query worker had it open, and the worker is started again',
+    realCorruptQuery: 'pages damaged on disk that only a query reads: the worker answers with the code, the store renames the file and backfills',
     realKilled: 'a query worker that is killed is replaced, and the query it was working on resolves to { error }',
     realDuringBackfill: 'queries asked while a backfill is being written resolve, each seeing a committed state',
     realGarbage: 'nothing rejects for garbage arguments, and each answer equals the inline answer',
