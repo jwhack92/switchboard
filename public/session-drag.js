@@ -83,6 +83,9 @@ async function promote() {
   if (row) row.classList.add('dragging');
 
   const { label, subtitle } = sessionLabel(sessionId);
+  // A marker for the focus watch (focus-watch.js): main is about to track the
+  // cursor and float the ghost. finish() marks the other end.
+  try { window.TermDiag && window.TermDiag.focusMark('drag-start'); } catch {}
   const res = await window.api.sessionDragStart(sessionId, label, subtitle);
   if (!res || !res.ok) finish({ cancelled: true });
 }
@@ -132,6 +135,7 @@ function onPointerCancel(e) {
 }
 
 function finish({ cancelled }) {
+  try { window.TermDiag && window.TermDiag.focusMark(cancelled ? 'drag-cancel' : 'drag-end'); } catch {}
   if (active) {
     try { active.target.releasePointerCapture(active.pointerId); } catch {}
     const row = rowFor(active.sessionId);

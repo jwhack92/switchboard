@@ -240,6 +240,9 @@
   <script src="utils.js"></script>
   <script src="terminal-themes.js"></script>
   <script src="terminal-links.js"></script>
+  <!-- Before terminal-diagnostics.js, which wires window.FocusWatch into its
+       key and focus listeners when it starts (and runs without it if absent). -->
+  <script src="focus-watch.js"></script>
   <!-- Before terminal-manager.js: its recorders are called from the terminal's
        own data and key paths, so window.TermDiag must already exist. -->
   <script src="terminal-diagnostics.js"></script>

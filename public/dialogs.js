@@ -458,6 +458,8 @@ function showAddProjectDialog() {
   }
 
   dialog.querySelector('.add-project-browse-btn').onclick = async () => {
+    // A native folder picker is about to open: a marker for the focus watch.
+    try { window.TermDiag && window.TermDiag.focusMark('browse-folder'); } catch {}
     const folder = await window.api.browseFolder();
     if (folder) pathInput.value = folder;
   };

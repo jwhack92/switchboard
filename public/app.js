@@ -560,6 +560,8 @@ function showAdoptedCorpse(sessionId, serialized, projectPath, isPlainTerminal) 
 // from the serialized buffer the source window handed over, then attach with
 // skipReplay so main does not also replay its 256KB tail on top.
 async function adoptSession({ sessionId, serialized, projectPath, exited, isPlainTerminal }, depth = 0) {
+  // A marker for the focus watch (focus-watch.js), once per adopt, not per retry.
+  if (!depth) { try { window.TermDiag && window.TermDiag.focusMark('adopt'); } catch {} }
   try {
     // The session may not be in this window's sidebar at all, so resolve its
     // metadata from main rather than from the local sessionMap.
@@ -688,6 +690,7 @@ window.api.onAdoptSession(adoptSession);
 // them.
 window.api.onReleaseSession((sessionId) => {
   if (!openSessions.has(sessionId)) return;
+  try { window.TermDiag && window.TermDiag.focusMark('release'); } catch {}
   const wasActive = activeSessionId === sessionId;
   releaseSessionView(sessionId);
   sessionOwners.delete(sessionId);

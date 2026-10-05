@@ -3097,6 +3097,8 @@ function showNewSessionMenu(project, track, anchor) {
 
 /** One Attach: a plain folder attaches as it is; a repository asks how the project should work in it. */
 async function attachFolderAsk(project) {
+  // A native folder picker is about to open: a marker for the focus watch.
+  try { window.TermDiag && window.TermDiag.focusMark('browse-folder'); } catch {}
   const folder = await window.api.browseFolder();
   if (!folder) return;
   let info = { git: false };
@@ -3340,6 +3342,7 @@ async function renameTrackFlow(project, track) {
 }
 
 async function attachFolderFlow(project, mode, folderPath = null) {
+  if (!folderPath) { try { window.TermDiag && window.TermDiag.focusMark('browse-folder'); } catch {} }
   const folder = folderPath || await window.api.browseFolder();
   if (!folder) return;
   let branch = null;
@@ -4045,7 +4048,10 @@ async function showNewProjectDialog({ name: initialName = '', folders: initialFo
     if (created) await openFirstSession(launchTargetFor(created), { runtime: 'claude' });
   }
 
-  q('#np-add-folder').onclick = async () => addFolder(await window.api.browseFolder());
+  q('#np-add-folder').onclick = async () => {
+    try { window.TermDiag && window.TermDiag.focusMark('browse-folder'); } catch {}
+    return addFolder(await window.api.browseFolder());
+  };
   q('.add-project-cancel-btn').onclick = close;
   createBtn.onclick = create;
   nameInput.addEventListener('input', () => { renderBranchLine(); renderPreview(); });

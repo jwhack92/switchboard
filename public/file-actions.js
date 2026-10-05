@@ -102,6 +102,9 @@ function fileEntryMenuItems(root, entry, open) {
         name = await showPromptDialog({ title: 'Rename ' + entry.name, label: 'Name', value: entry.name, confirm: 'Rename' });
         if (!name || name === entry.name) return;
       }
+      // Main opens a native box for trash and an Explorer window for reveal and
+      // open-folder: a marker for the focus watch, named by the action.
+      try { window.TermDiag && window.TermDiag.focusMark('manage-' + action); } catch {}
       const result = await window.api.manageProjectEntry(root, entry.relativePath, action, name);
       if (!result?.ok) throw new Error(result?.error || 'Could not complete the file action.');
       if (result.cancelled || (action !== 'rename' && action !== 'trash')) return;

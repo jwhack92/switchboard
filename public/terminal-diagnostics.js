@@ -37,7 +37,14 @@
 //   Ctrl/Cmd+Shift+D   "this looks wrong" — writes a capture, repaints that
 //                      terminal, and offers a full redraw.
 //
-// and nothing else. Nothing in this module acts unless that key is pressed.
+// and nothing else. Nothing in this module touches a terminal unless that key
+// is pressed.
+//
+// One thing does speak up unasked: the focus watch (focus-watch.js, wired in
+// below). When keys reach a window that Chromium says is unfocused, typed
+// characters are being dropped, and the user is shown one notice that names
+// the cure (click another program and come back) while the app log gets one
+// line. It repairs nothing and changes no input.
 //
 // There used to be automatic detection as well: scan the rows after output
 // settled, and capture and "repair" when they looked wrong. It was removed on
@@ -58,6 +65,7 @@
   const KEY_RING = 400;                // key/data events, app-wide
   const EVENT_RING = 200;              // lifecycle notes, app-wide
   const BUFFER_LINES = 240;            // scrollback lines included in a capture
+  const CAPTURE_TIMEOUT_MS = 8000;     // then the next capture may run
 
   // --- Detector thresholds ------------------------------------------------
   // The detector now only annotates a capture the user asked for; it never
@@ -175,6 +183,19 @@
         t: now(), layer: 'onData', sessionId,
         data: visible(String(data).slice(0, 64)),
       });
+    } catch {}
+  }
+
+  /** A keypress or beforeinput at the window: proof that a character arrived,
+   *  which a keydown is not. Deliberately not recordKey(): only the event type
+   *  and, for beforeinput, its inputType ("insertText", "deleteContentBackward")
+   *  are kept. Never the key, the code or the data. */
+  function recordCharEvent(type, e) {
+    try {
+      const item = { t: now(), layer: 'document', type };
+      if (type === 'beforeinput') item.inputType = String((e && e.inputType) || '').replace(/[^A-Za-z]/g, '').slice(0, 40);
+      item.focus = focusSnapshot();
+      push(keyRing, KEY_RING, item);
     } catch {}
   }
 
@@ -384,6 +405,8 @@
       } : null,
       renderer: entry ? describeRenderer(entry) : null,
       focus: focusSnapshot(),
+      // Episodes, native dialogs and markers; null when focus-watch.js is absent.
+      focusWatch: focusWatch ? safe(() => focusWatch.snapshot()) : null,
       detector: result,
       // What xterm believes is on screen, right now. Compare against the PNG.
       viewport: rows,
@@ -405,17 +428,27 @@
   async function capture(reason, entry, scan) {
     if (busy) return null;
     busy = true;
+    let timer = null;
     try {
       const report = buildReport(reason, entry, scan);
-      const res = await window.api.diagCapture(report);
+      // A reply that never comes must not hold `busy` for the rest of the
+      // page's life: that would turn every later Ctrl+Shift+D into a silent
+      // no-op. Main may still finish writing after we stop waiting.
+      const gaveUp = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false, error: 'no reply after ' + (CAPTURE_TIMEOUT_MS / 1000) + ' s' }), CAPTURE_TIMEOUT_MS);
+      });
+      const res = await Promise.race([window.api.diagCapture(report), gaveUp]);
       if (res && res.ok) {
         note('captured', { reason, json: res.json });
+      } else {
+        note('capture-failed', { reason, error: String((res && res.error) || 'no result').slice(0, 160) });
       }
       return res;
     } catch (e) {
       note('capture-failed', { reason, error: String(e && e.message) });
       return null;
     } finally {
+      clearTimeout(timer);
       busy = false;
     }
   }
@@ -492,17 +525,44 @@
 
   /** Ctrl/Cmd+Shift+D. Record first, then try the two free repairs. */
   async function reportAndRepair() {
+    // No session is not "nothing to capture". The key ring, the event ring and
+    // the window's focus state belong to the window, and a window where typing
+    // has stopped working may well have no session selected. buildReport takes
+    // a null entry, and main names the file 'nosession'.
     const entry = activeEntry();
-    if (!entry) {
-      toast('Nothing to capture', 'No session is open in this window.', []);
+    const alreadyRunning = busy;
+    const before = await capture('user', entry);
+    const saved = !!(before && before.ok);
+    const steps = entry ? repair(entry) : [];
+    const fixed = steps.some((s) => s.cleared);
+    if (entry) note('repair', { steps, aggressive: false });
+
+    const actions = [];
+    if (entry) actions.push({ label: 'Force full redraw', primary: !fixed, onClick: forceRedraw });
+    actions.push({ label: 'Open folder', onClick: () => window.api.diagOpenFolder() });
+
+    // There is one toast at a time, so this one replaces the stuck-keyboard
+    // notice if it is up. Carry the cure over while the episode is still open.
+    const stuck = focusWatch && safe(() => focusWatch.snapshot().episode)
+      ? ' Keyboard input is stuck in this window: click another program and come back.' : '';
+
+    // Say "Captured" only when main said a file was written. This used to
+    // read "Captured ... Saved to the diagnostics folder" when capture() had
+    // returned nothing at all.
+    if (!saved) {
+      const why = alreadyRunning ? ' (the previous capture has not finished)'
+        : before && before.error ? ' (' + String(before.error).slice(0, 160) + ')' : '';
+      toast(
+        'Capture failed',
+        'Nothing was saved' + why + '.' + (fixed ? ' A repaint did fix the display.' : '') + stuck,
+        actions,
+      );
       return;
     }
-    const before = await capture('user', entry);
-    const steps = repair(entry);
-    const fixed = steps.some((s) => s.cleared);
-    note('repair', { steps, aggressive: false });
-
-    const where = before && before.ok ? before.json : 'the diagnostics folder';
+    if (!entry) {
+      toast('Captured', 'No session is open in this window, so nothing was repainted. Saved to ' + before.json + (stuck && '.' + stuck), actions);
+      return;
+    }
     // Claim a repair only when the detector saw damage and then stopped seeing
     // it. The detector does not recognise every kind of damage, so "nothing
     // detected" is not "nothing wrong" — say what was saved and offer the
@@ -510,12 +570,9 @@
     toast(
       fixed ? 'Captured, and repaired' : 'Captured',
       fixed
-        ? 'A repaint fixed it. Saved to ' + where
-        : 'Saved to ' + where + '. If it still looks wrong, Force full redraw makes the CLI repaint everything.',
-      [
-        { label: 'Force full redraw', primary: !fixed, onClick: forceRedraw },
-        { label: 'Open folder', onClick: () => window.api.diagOpenFolder() },
-      ],
+        ? 'A repaint fixed it. Saved to ' + before.json + (stuck && '.' + stuck)
+        : 'Saved to ' + before.json + '. If it still looks wrong, Force full redraw makes the CLI repaint everything.' + stuck,
+      actions,
     );
   }
 
@@ -537,14 +594,81 @@
     return mod && e.shiftKey && !e.altKey && e.code === 'KeyD';
   }
 
+  // --- Focus watch --------------------------------------------------------
+  //
+  // The rule lives in focus-watch.js; this is its browser side. If that file
+  // did not load, `focusWatch` stays null, window.confirm and window.alert are
+  // left as they are, and everything else in this module runs as before.
+
+  let focusWatch = null;
+
+  function initFocusWatch() {
+    try {
+      const FW = window.FocusWatch;
+      if (!FW || typeof FW.createFocusWatch !== 'function') return;
+      const watch = FW.createFocusWatch({
+        now,
+        setTimer: (fn, ms) => setTimeout(fn, ms),
+        clearTimer: (id) => clearTimeout(id),
+        hasFocus: () => document.hasFocus(),
+        isVisible: () => document.visibilityState !== 'hidden',
+        activeTag: () => {
+          const f = focusSnapshot();
+          return f.activeIsXtermTextarea ? 'TEXTAREA-xterm' : f.activeTag;
+        },
+        note,
+        // Main copies a renderer warning into the app log as
+        // "[renderer:<window id>] ..." when the app is not packaged (main.js,
+        // 'console-message'). That is the whole log route; main needs no change.
+        warn: (line) => console.warn(line),
+        notify: () => toast(
+          'Keyboard input is stuck in this window',
+          'Click another program and come back. (Recorded.)',
+          [], { timeout: 20_000 },
+        ),
+      });
+      focusWatch = watch;
+      // Native dialogs are the one trigger with a known mechanism, and until
+      // now nothing recorded that one had been open. The wrapper returns what
+      // the dialog returned (see wrapDialog).
+      for (const kind of ['confirm', 'alert']) {
+        const original = window[kind];
+        if (typeof original === 'function') window[kind] = watch.wrapDialog(kind, original, window);
+      }
+      watch.start();
+    } catch {}
+  }
+
+  /** Call into the focus watch. It must never be able to break a key
+   *  listener, so a missing watch and a throwing one both do nothing. */
+  function tellFocusWatch(method, a, b) {
+    if (!focusWatch) return;
+    try { focusWatch[method](a, b); } catch {}
+  }
+
+  /** A marker from another file: something suspected of causing the stuck
+   *  state is about to happen there (a session drag, an adopt or release, a
+   *  native folder picker, a file action). The caller passes a kind and
+   *  nothing else; where it was called from is read off the stack, as a file
+   *  name and a line. Call it the way the recorders are called,
+   *    try { window.TermDiag && window.TermDiag.focusMark('drag-start'); } catch {}
+   *  so that neither a missing file nor an older one can break the caller. */
+  function focusMark(kind) {
+    if (!focusWatch) return;
+    try { focusWatch.mark(kind, window.FocusWatch.callSite(new Error().stack, 'terminal-diagnostics.js')); } catch {}
+  }
+
   // --- Init ---------------------------------------------------------------
 
   function init() {
+    initFocusWatch();
+
     // Capture-phase, on the window, so it sees keys before anything can stop
     // them — including keys that never reach a terminal at all. That asymmetry
     // against the 'xterm' layer is the whole point of recording here.
     window.addEventListener('keydown', (e) => {
       recordKey('document', e);
+      tellFocusWatch('onKeydown', e);
       if (isReportHotkey(e)) {
         e.preventDefault();
         e.stopPropagation();
@@ -552,8 +676,17 @@
       }
     }, { capture: true });
 
-    window.addEventListener('focus', () => note('window-focus'));
-    window.addEventListener('blur', () => note('window-blur'));
+    // Whether a character followed the keydown. In the stuck state keydowns
+    // keep arriving and these stop, and no capture before this recorded either.
+    for (const type of ['keypress', 'beforeinput']) {
+      window.addEventListener(type, (e) => {
+        recordCharEvent(type, e);
+        tellFocusWatch('onCharEvent', type, e);
+      }, { capture: true });
+    }
+
+    window.addEventListener('focus', () => { note('window-focus'); tellFocusWatch('onWindowFocus'); });
+    window.addEventListener('blur', () => { note('window-blur'); tellFocusWatch('onWindowBlur'); });
     window.addEventListener('resize', () => note('window-resize', {
       w: window.innerWidth, h: window.innerHeight,
     }));
@@ -571,5 +704,6 @@
     forgetSession, rekeySession,
     inspect, viewportRows,
     capture, repair, reportAndRepair, forceRedraw,
+    focusMark,
   };
 })();
