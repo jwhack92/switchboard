@@ -1044,6 +1044,14 @@ function dismissSession(sessionId) {
 
 async function confirmAndStopSession(sessionId) {
   if (!await confirmDialog('Stop this session?', { confirm: 'Stop', danger: true })) return;
+  // From here on nothing typed goes to this session: its terminal has the
+  // keyboard again (the box gave it back), and a key that lands in a terminal
+  // while main is killing its process makes the shell print at the worst
+  // moment. xterm sends nothing while its input is switched off.
+  try {
+    const stopping = openSessions.get(sessionId);
+    if (stopping && stopping.terminal) stopping.terminal.options.disableStdin = true;
+  } catch {}
   await window.api.stopSession(sessionId);
   activePtyIds.delete(sessionId);
   if (!gridViewActive && activeSessionId === sessionId) {

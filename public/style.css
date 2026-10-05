@@ -1034,7 +1034,9 @@ body { display: flex; flex-direction: column; }
   line-height: 1.45;
   box-shadow: 0 0 0 3px rgba(120,130,255,0.08);
   /* The box is about 5px taller than the line of text it stands in for; taken
-     back here so the rows below do not jump while a name is edited. */
+     back here so the rows below do not jump while a name is edited. A block,
+     because the margins of an inline box do not shrink the line it sits on. */
+  display: block;
   margin-block: -2.5px;
 }
 

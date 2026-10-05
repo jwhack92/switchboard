@@ -526,8 +526,34 @@ let appDialogLastAnswerAt = -Infinity;
 
 /** When a key last went down anywhere in the window, box or no box. */
 let appDialogLastKeyAt = -Infinity;
+
+// The key that answered a box is used up whole. Its key-down closed the box
+// and moved the focus on, as a rule to a terminal; its character and its
+// key-up arrive after that, and a key still held down goes on repeating. A
+// native box swallowed all of that. Here it would be typed into whatever has
+// the focus now: an Enter into the very session that is being stopped.
+// { key, until }: events for that key are stopped until its key-up, and for
+// no longer than APP_DIALOG_KEY_TAIL_MS in case the key-up never comes.
+const APP_DIALOG_KEY_TAIL_MS = 500;
+let appDialogKeyTail = null;
+
+function appDialogSwallowKeyTail(e) {
+  const tail = appDialogKeyTail;
+  if (!tail) return;
+  if (performance.now() > tail.until) { appDialogKeyTail = null; return; }
+  if (e.key !== tail.key) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.type === 'keyup') appDialogKeyTail = null;
+}
+
 if (typeof window !== 'undefined') {
-  window.addEventListener('keydown', () => { appDialogLastKeyAt = performance.now(); }, true);
+  window.addEventListener('keydown', (e) => {
+    appDialogLastKeyAt = performance.now();
+    appDialogSwallowKeyTail(e);
+  }, true);
+  window.addEventListener('keypress', appDialogSwallowKeyTail, true);
+  window.addEventListener('keyup', appDialogSwallowKeyTail, true);
 }
 
 /**
@@ -658,10 +684,12 @@ function openAppDialog(request, done) {
   // Which of the box's buttons had the focus last, for taking it back below.
   let lastInBox = null;
 
-  function finish(result) {
+  function finish(result, byKey) {
     if (finished) return;
     finished = true;
     appDialogLastAnswerAt = performance.now();
+    // Answered with a key: the rest of that key press is nobody's.
+    if (typeof byKey === 'string') appDialogKeyTail = { key: byKey, until: performance.now() + APP_DIALOG_KEY_TAIL_MS };
     for (const type of KEY_EVENTS) window.removeEventListener(type, onKey, true);
     if (typeof document.removeEventListener === 'function') document.removeEventListener('focusin', onFocusIn, true);
     overlay.remove();
@@ -699,7 +727,7 @@ function openAppDialog(request, done) {
     }
     if (e.key === 'Escape') {
       e.preventDefault();
-      finish(false);
+      finish(false, e.key);
     } else if (e.key === 'Tab') {
       e.preventDefault();
       const at = buttons.indexOf(document.activeElement);
@@ -711,7 +739,7 @@ function openAppDialog(request, done) {
       // the focus on no button (after a click on the text), the first press
       // puts the ring back and the second one answers.
       const pressed = buttons.find((btn) => btn === document.activeElement);
-      if (pressed) finish(pressed === confirmBtn);
+      if (pressed) finish(pressed === confirmBtn, e.key);
       else confirmBtn.focus();
     }
   }

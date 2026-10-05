@@ -1043,6 +1043,54 @@ test('a box opened from a button hands the keyboard to the terminal on screen, n
   assert.equal(app.dom.active, field);
 });
 
+test('the key that answers a box is used up whole: its character, its repeats and its key-up reach nothing', async () => {
+  for (const key of ['Enter', ' ', 'Escape']) {
+    const app = boot();
+    const terminal = app.dom.body.appendChild(new app.dom.El('textarea'));
+    terminal.focus();
+    const answer = app.confirm('Stop this session?', { confirm: 'Stop', danger: true });
+    app.wait();
+    app.key(key);
+    assert.equal(await peek(answer), key !== 'Escape', JSON.stringify(key));
+    assert.equal(app.dom.active, terminal, 'the terminal has the keyboard again');
+    const before = app.behind.length;
+
+    // What follows the key-down that closed the box, in the order a browser sends it.
+    const char = app.event('keypress', key);
+    assert.equal(char.defaultPrevented, true, 'the character is not typed into the terminal');
+    assert.equal(char.stopped, true);
+    const repeat = app.event('keydown', key, { repeat: true });
+    assert.equal(repeat.defaultPrevented, true, 'nor is a key still held down');
+    const other = app.event('keydown', 'x');
+    assert.equal(other.defaultPrevented, false, 'another key is typed as usual');
+    const up = app.event('keyup', key);
+    assert.equal(up.stopped, true);
+    assert.equal(app.behind.length, before + 1, 'only the other key got through');
+
+    // After the key-up the key is an ordinary key again.
+    const next = app.event('keydown', key);
+    assert.equal(next.defaultPrevented, false, 'the next press of the same key is the terminal\'s');
+    assert.equal(app.behind.length, before + 2);
+  }
+
+  // A key-up that never comes does not swallow that key for good.
+  const app = boot();
+  const answer = app.confirm('Stop this session?');
+  app.wait();
+  app.key('Enter');
+  await answer;
+  app.clock += 600;
+  assert.equal(app.event('keydown', 'Enter').defaultPrevented, false, 'half a second later it is typed again');
+
+  // A box answered with the mouse swallows nothing.
+  const clicked = boot();
+  const second = clicked.confirm('Stop this session?');
+  clicked.wait();
+  clicked.box().confirm.fire('click');
+  await second;
+  assert.equal(clicked.event('keydown', 'Enter').defaultPrevented, false);
+});
+
 test('with the focus on no button, Enter puts it back on the confirm button and answers on the next press', async () => {
   const app = boot();
   const answer = app.confirm('Delete the scheduled task?', { confirm: 'Delete', danger: true });
@@ -1381,6 +1429,25 @@ test('deleting a scheduled task, removing a project and stopping a session each 
       assert.equal(calls.reloads + booted.calls.reloads, answer ? 1 : 0, `${name}, answered ${answer}: the list is repainted only after the action`);
       assert.deepEqual(booted.calls.alerts, []);
     }
+  }
+});
+
+test('a session that is being stopped takes no more typed input: its terminal is switched off before main is asked', async () => {
+  for (const answer of [false, true]) {
+    const terminal = { options: {} };
+    let offWhenAsked = null;
+    const booted = bootFlow(STOP_FLOW, 'app.js', {
+      answers: [answer],
+      api: { stopSession: () => { offWhenAsked = terminal.options.disableStdin === true; return { ok: true }; } },
+      globals: {
+        activePtyIds: new Set(['sess1']), gridViewActive: true, activeSessionId: 'sess1',
+        openSessions: new Map([['sess1', { terminal }]]),
+        setActiveSession() {}, terminalHeader: { style: {} }, placeholder: { style: {} }, refreshSidebar() {},
+      },
+    });
+    await booted.ctx.confirmAndStopSession('sess1');
+    assert.equal(offWhenAsked, answer ? true : null, 'answered ' + answer);
+    assert.equal(terminal.options.disableStdin === true, answer, 'a session that was not stopped still takes input');
   }
 });
 
