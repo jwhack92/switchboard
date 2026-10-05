@@ -501,8 +501,11 @@ function renderProjects(projects, resort) {
 
   // Restore terminal focus after morphdom DOM updates, but not if the user is
   // interacting with an input/textarea (search box, rename input, dialogs, etc.)
+  // .add-project-overlay is every dialog dialogs.js builds, the in-page
+  // confirm included: its focus sits on a button, not a field, and a repaint
+  // that took it away left "click Stop, press Enter" typing into the terminal.
   const ae = document.activeElement;
-  const isUserTyping = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable || ae.closest('.modal-overlay'));
+  const isUserTyping = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable || ae.closest('.modal-overlay, .add-project-overlay'));
   if (activeSessionId && openSessions.has(activeSessionId) && !isUserTyping) {
     openSessions.get(activeSessionId).terminal.focus();
   }

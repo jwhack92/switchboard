@@ -1033,6 +1033,16 @@ body { display: flex; flex-direction: column; }
   font-family: inherit;
   line-height: 1.45;
   box-shadow: 0 0 0 3px rgba(120,130,255,0.08);
+  /* The box is about 5px taller than the line of text it stands in for; taken
+     back here so the rows below do not jump while a name is edited. */
+  margin-block: -2.5px;
+}
+
+/* While a row's name is being edited its hover buttons (stop, mark unread) are
+   put away. They are positioned over the right-hand end of the row, on top of
+   the box, and a click meant for the end of the name landed on them. */
+.session-item:has(.session-rename-input) .session-actions {
+  display: none;
 }
 
 .session-id {

@@ -451,10 +451,10 @@ function makeDom() {
  *   app.recorded     the key events the diagnostics recorder saw (a capture
  *                    listener on the window from before any box)
  */
-function boot({ nativeAlert } = {}) {
+function boot({ nativeAlert, globals = {} } = {}) {
   const dom = makeDom();
   const capture = [];
-  const app = { dom, behind: [], recorded: [], errors: [], clock: 1000, nativeAlerts: [] };
+  const app = { dom, behind: [], recorded: [], errors: [], clock: 1000, nativeAlerts: [], docListeners: [] };
   const win = {
     alert: nativeAlert || function (message) { app.nativeAlerts.push(message); },
     addEventListener(type, fn, useCapture) { assert.equal(useCapture, true, 'the box listens in the capture phase'); capture.push({ type, fn }); },
@@ -472,7 +472,20 @@ function boot({ nativeAlert } = {}) {
       body: dom.body,
       createElement: (tag) => new dom.El(tag),
       get activeElement() { return dom.active; },
+      addEventListener(type, fn, useCapture) { app.docListeners.push({ type, fn, useCapture }); },
+      removeEventListener(type, fn) {
+        const i = app.docListeners.findIndex((l) => l.type === type && l.fn === fn);
+        if (i >= 0) app.docListeners.splice(i, 1);
+      },
     },
+    ...globals,
+  };
+  /** Code behind the box moves the focus: the element takes it, and the
+   *  document hears a focusin, as in a browser (a bare el.focus() in this fake
+   *  reports no event). */
+  app.focusFrom = (el) => {
+    el.focus();
+    for (const l of app.docListeners.slice()) if (l.type === 'focusin') l.fn({ type: 'focusin', target: el });
   };
   vm.createContext(ctx);
   // The recorder terminal-diagnostics.js puts on the window at start-up.
@@ -969,6 +982,69 @@ test('when something behind the box takes the focus, a key neither types there n
   terminal.focus();
   app.key('Escape');
   assert.equal(await peek(second), false);
+});
+
+test('code behind the box that takes the focus loses it again at once, so one Enter still answers', async () => {
+  const app = boot();
+  const terminal = app.dom.body.appendChild(new app.dom.El('textarea'));
+  terminal.focus();
+  const answer = app.confirm('Stop this session?', { confirm: 'Stop', danger: true });
+  const box = app.box();
+  assert.equal(app.docListeners.filter((l) => l.type === 'focusin' && l.useCapture === true).length, 1, 'the box listens for the focus leaving it');
+
+  app.focusFrom(terminal);          // a sidebar repaint, or showSession() on an event from main
+  assert.equal(app.dom.active, box.confirm, 'taken straight back');
+  app.key('Tab');                   // on Cancel now
+  app.focusFrom(box.cancel);        // the browser reports the move inside the box too
+  app.focusFrom(terminal);
+  assert.equal(app.dom.active, box.cancel, 'back to the button it was on, not always the confirm button');
+  app.key('Tab');
+  app.focusFrom(box.confirm);
+  app.focusFrom(terminal);
+  app.key('Enter');
+  assert.equal(await peek(answer), true, 'click Stop, press Enter: one Enter');
+  assert.equal(app.docListeners.length, 0, 'and the box stops listening when it closes');
+  assert.equal(app.dom.active, terminal);
+});
+
+test('a box opened from a button hands the keyboard to the terminal on screen, not back to the button', async () => {
+  const session = (visible) => {
+    const entry = { focused: 0, element: { offsetParent: visible ? {} : null } };
+    entry.terminal = { focus() { entry.focused++; } };
+    return entry;
+  };
+  // The header's Stop button was clicked: it has the focus when the box opens.
+  const shown = session(true);
+  let app = boot({ globals: { activeSessionId: 's1', openSessions: new Map([['s1', shown]]) } });
+  let button = app.dom.body.appendChild(new app.dom.El('button'));
+  button.focus();
+  let answer = app.confirm('Stop this session?', { confirm: 'Stop' });
+  app.key('Escape');
+  assert.equal(await answer, false);
+  assert.equal(shown.focused, 1, 'the terminal on screen gets the keyboard');
+  assert.equal(app.box(), null);
+
+  // A terminal that is not on screen (another tab is showing) is left alone.
+  const hidden = session(false);
+  app = boot({ globals: { activeSessionId: 's1', openSessions: new Map([['s1', hidden]]) } });
+  button = app.dom.body.appendChild(new app.dom.El('button'));
+  button.focus();
+  answer = app.confirm('Remove the project?', { confirm: 'Remove' });
+  app.key('Escape');
+  await answer;
+  assert.equal(hidden.focused, 0);
+  assert.equal(app.dom.active, button, 'back to the button, as before');
+
+  // A field the user was typing in keeps the keyboard, terminal or no terminal.
+  const other = session(true);
+  app = boot({ globals: { activeSessionId: 's1', openSessions: new Map([['s1', other]]) } });
+  const field = app.dom.body.appendChild(new app.dom.El('input'));
+  field.focus();
+  answer = app.confirm('Delete the scheduled task?', { confirm: 'Delete' });
+  app.key('Escape');
+  await answer;
+  assert.equal(other.focused, 0);
+  assert.equal(app.dom.active, field);
 });
 
 test('with the focus on no button, Enter puts it back on the confirm button and answers on the next press', async () => {
