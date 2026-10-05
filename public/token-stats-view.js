@@ -412,8 +412,11 @@ function tokCall(name, arg) {
   }
 }
 
-function tokConfirm(message) {
-  try { return typeof window.confirm === 'function' ? !!window.confirm(message) : false; } catch { return false; }
+// The app's in-page confirm (dialogs.js confirmDialog), which answers through
+// a Promise: this is awaited at every call, or the answer would always read
+// as yes. A missing or failing dialog is a no.
+async function tokConfirm(message, confirm) {
+  try { return typeof confirmDialog === 'function' ? (await confirmDialog(message, { confirm })) === true : false; } catch { return false; }
 }
 
 function tokClearTimers() {
@@ -828,7 +831,7 @@ async function tokAction(name, after, label) {
   await loadTokenStats();
 }
 
-function tokRebuild() {
+async function tokRebuild() {
   // A rebuild counts only what is on disk now, so the kept history of deleted
   // transcripts ("their history is kept", the footer) leaves the views. Jason:
   // "Warn, and keep the old store aside": the store renames the old file
@@ -838,19 +841,19 @@ function tokRebuild() {
     ? '\n\nThe history of ' + tokNum(missing) + (missing === 1 ? ' transcript file that is' : ' transcript files that are') +
       ' no longer on disk will leave the views: a rebuild counts only the transcripts that are on disk now.'
     : '';
-  if (!tokConfirm('Rebuild token analytics?\n\nA new token store is started and every transcript is scanned again. ' +
+  if (!await tokConfirm('Rebuild token analytics?\n\nA new token store is started and every transcript is scanned again. ' +
     'Transcripts are only read. Totals are partial until the scan finishes.\n\n' +
-    'The old store is kept beside the new one as token-usage.db.before-rebuild-<time> (only the latest one is kept).' + gone)) return;
+    'The old store is kept beside the new one as token-usage.db.before-rebuild-<time> (only the latest one is kept).' + gone, 'Rebuild')) return;
   return tokAction('rescanTokenStats', () => { tokLimit = TOK_PAGE; }, 'Rebuild');
 }
 
-function tokDisable() {
-  if (!tokConfirm('Turn token analytics off?\n\nScanning stops and the Tokens tab shows nothing until it is enabled again. What has been counted is kept. No restart is needed.')) return;
+async function tokDisable() {
+  if (!await tokConfirm('Turn token analytics off?\n\nScanning stops and the Tokens tab shows nothing until it is enabled again. What has been counted is kept. No restart is needed.', 'Turn off')) return;
   return tokAction('disableTokenStats', null, 'Disable');
 }
 
-function tokEnable() {
-  if (!tokConfirm('Turn token analytics on?\n\nSwitchboard starts reading transcripts again and catches up in the background.')) return;
+async function tokEnable() {
+  if (!await tokConfirm('Turn token analytics on?\n\nSwitchboard starts reading transcripts again and catches up in the background.', 'Turn on')) return;
   return tokAction('enableTokenStats', null, 'Enable');
 }
 

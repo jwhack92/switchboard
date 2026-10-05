@@ -576,7 +576,7 @@
     const removeBtn = settingsViewerBody.querySelector('#sv-remove-btn');
     if (removeBtn) {
       removeBtn.addEventListener('click', async () => {
-        if (!confirm(`Hide project "${shortName}" from Switchboard?\n\nThis hides the project from the sidebar. Your session files are not deleted.`)) return;
+        if (!await confirmDialog(`Hide project "${shortName}" from Switchboard?\n\nThis hides the project from the sidebar. Your session files are not deleted.`, { confirm: 'Hide' })) return;
         await window.api.removeProject(projectPath);
         settingsViewer.style.display = 'none';
         document.getElementById('placeholder').style.display = 'flex';

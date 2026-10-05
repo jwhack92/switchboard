@@ -1561,7 +1561,9 @@ function editItemInline(project, kind, item, textEl, afterSave) {
     if (!text || text === item.text) { restore(); return; }
     input.disabled = true;
     const result = await window.api.editPlanItem(project.id, kind, item.line, text);
-    if (result?.error) { alert(result.error); input.disabled = false; input.focus(); return; }
+    // Awaited: the box takes the focus, and the field gets it back only once
+    // the message has been dismissed.
+    if (result?.error) { await alertDialog(result.error); input.disabled = false; input.focus(); return; }
     finished = true;
     item.text = text;
     textEl.textContent = text;
@@ -3241,9 +3243,9 @@ function sessionMoveItems(session) {
   if (session.projectId) moveItems.push({ sep: true }, {
     label: `Remove from ${project ? project.name : 'project'}…`,
     icon: PICONS.x(13), hint: 'stays in the Sessions tab',
-    onClick: () => {
+    onClick: async () => {
       const name = project ? project.name : 'its project';
-      if (!confirm(`Remove ${sessionTitle(session)} from ${name}?\n\nThe session stays in the Sessions tab under its folder.`)) return;
+      if (!await confirmDialog(`Remove ${sessionTitle(session)} from ${name}?\n\nThe session stays in the Sessions tab under its folder.`, { confirm: 'Remove' })) return;
       move(null, null);
     },
   });
@@ -3356,14 +3358,19 @@ async function attachFolderFlow(project, mode, folderPath = null) {
 }
 
 async function detachFolderFlow(project, folder) {
+  const worktree = folder.mode === 'worktree';
+  // A worktree is asked about twice, so that there is a way out. In one box
+  // both answers detached, and Escape or a click beside the box counted as
+  // "Keep on disk": the folder left the project on a dismissal.
+  if (!await confirmDialog(`Detach ${pathBasename(folder.path)} from ${project.name}?\n\n${worktree ? 'What happens to its checkout is the next question.' : 'Nothing on disk changes.'}`, { confirm: 'Detach' })) return;
   let opts = {};
-  if (folder.mode === 'worktree') {
-    opts = { removeWorktree: confirm(`Detach ${pathBasename(folder.path)}.\n\nAlso remove the checkout at ${folder.path}?\nOK removes it (the branch "${folder.branch}" stays). Cancel keeps it on disk.`) };
-  } else if (!confirm(`Detach ${pathBasename(folder.path)} from ${project.name}?\n\nNothing on disk changes.`)) {
-    return;
+  if (worktree) {
+    // The detach is settled by now: this decides only the checkout, and
+    // dismissing it keeps the checkout.
+    opts = { removeWorktree: await confirmDialog(`Also remove the checkout at ${folder.path}?\n\nThe branch "${folder.branch}" stays either way.`, { confirm: 'Remove checkout', cancel: 'Keep on disk', danger: true }) };
   }
   let result = await window.api.detachProjectFolder(project.id, folder.path, opts);
-  if (result?.dirty && confirm(`The worktree has uncommitted changes.\n\n${result.error}\n\nRemove it anyway and lose those changes?`)) {
+  if (result?.dirty && await confirmDialog(`The worktree has uncommitted changes.\n\n${result.error}\n\nRemove it anyway and lose those changes?`, { confirm: 'Remove anyway', danger: true })) {
     result = await window.api.detachProjectFolder(project.id, folder.path, { removeWorktree: true, force: true });
   }
   if (result?.error) { alert(result.error); return; }
@@ -3417,13 +3424,15 @@ async function deleteTrackFlow(project, track) {
 /** After marking a project done: offer to remove its worktrees, one confirm each for dirty ones. */
 async function offerWorktreeRemoval(project, worktrees) {
   const n = worktrees.length;
-  if (!confirm(`Remove ${n} worktree${n === 1 ? '' : 's'} for ${project.name}?\n\n${worktrees.join('\n')}\n\nThe branches stay. Cancel keeps the checkouts on disk.`)) return;
+  if (!await confirmDialog(`Remove ${n} worktree${n === 1 ? '' : 's'} for ${project.name}?\n\n${worktrees.join('\n')}\n\nThe branches stay.`, { confirm: 'Remove', cancel: 'Keep on disk', danger: true })) return;
   for (const p of worktrees) {
     let result = await window.api.detachProjectFolder(project.id, p, { removeWorktree: true });
-    if (result?.dirty && confirm(`${p} has uncommitted changes.\n\n${result.error}\n\nRemove it anyway and lose them?`)) {
+    if (result?.dirty && await confirmDialog(`${p} has uncommitted changes.\n\n${result.error}\n\nRemove it anyway and lose them?`, { confirm: 'Remove anyway', danger: true })) {
       result = await window.api.detachProjectFolder(project.id, p, { removeWorktree: true, force: true });
     }
-    if (result?.error) alert(result.error);
+    // Awaited, as the native box held the loop: one failure is read before
+    // the next worktree is touched.
+    if (result?.error) await alertDialog(result.error);
   }
 }
 
@@ -3523,7 +3532,7 @@ async function toggleTrackDone(project, track, patch) {
   const toDone = track.status !== 'done';
   if (toDone) {
     const paused = schedulesForProject(project).filter(s => s.trackId === track.id && s.enabled);
-    if (paused.length && !confirm(`Mark “${track.name}” as done?\n\n${paused.length} scheduled task${paused.length === 1 ? '' : 's'} in it will pause until the track is reopened.`)) return;
+    if (paused.length && !await confirmDialog(`Mark “${track.name}” as done?\n\n${paused.length} scheduled task${paused.length === 1 ? '' : 's'} in it will pause until the track is reopened.`, { confirm: 'Mark as done' })) return;
   }
   await patch({ status: toDone ? 'done' : 'active' });
 }
@@ -3652,7 +3661,7 @@ window.addEventListener('focus', () => {
 });
 
 async function removeProjectFlow(project) {
-  if (!confirm(`Remove ${project.name} from Switchboard?\n\nThe folder ${project.root} and all sessions stay on disk.`)) return;
+  if (!await confirmDialog(`Remove ${project.name} from Switchboard?\n\nThe folder ${project.root} and all sessions stay on disk.`, { confirm: 'Remove', danger: true })) return;
   const result = await window.api.deleteProject(project.id);
   if (result?.error) { alert(result.error); return; }
   projectsUi.navigationByProject.delete(project.id);
@@ -4033,7 +4042,7 @@ async function showNewProjectDialog({ name: initialName = '', folders: initialFo
     if (tab && activeTab !== 'projects') tab.click();
     else showProjectOverview();
     if (result.errors?.length) {
-      alert(`Project created, but some worktrees could not be made:\n\n${result.errors.join('\n')}\n\nAttach them again from the project settings.`);
+      await alertDialog(`Project created, but some worktrees could not be made:\n\n${result.errors.join('\n')}\n\nAttach them again from the project settings.`);
     }
     // A new project opens with a session in it (dialogs.js openFirstSession):
     // the same launch as Claude on the project's + menu, shown in place of the

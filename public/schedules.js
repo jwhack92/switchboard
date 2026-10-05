@@ -98,7 +98,7 @@ async function toggleScheduleEnabled(schedule) {
 }
 
 async function deleteScheduleFlow(schedule) {
-  if (!confirm(`Delete the scheduled task “${schedule.name}”?\n\nSessions it already started are kept.`)) return;
+  if (!await confirmDialog(`Delete the scheduled task “${schedule.name}”?\n\nSessions it already started are kept.`, { confirm: 'Delete', danger: true })) return;
   const result = await window.api.deleteSchedule(schedule.id);
   if (result?.error) alert(result.error);
   else await refreshSchedules();

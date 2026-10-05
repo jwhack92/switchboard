@@ -508,6 +508,18 @@ function renderProjects(projects, resort) {
   }
 }
 
+/**
+ * What the two "archive all" buttons ask. Their loops stop a running session
+ * before archiving it: the question says so, and is a red one, only when
+ * there is one to stop.
+ *   lead   the question itself ('Archive all 3 sessions in tools?')
+ */
+function archiveQuestion(sessions, lead) {
+  const running = sessions.filter(s => activePtyIds.has(s.sessionId)).length;
+  const stops = running ? `\n\n${running} running session${running > 1 ? 's' : ''} will be stopped first.` : '';
+  return { message: lead + stops, danger: running > 0 };
+}
+
 function rebindSidebarEvents(projects) {
   for (const project of projects) {
     const fId = folderId(project.projectPath);
@@ -545,7 +557,8 @@ function rebindSidebarEvents(projects) {
         const sessions = project.sessions.filter(s => !s.archived);
         if (sessions.length === 0) return;
         const shortName = shortProjectPath(project.projectPath);
-        if (!confirm(`Archive all ${sessions.length} session${sessions.length > 1 ? 's' : ''} in ${shortName}?`)) return;
+        const question = archiveQuestion(sessions, `Archive all ${sessions.length} session${sessions.length > 1 ? 's' : ''} in ${shortName}?`);
+        if (!await confirmDialog(question.message, { confirm: 'Archive', danger: question.danger })) return;
         for (const s of sessions) {
           if (activePtyIds.has(s.sessionId)) {
             await window.api.stopSession(s.sessionId);
@@ -582,7 +595,7 @@ function rebindSidebarEvents(projects) {
       wtHideBtn.onclick = async (e) => {
         e.stopPropagation();
         const name = wtProject.projectPath.split('/').pop();
-        if (!confirm(`Hide worktree "${name}"?\n\nSession files are not deleted.`)) return;
+        if (!await confirmDialog(`Hide worktree "${name}"?\n\nSession files are not deleted.`, { confirm: 'Hide' })) return;
         await window.api.removeProject(wtProject.projectPath);
         loadProjects();
       };
@@ -650,7 +663,8 @@ function rebindSidebarEvents(projects) {
           .map(item => sessionMap.get(item.dataset.sessionId))
           .filter(session => session && !session.archived);
         if (sessions.length === 0) return;
-        if (!confirm(`Archive all ${sessions.length} older session${sessions.length > 1 ? 's' : ''}?`)) return;
+        const question = archiveQuestion(sessions, `Archive all ${sessions.length} older session${sessions.length > 1 ? 's' : ''}?`);
+        if (!await confirmDialog(question.message, { confirm: 'Archive', danger: question.danger })) return;
         for (const session of sessions) {
           if (activePtyIds.has(session.sessionId)) {
             await window.api.stopSession(session.sessionId);

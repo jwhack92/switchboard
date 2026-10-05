@@ -1263,25 +1263,30 @@ function handoffTypingControl(id, which) {
   return model.primary.kind === 'handoff' ? model.primary : null;
 }
 
-// The app's own confirm dialogs are window.confirm (app.js confirmAndStopSession).
-// Anything but an explicit OK is a no.
-function handoffConfirmOverride() {
-  try { return typeof window.confirm === 'function' && window.confirm(OVERRIDE_CONFIRM) === true; } catch { return false; }
+// The app's own in-page confirm (dialogs.js confirmDialog), which answers
+// through a Promise: the call below is awaited, and so is every call of this
+// function. Anything but an explicit yes is a no, a missing or failing dialog
+// included.
+async function handoffConfirmOverride() {
+  try {
+    return typeof confirmDialog === 'function'
+      && (await confirmDialog(OVERRIDE_CONFIRM, { confirm: 'Type it anyway', danger: true })) === true;
+  } catch { return false; }
 }
 
 async function handoffTypeRequest(id, which) {
   let control = handoffTypingControl(id, which);
   if (!control || !control.enabled) return;
   if (control.override) {
-    if (!handoffConfirmOverride()) return;
-    // The dialog held this window up: busy events queued behind it and the
-    // state file may have moved on. Wait, read again and decide again. The
-    // wait is a real timer, not a resolved promise: the queued busy events are
-    // tasks of their own and have to run before the second decision, and it is
-    // as long as the reader contract's gap so that the read after it is a read
-    // and not the cache. A session that went busy meanwhile is not typed into;
-    // one that is still (or now properly) clear is, with the question already
-    // answered.
+    if (!await handoffConfirmOverride()) return;
+    // The question was open for as long as the user took: the session may have
+    // gone busy meanwhile and the state file may have moved on. Wait, read
+    // again and decide again. The wait is a real timer, not a resolved promise:
+    // a busy event still on its way is a task of its own and has to run before
+    // the second decision, and it is as long as the reader contract's gap so
+    // that the read after it is a read and not the cache. A session that went
+    // busy meanwhile is not typed into; one that is still (or now properly)
+    // clear is, with the question already answered.
     await handoffDelay(HANDOFF_MIN_READ_GAP_MS);
     await handoffRefresh(id);
     if (handoffActiveId() !== id) return;

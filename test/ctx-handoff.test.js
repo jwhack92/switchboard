@@ -1895,6 +1895,7 @@ function boot(opts = {}) {
   const files = new Map();
   const sent = [];
   const confirms = [];
+  const confirmOptions = [];
   const errors = [];
   const launches = [];
   const reads = [];
@@ -1949,7 +1950,10 @@ function boot(opts = {}) {
     static now() { return now; }
   }
   const context = vm.createContext({
-    window: { api, confirm: (message) => { confirms.push(message); return knobs.confirmAnswer; } },
+    window: { api },
+    // dialogs.js's in-page confirm: it answers through a Promise, where the
+    // native box this stood for returned a boolean.
+    confirmDialog: async (message, options) => { confirms.push(message); confirmOptions.push(options); return knobs.confirmAnswer; },
     document: {
       getElementById: (id) => byId[id] || null,
       createElement: (tag) => fakeElement(tag, byId),
@@ -1997,7 +2001,7 @@ function boot(opts = {}) {
 
   const visible = (el) => !!el && el.style.display !== 'none';
   const h = {
-    files, sent, confirms, errors, launches, reads, storage, knobs, listeners, byId, run,
+    files, sent, confirms, confirmOptions, errors, launches, reads, storage, knobs, listeners, byId, run,
     get now() { return now; },
     get sec() { return now / 1000; },
     // Moves the clock on, running every timer that falls due on the way.
@@ -2142,8 +2146,40 @@ test('browser: an override asks first, and "no" types nothing', async () => {
   await h.click('primary');
   await h.advance(5000);
   assert.deepEqual(h.confirms, [OVERRIDE_CONFIRM]);
+  // The button says what a yes does, and is the red one: the typed line could
+  // answer a prompt that is open in the terminal.
+  assert.deepEqual(h.confirmOptions.map((o) => ({ ...o })), [{ confirm: 'Type it anyway', danger: true }]);
   assert.deepEqual(h.sent, []);
   assert.equal(h.header().primary, 'Hand off');
+});
+
+test('browser: an override answer that is not exactly true is a no, a missing or failing dialog included', async () => {
+  // The in-page confirm answers through a Promise. A Promise is truthy, so the
+  // click handler has to await it; and whatever comes back that is not `true`
+  // (no dialog loaded, a rejection, a stray value) must type nothing.
+  const answers = {
+    'undefined': () => undefined,
+    'a truthy value that is not true': () => 'yes',
+    'a rejection': () => Promise.reject(new Error('dialog failed')),
+    'a throw': () => { throw new Error('dialog failed'); },
+  };
+  for (const [name, answer] of Object.entries(answers)) {
+    const h = boot();
+    h.setSidecar(VM_SIDECAR);
+    await h.refresh();
+    assert.equal(h.header().primaryOverride, true, name);
+    h.run('confirmDialog = ' + answer.toString());
+    await h.click('primary');
+    await h.advance(5000);
+    assert.deepEqual(h.sent, [], name);
+  }
+  const missing = boot();
+  missing.setSidecar(VM_SIDECAR);
+  await missing.refresh();
+  missing.run('confirmDialog = undefined');
+  await missing.click('primary');
+  await missing.advance(5000);
+  assert.deepEqual(missing.sent, [], 'dialogs.js did not load');
 });
 
 test('browser: an override answered OK waits, reads again, then types', async () => {

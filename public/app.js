@@ -1028,7 +1028,7 @@ function dismissSession(sessionId) {
 }
 
 async function confirmAndStopSession(sessionId) {
-  if (!confirm('Stop this session?')) return;
+  if (!await confirmDialog('Stop this session?', { confirm: 'Stop', danger: true })) return;
   await window.api.stopSession(sessionId);
   activePtyIds.delete(sessionId);
   if (!gridViewActive && activeSessionId === sessionId) {
@@ -2228,7 +2228,7 @@ async function clearStop() {
     + ((stopState.survivors || []).length
       ? `\n\n${stopState.survivors.length} process(es) from the last stop were never confirmed dead.`
       : '');
-  if (!confirm(msg)) return;
+  if (!await confirmDialog(msg, { confirm: 'Resume' })) return;
   try {
     await window.api.clearDriverHalt();
     setStopOutcome('scheduled tasks may run again', 'ok');

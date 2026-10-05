@@ -314,6 +314,7 @@ function boot(opts = {}) {
   const dom = makeDom();
   const calls = [];
   const confirms = [];
+  const confirmOptions = [];
   const errors = [];
   const listeners = [];
   const knobs = { confirm: true, respond: opts.respond || ((name) => okData()[METHODS[name]]) };
@@ -333,7 +334,10 @@ function boot(opts = {}) {
   // `new Date()` in the view stays real, so the day ranges are today's.
   const clock = { now: Date.now(), timers: [], seq: 0 };
   const context = vm.createContext({
-    window: { api, innerWidth: 1200, confirm: (m) => { confirms.push(m); return knobs.confirm; } },
+    window: { api, innerWidth: 1200 },
+    // dialogs.js's in-page confirm: it answers through a Promise, where the
+    // native box this stood for returned a boolean.
+    confirmDialog: async (m, options) => { confirms.push(m); confirmOptions.push(options); return knobs.confirm; },
     document: dom.document,
     console: { error: (...a) => errors.push(a.map(String).join(' ')), log() {} },
     statsViewerBody: dom.activityBody,
@@ -363,7 +367,7 @@ function boot(opts = {}) {
     await flush();
   };
   const args = (name) => calls.filter(c => c[0] === name).map(c => plain(c[1] === undefined ? null : c[1]));
-  return { ...dom, run, calls, count, args, confirms, errors, listeners, knobs, api, clock, tick };
+  return { ...dom, run, calls, count, args, confirms, confirmOptions, errors, listeners, knobs, api, clock, tick };
 }
 
 async function openTokens(app) {
@@ -586,6 +590,7 @@ test('disabled: the whole tab is one notice; Enable only for the kill switch, wi
   button(app.tokensBody, 'Enable').fire('click');
   await flush();
   assert.equal(app.confirms.length, 1);
+  assert.deepEqual({ ...app.confirmOptions[0] }, { confirm: 'Turn on' });
   assert.equal(app.count('enableTokenStats'), 0, 'a declined confirm must not enable');
 
   app.knobs.confirm = true;
@@ -812,7 +817,25 @@ test('Disable and Rebuild ask first; Rebuild is disabled while a scan runs', asy
   button(app.tokensBody, 'Disable').fire('click');
   await flush();
   assert.equal(app.confirms.length, 2);
+  // Each button of the question is the action's own verb.
+  assert.deepEqual(app.confirmOptions.map((o) => ({ ...o })), [{ confirm: 'Rebuild' }, { confirm: 'Turn off' }]);
   assert.equal(app.count('rescanTokenStats') + app.count('disableTokenStats'), 0);
+  // The in-page confirm answers through a Promise, and a Promise is truthy:
+  // only an awaited `true` may go ahead.
+  for (const notYes of [undefined, 'yes', 1, {}]) {
+    app.knobs.confirm = notYes;
+    button(app.tokensBody, 'Rebuild').fire('click');
+    button(app.tokensBody, 'Disable').fire('click');
+    await flush();
+  }
+  app.run('__saved = confirmDialog; confirmDialog = () => Promise.reject(new Error("dialog failed"))');
+  button(app.tokensBody, 'Rebuild').fire('click');
+  await flush();
+  app.run('confirmDialog = undefined');
+  button(app.tokensBody, 'Disable').fire('click');
+  await flush();
+  assert.equal(app.count('rescanTokenStats') + app.count('disableTokenStats'), 0, 'anything but true is a no; so is a failing or missing dialog');
+  app.run('confirmDialog = __saved');
   app.knobs.confirm = true;
   button(app.tokensBody, 'Rebuild').fire('click');
   await flush();
