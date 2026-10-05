@@ -21,9 +21,11 @@ const vm = require('vm');
 const PUBLIC = path.join(__dirname, '..', 'public');
 const FOCUS_WATCH = path.join(PUBLIC, 'focus-watch.js');
 const DIAGNOSTICS = path.join(PUBLIC, 'terminal-diagnostics.js');
+const DIALOGS = path.join(PUBLIC, 'dialogs.js');
 const INDEX_HTML = path.join(PUBLIC, 'index.html');
 
-/** An element that keeps what the toast puts into it. */
+/** An element that keeps what the toast puts into it (and, in the tests with
+ *  dialogs.js, lets an in-page box be built out of it). */
 function fakeEl(tag) {
   const el = {
     tagName: String(tag).toUpperCase(), className: '', textContent: '', kids: [], removed: false, heard: [],
@@ -31,6 +33,7 @@ function fakeEl(tag) {
     appendChild(kid) { el.kids.push(kid); return kid; },
     addEventListener(type, fn) { el.heard.push({ type, fn }); },
     remove() { el.removed = true; },
+    setAttribute() {}, focus() {}, contains: () => false,
   };
   return el;
 }
@@ -56,8 +59,12 @@ function fakeEntry() {
  *   diagCapture   what window.api.diagCapture does with the report
  *   confirm       the page's original window.confirm
  *   session       true to have one active session
+ *   dialogs       'first' or 'last' to run dialogs.js as well, before or after
+ *                 the other two; left out, the page has no dialogs.js
+ *   loading       true for a page that is still loading: the diagnostics wait
+ *                 for DOMContentLoaded, which app.domReady() then fires
  */
-function boot({ focusWatch = 'shipped', diagCapture, confirm, alert, session = false } = {}) {
+function boot({ focusWatch = 'shipped', diagCapture, confirm, alert, session = false, dialogs = null, loading = false } = {}) {
   const listeners = {};
   const timers = [];
   let seq = 0;
@@ -71,6 +78,7 @@ function boot({ focusWatch = 'shipped', diagCapture, confirm, alert, session = f
     confirm: original.confirm,
     alert: original.alert,
     addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+    removeEventListener(type, fn) { listeners[type] = (listeners[type] || []).filter((l) => l !== fn); },
     api: {
       platform: 'win32',
       getZoomFactor: () => 1,
@@ -86,16 +94,17 @@ function boot({ focusWatch = 'shipped', diagCapture, confirm, alert, session = f
     console: { warn: (...a) => app.warns.push(a.join(' ')), log() {}, error() {} },
     setTimeout: (fn, ms) => { const id = ++seq; timers.push({ id, ms: ms || 0, fn }); return id; },
     clearTimeout: (id) => { const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); },
+    performance: { now: () => 0 },
     window: win,
     document: {
-      readyState: 'complete',
+      readyState: loading ? 'loading' : 'complete',
       visibilityState: 'visible',
       hasFocus: () => app.focused,
       activeElement: { tagName: 'INPUT', className: 'rename-input', classList: { contains: () => false } },
       createElement: (tag) => fakeEl(tag),
       head: fakeEl('head'),
       body: app.body,
-      addEventListener() {},
+      addEventListener(type, fn) { if (type === 'DOMContentLoaded') app.domReady = fn; },
     },
   };
   if (session) {
@@ -103,9 +112,11 @@ function boot({ focusWatch = 'shipped', diagCapture, confirm, alert, session = f
     ctx.openSessions = new Map([['s1', fakeEntry()]]);
   }
   vm.createContext(ctx);
+  if (dialogs === 'first') vm.runInContext(fs.readFileSync(DIALOGS, 'utf8'), ctx, { filename: DIALOGS });
   if (focusWatch === 'shipped') vm.runInContext(fs.readFileSync(FOCUS_WATCH, 'utf8'), ctx, { filename: FOCUS_WATCH });
   else if (focusWatch !== 'absent') vm.runInContext(focusWatch, ctx, { filename: 'focus-watch.js' });
   vm.runInContext(fs.readFileSync(DIAGNOSTICS, 'utf8'), ctx, { filename: DIAGNOSTICS });
+  if (dialogs === 'last') vm.runInContext(fs.readFileSync(DIALOGS, 'utf8'), ctx, { filename: DIALOGS });
 
   Object.assign(app, {
     ctx, win, original,
@@ -179,6 +190,9 @@ test('both files load; the page-load line goes to console.warn', () => {
 
 // --- The dialog wrappers ---
 
+// A page without dialogs.js (its script tag failed): window.alert is still the
+// native one, and is wrapped like window.confirm. The page as it ships is in
+// the next section.
 test('window.confirm and window.alert are wrapped, stay functions, and return the original\'s value', () => {
   for (const answer of [true, false]) {
     const calls = [];
@@ -226,6 +240,66 @@ test('a dialog shows up in a capture as kind, call site and timings, never as it
   const out = JSON.stringify({ report, warns: app.warns });
   assert.equal(out.includes('XYZZY'), false, 'dialog text reached the capture or the log');
   assert.equal(out.includes('sentinel'), false);
+});
+
+// --- With dialogs.js on the page ---
+//
+// dialogs.js puts an in-page box in place of window.alert and marks it
+// `inPage`. That box is not a native dialog, so the watch must neither wrap it
+// nor record it. window.confirm stays native and wrapped: nothing in the
+// renderer calls it any more (test/in-page-dialogs.test.js), so one that turns
+// up in a capture is a call somebody added, and still a suspect.
+//
+// index.html loads terminal-diagnostics.js before dialogs.js, and the wrap
+// happens at DOMContentLoaded, after both. Nothing may depend on that: the
+// outcome has to be the same whichever of the two gets to window.alert first.
+
+const LOAD_ORDERS = {
+  'as the page loads: the diagnostics wait for DOMContentLoaded and dialogs.js runs meanwhile': { dialogs: 'last', loading: true },
+  'dialogs.js first, the diagnostics start at once': { dialogs: 'first' },
+  'the diagnostics start at once and wrap the native alert, then dialogs.js loads': { dialogs: 'last' },
+};
+
+test('with dialogs.js, in any load order: confirm is wrapped, alert is the in-page box, unwrapped and unrecorded', async () => {
+  for (const [name, order] of Object.entries(LOAD_ORDERS)) {
+    const native = [];
+    const app = boot({
+      ...order,
+      confirm: function (message) { native.push(['confirm', message]); return true; },
+      alert: function (message) { native.push(['alert', message]); },
+    });
+    if (order.loading) {
+      assert.equal(app.win.confirm, app.original.confirm, 'nothing is wrapped before DOMContentLoaded');
+      app.domReady();
+    }
+    assert.equal(app.win.alert, vm.runInContext('inPageAlert', app.ctx), name);
+    assert.equal(app.win.alert.inPage, true, name);
+    assert.notEqual(app.win.confirm, app.original.confirm, name);
+
+    app.win.alert('XYZZY in-page text');
+    assert.deepEqual(native, [], name + ': the native alert cannot be reached through window.alert');
+    assert.equal(app.body.kids.filter((el) => el.className.includes('app-dialog-overlay')).length, 1, name + ': the in-page box opened');
+
+    app.win.confirm('a native confirm somebody added');
+    assert.deepEqual(native, [['confirm', 'a native confirm somebody added']], name);
+    app.runTimers(1500);
+    const report = await app.report();
+    assert.deepEqual(
+      report.events.filter((n) => /^dialog-/.test(n.kind)).map((n) => n.dialog + ' ' + n.kind),
+      ['confirm dialog-open', 'confirm dialog-close', 'confirm dialog-settled'],
+      name + ': only the native confirm is on record',
+    );
+    assert.equal(report.focusWatch.lastDialog.kind, 'confirm', name);
+    assert.equal(JSON.stringify({ report, warns: app.warns }).includes('XYZZY'), false, name);
+  }
+});
+
+test('with dialogs.js but no focus watch, alert is still the in-page box and confirm is left alone', () => {
+  for (const dialogs of ['first', 'last']) {
+    const app = boot({ focusWatch: 'absent', dialogs });
+    assert.equal(app.win.alert.inPage, true);
+    assert.equal(app.win.confirm, app.original.confirm);
+  }
 });
 
 // --- Detection, the notice and the log line ---

@@ -598,7 +598,8 @@
   //
   // The rule lives in focus-watch.js; this is its browser side. If that file
   // did not load, `focusWatch` stays null, window.confirm and window.alert are
-  // left as they are, and everything else in this module runs as before.
+  // left as they are (alert being the in-page one dialogs.js installs), and
+  // everything else in this module runs as before.
 
   let focusWatch = null;
 
@@ -631,9 +632,20 @@
       // Native dialogs are the one trigger with a known mechanism, and until
       // now nothing recorded that one had been open. The wrapper returns what
       // the dialog returned (see wrapDialog).
+      //
+      // dialogs.js replaces window.alert with an in-page box and marks it
+      // `inPage`. That one is not a native dialog and is not a suspect, so it
+      // is never wrapped: a wrapper would put every in-page message on record
+      // as a native box opening and closing. dialogs.js loads after this file
+      // and this runs at DOMContentLoaded, so normally the mark is already
+      // there; had this run first, dialogs.js would simply replace the wrapped
+      // native alert. Either way window.alert ends up the in-page one,
+      // unwrapped. window.confirm stays native and wrapped: nothing calls it
+      // now, so one that shows up in a capture is a call somebody added.
       for (const kind of ['confirm', 'alert']) {
         const original = window[kind];
-        if (typeof original === 'function') window[kind] = watch.wrapDialog(kind, original, window);
+        if (typeof original !== 'function' || original.inPage) continue;
+        window[kind] = watch.wrapDialog(kind, original, window);
       }
       watch.start();
     } catch {}

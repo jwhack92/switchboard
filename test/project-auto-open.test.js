@@ -89,6 +89,9 @@ function boot({ addReply, afterLoad = [], settings = {} } = {}) {
       removeEventListener: (type, fn) => { if (type === 'keydown') keydown.delete(fn); },
     },
     window: {
+      // dialogs.js keeps one key listener on the window (when a key last went
+      // down, for its confirm and alert boxes). Nothing here presses a key.
+      addEventListener() {},
       api: {
         addProject: async (p) => {
           calls.addProject.push(p);
@@ -651,8 +654,10 @@ const CREATE_BLOCK = [
  *   reply      what window.api.createProject answers: a value, or a function
  *              returning one (or a promise of it, or throwing)
  *   tree       the projects loadProjects() leaves in the tree
+ *   alertGate  a deferred the in-page alert stays open on, until the test
+ *              resolves it (the user dismissing the box)
  */
-function bootProjectsTab({ reply, tree = [], name = 'Alpha' } = {}) {
+function bootProjectsTab({ reply, tree = [], name = 'Alpha', alertGate = null } = {}) {
   const calls = { create: [], opened: [], alerts: [], errors: [], closed: 0, order: [] };
   const ctx = {
     nameInput: { value: name, focus() {} },
@@ -671,7 +676,14 @@ function bootProjectsTab({ reply, tree = [], name = 'Alpha' } = {}) {
     document: { querySelector: () => null },
     activeTab: 'projects',
     showProjectOverview: () => calls.order.push('overview'),
-    alert: (text) => { calls.order.push('alert'); calls.alerts.push(text); },
+    // dialogs.js's in-page alert. Unlike the native box it does not block,
+    // so create() awaits it.
+    alertDialog: async (text) => {
+      calls.order.push('alert');
+      calls.alerts.push(text);
+      if (alertGate) await alertGate.promise;
+      calls.order.push('dismissed');
+    },
     openFirstSession: async (target, opts) => {
       calls.order.push('open');
       calls.opened.push({ target: { ...target }, opts: { ...opts } });
@@ -717,7 +729,26 @@ test('New project on the Projects tab: worktree errors are shown, then the sessi
   assert.equal(app.calls.alerts.length, 1);
   assert.match(app.calls.alerts[0], /some worktrees could not be made/);
   assert.match(app.calls.alerts[0], /branch already exists/);
-  assert.deepEqual(app.calls.order, ['create', 'load', 'overview', 'alert', 'open'], 'after the alert');
+  assert.deepEqual(app.calls.order, ['create', 'load', 'overview', 'alert', 'dismissed', 'open'], 'after the alert');
+  assert.deepEqual(app.calls.opened, [{ target: TARGET, opts: { runtime: 'claude' } }]);
+});
+
+test('New project on the Projects tab: the session waits for the worktree message to be dismissed', async () => {
+  // The native alert held the page until OK. The in-page one does not, so
+  // without the await the session's terminal would open under the message.
+  const alertGate = deferred();
+  const app = bootProjectsTab({
+    reply: { ok: true, project: PROJECT, errors: ['C:\\src\\repo: branch already exists'] },
+    tree: [PROJECT],
+    alertGate,
+  });
+  const created = app.ctx.create();
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(app.calls.order, ['create', 'load', 'overview', 'alert'], 'the message is up and nothing has opened');
+  assert.deepEqual(app.calls.opened, []);
+  alertGate.resolve();
+  await created;
+  assert.deepEqual(app.calls.order, ['create', 'load', 'overview', 'alert', 'dismissed', 'open']);
   assert.deepEqual(app.calls.opened, [{ target: TARGET, opts: { runtime: 'claude' } }]);
 });
 

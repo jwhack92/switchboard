@@ -474,3 +474,247 @@ function showAddProjectDialog() {
   }
   document.addEventListener('keydown', onKey);
 }
+
+// --- In-page confirm and alert ---
+// Nothing in the renderer opens a native confirm() or alert() box any more.
+// On Windows, closing one can leave this Electron (41.0.3) window in a state
+// where key-down still arrives but typed characters are dropped, until the
+// window is deactivated and activated again. Electron PR 54380 describes it;
+// its fix went to the 43, 44 and 45 lines only. Jason, the third time in one
+// day: "can't edit session names again, need a permanent fix for this".
+//
+// Two differences from the native boxes that every caller has to know:
+//   - confirmDialog() does not block; it returns a Promise, and a Promise is
+//     truthy. `if (!confirmDialog(...)) return` would stop, delete or archive
+//     without asking. Every call is `await confirmDialog(...)`, and
+//     test/in-page-dialogs.test.js scans public/ for one that is not.
+//   - alert() returns at once (it is replaced at the end of this section). A
+//     caller whose next step has to wait until the message was dismissed uses
+//     `await alertDialog(...)`.
+//
+// The look is the add-project dialog's (same classes); style.css adds only
+// the layer, the message text, the danger button and the focus ring.
+
+/** Requests waiting for their turn; the one on screen is not in here. */
+const appDialogQueue = [];
+let appDialogShowing = false;
+
+// A click this soon after the box opened is not an answer to it. The second
+// click of a double-click lands on the backdrop, or on a button that happens
+// to be under the pointer, before the box has even been seen.
+//
+// Keys are held back for as long only when a key went down just before the box
+// opened. That is a box the user did not see coming: the next one in the
+// queue, opened by the Enter that answered the one before it, or one that
+// appeared by itself (a reply came back) while they were typing in a terminal.
+// Its focus is on the confirm button, which may be "Remove anyway". A box
+// opened with the mouse answers its first key: "click Stop, press Enter" is
+// meant to be fast.
+const APP_DIALOG_GUARD_MS = 350;
+
+// Nor is a click this soon after the last box was answered. Two boxes that
+// follow each other put their buttons in the same place, so the second click
+// of a slow double-click on "Detach" would land on "Remove checkout". It has
+// to outlast a double-click, which the guard above does not, and it counts
+// from the answer and not from the opening: the next box may come at once or
+// after a reply from main. Keys are not held back by it: a key pressed after
+// a click is a second decision, not the tail of the first.
+const APP_DIALOG_AFTER_ANSWER_MS = 700;
+
+/** When a box was last answered, with the mouse or a key. */
+let appDialogLastAnswerAt = -Infinity;
+
+/** When a key last went down anywhere in the window, box or no box. */
+let appDialogLastKeyAt = -Infinity;
+if (typeof window !== 'undefined') {
+  window.addEventListener('keydown', () => { appDialogLastKeyAt = performance.now(); }, true);
+}
+
+/**
+ * Ask a yes/no question in the page. Resolves true for the confirm button,
+ * false for Cancel, Escape and a click on the backdrop.
+ *   confirm   the confirm button's label: the action's own verb ('Stop')
+ *   danger    true where the action destroys or stops something
+ */
+function confirmDialog(message, { title, confirm = 'OK', cancel = 'Cancel', danger = false } = {}) {
+  return queueAppDialog({ message, title, confirm, cancel, danger });
+}
+
+/** Show a message in the page. Resolves, with nothing, once it is closed. */
+function alertDialog(message, { title, ok = 'OK' } = {}) {
+  return queueAppDialog({ message, title, confirm: ok, cancel: null, danger: false }).then(() => {});
+}
+
+// One box at a time, first in first out. Two failures can arrive together (a
+// loop over worktrees, a reply landing while a question is open), and two
+// stacked boxes would put the answer to the second on the keys meant for the
+// first.
+function queueAppDialog(request) {
+  return new Promise((resolve) => {
+    appDialogQueue.push({ ...request, resolve });
+    showNextAppDialog();
+  });
+}
+
+function showNextAppDialog() {
+  if (appDialogShowing || !appDialogQueue.length) return;
+  const request = appDialogQueue.shift();
+  appDialogShowing = true;
+  try {
+    openAppDialog(request, (result) => {
+      appDialogShowing = false;
+      request.resolve(result);
+      showNextAppDialog();
+    });
+  } catch (err) {
+    // A box that could not be built is a "no": nothing was confirmed. Without
+    // this the flag would stay up and every later question would wait forever.
+    console.error('[dialog] could not show an in-page dialog:', err);
+    appDialogShowing = false;
+    request.resolve(false);
+    showNextAppDialog();
+  }
+}
+
+function openAppDialog(request, done) {
+  const overlay = document.createElement('div');
+  overlay.className = 'add-project-overlay app-dialog-overlay';
+  const dialog = document.createElement('div');
+  dialog.className = 'add-project-dialog app-dialog';
+  dialog.setAttribute('role', 'alertdialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-describedby', 'app-dialog-message');
+
+  // Text, never markup: messages carry session, project and file names.
+  if (request.title) {
+    const heading = document.createElement('h3');
+    heading.textContent = String(request.title);
+    dialog.appendChild(heading);
+  }
+  const text = document.createElement('div');
+  text.className = 'app-dialog-message';
+  text.id = 'app-dialog-message';
+  text.textContent = String(request.message);
+  dialog.appendChild(text);
+
+  const actions = document.createElement('div');
+  actions.className = 'add-project-actions';
+  const makeButton = (className, label) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = className;
+    btn.textContent = String(label);
+    actions.appendChild(btn);
+    return btn;
+  };
+  // Cancel first, the action last, as in every other dialog here. An alert
+  // has the one button.
+  const cancelBtn = request.cancel === null ? null : makeButton('add-project-cancel-btn', request.cancel);
+  const confirmBtn = makeButton('add-project-add-btn' + (request.danger ? ' app-dialog-danger' : ''), request.confirm);
+  const buttons = cancelBtn ? [cancelBtn, confirmBtn] : [confirmBtn];
+  dialog.appendChild(actions);
+  overlay.appendChild(dialog);
+
+  // Where the user was. For a terminal this is xterm's hidden textarea, and
+  // going back to it is what lets typing carry on after the box.
+  const previous = document.activeElement;
+  const openedAt = performance.now();
+  const tooSoon = () => performance.now() - openedAt < APP_DIALOG_GUARD_MS;
+  const tooSoonToClick = () => tooSoon() || performance.now() - appDialogLastAnswerAt < APP_DIALOG_AFTER_ANSWER_MS;
+  const openedWhileTyping = openedAt - appDialogLastKeyAt < APP_DIALOG_GUARD_MS;
+  const KEY_EVENTS = ['keydown', 'keypress', 'keyup'];
+  let finished = false;
+
+  function finish(result) {
+    if (finished) return;
+    finished = true;
+    appDialogLastAnswerAt = performance.now();
+    for (const type of KEY_EVENTS) window.removeEventListener(type, onKey, true);
+    overlay.remove();
+    // Only if it is still on the page: the row or menu that asked may be gone.
+    // preventScroll, as xterm itself focuses its textarea: that textarea sits
+    // far off to the left until it is moved to the cursor, and a plain focus()
+    // would scroll the terminal sideways to bring it into view.
+    if (previous && previous !== document.body && previous.isConnected && typeof previous.focus === 'function') {
+      try { previous.focus({ preventScroll: true }); } catch {}
+    }
+    done(result);
+  }
+
+  // On the window, in the capture phase: ahead of xterm, of the other dialogs'
+  // document listeners (Enter in the add-project dialog adds the project) and
+  // of the app's shortcuts. stopPropagation() and not the immediate kind, so
+  // the diagnostics recorder, also a capture listener on the window, still
+  // sees every key and Ctrl+Shift+D still works with a box open.
+  function onKey(e) {
+    e.stopPropagation();
+    const active = document.activeElement;
+    if (active && active !== document.body && !dialog.contains(active)) {
+      // Something behind the box took the focus (code did: the backdrop keeps
+      // the pointer out). Stopping the event is not enough there: the key's
+      // default would still type or paste into it. Take the focus back, and
+      // do not let this key answer the box either.
+      e.preventDefault();
+      confirmBtn.focus();
+      if (e.key !== 'Escape') return;
+    }
+    // Alt+Space is the window menu; a Ctrl or Meta chord is somebody's shortcut.
+    if (e.type !== 'keydown' || e.ctrlKey || e.altKey || e.metaKey) return;
+    // Escape too: it would close an alert nobody has read, and its text is
+    // kept nowhere else. A repeat is a key still held down, from before the
+    // box or from answering the one before it: never an answer, however long
+    // it is held.
+    const answers = e.key === 'Escape' || e.key === 'Enter' || e.key === ' ';
+    if (answers && (e.repeat || (openedWhileTyping && tooSoon()))) {
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      finish(false);
+    } else if (e.key === 'Tab') {
+      e.preventDefault();
+      const at = buttons.indexOf(document.activeElement);
+      const next = at < 0 ? buttons.length - 1 : (at + (e.shiftKey ? buttons.length - 1 : 1)) % buttons.length;
+      buttons[next].focus();
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      // Enter presses the button that shows the focus ring, and only that: with
+      // the focus on no button (after a click on the text), the first press
+      // puts the ring back and the second one answers.
+      const pressed = buttons.find((btn) => btn === document.activeElement);
+      if (pressed) finish(pressed === confirmBtn);
+      else confirmBtn.focus();
+    }
+  }
+
+  for (const btn of buttons) {
+    btn.addEventListener('click', () => { if (!tooSoonToClick()) finish(btn === confirmBtn); });
+  }
+  // The backdrop is a way out here, unlike in the dialogs that hold typed
+  // work: there is nothing in this box to lose. Only a click that began on it,
+  // though: dragging across the message to select it and letting go past the
+  // edge of the box is also reported as a click on the backdrop.
+  let pressedOnBackdrop = false;
+  overlay.addEventListener('mousedown', (e) => { pressedOnBackdrop = e.target === overlay; });
+  overlay.addEventListener('click', (e) => { if (pressedOnBackdrop && e.target === overlay && !tooSoonToClick()) finish(false); });
+
+  // The box first: if it cannot be put on the page, no key listener is left
+  // behind to swallow every key in the window.
+  document.body.appendChild(overlay);
+  for (const type of KEY_EVENTS) window.addEventListener(type, onKey, true);
+  // On the confirm button, as in the native box.
+  confirmBtn.focus();
+}
+
+// alert() from anywhere in the renderer, including a caller nobody has listed,
+// opens the in-page box. `inPage` is how the focus watch tells this function
+// from the native one (terminal-diagnostics.js initFocusWatch), whichever of
+// the two files gets to window.alert first. window.confirm is left native on
+// purpose: nothing calls it any more, and the focus watch still wraps it, so a
+// native confirm that comes back is recorded as a suspect.
+function inPageAlert(message) {
+  alertDialog(arguments.length ? String(message) : '');
+}
+inPageAlert.inPage = true;
+if (typeof window !== 'undefined') window.alert = inPageAlert;

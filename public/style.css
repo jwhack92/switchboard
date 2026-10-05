@@ -3065,6 +3065,57 @@ body { display: flex; flex-direction: column; }
   display: none;
 }
 
+/* ========== IN-PAGE CONFIRM / ALERT ========== */
+/* dialogs.js confirmDialog and alertDialog, which stand in for the native
+   confirm() and alert() boxes. The box is an .add-project-dialog inside an
+   .add-project-overlay; only what differs is here.
+
+   The layer: a question can be asked from inside any other overlay (the
+   highest of them is at 10040), so this sits above them all, and below only
+   the diagnostics toast (.diag-toast, 100000, styled in
+   terminal-diagnostics.js), which has to stay readable and clickable while a
+   box is open.
+
+   Both classes in the selector: the element carries both, and with one class
+   each this rule would beat .add-project-overlay's z-index only for as long as
+   it stayed below it in this file. */
+.add-project-overlay.app-dialog-overlay { z-index: 99000; }
+
+.app-dialog h3 { margin-bottom: 10px; }
+
+/* pre-wrap: the messages are written with \n\n between the question and its
+   detail, and list paths one to a line. A path has nowhere to break, hence
+   overflow-wrap. The cap keeps the buttons on screen under a long git error.
+   Selectable, so an error can be copied, which the native box did not allow. */
+.app-dialog-message {
+  color: #d0d0e0;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 50vh;
+  overflow-y: auto;
+  user-select: text;
+}
+
+/* :focus and not :focus-visible. The box opens after a mouse click, and
+   Chromium shows no focus-visible ring on a button that script focused then;
+   but Enter presses whichever button has the focus, so it must always show. */
+.app-dialog .add-project-actions button:focus {
+  outline: 2px solid #8ccbff;
+  outline-offset: 1px;
+}
+
+.app-dialog .app-dialog-danger {
+  background: rgba(224,80,112,0.18);
+  color: #ffb5b5;
+  border-color: rgba(224,80,112,0.45) !important;
+}
+
+.app-dialog .app-dialog-danger:hover {
+  background: rgba(224,80,112,0.28);
+}
+
 /* ========== GLOBAL SETTINGS BUTTON ========== */
 #global-settings-btn {
   margin-left: auto;
