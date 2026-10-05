@@ -232,7 +232,7 @@ test('the scans see a native confirm and an un-awaited question in the spellings
 
 // Everything in public/ that asks a question and answers through a Promise.
 // A new helper of this kind belongs in this list.
-const ASKS = ['confirmDialog', 'tokConfirm', 'handoffConfirmOverride', 'confirmStopWork'];
+const ASKS = ['confirmDialog', 'tokConfirm', 'handoffConfirmOverride', 'handoffConfirmUltracode', 'confirmStopWork'];
 
 test('every question is awaited: a Promise is truthy, so one that is not would go ahead without asking', () => {
   const files = rendererCode();
@@ -248,6 +248,7 @@ test('every question is awaited: a Promise is truthy, so one that is not would g
   // counted one by one in the next test.
   assert.equal(awaited.tokConfirm, 3, 'Rebuild, Turn off, Turn on');
   assert.ok(awaited.handoffConfirmOverride >= 1);
+  assert.ok(awaited.handoffConfirmUltracode >= 1);
   assert.ok(awaited.confirmStopWork >= 2);
 });
 
@@ -271,7 +272,10 @@ const QUESTIONS = {
     "if (!await confirmDialog(…, { confirm: 'Resume' })) return;",                             // let scheduled tasks run again
   ],
   // An explicit true, or it is a no (the line before it checks the dialog is there).
-  'ctx-handoff.js': ["&& (await confirmDialog(…, { confirm: 'Type it anyway', danger: true })) === true;"],
+  'ctx-handoff.js': [
+    "&& (await confirmDialog(…, { confirm: 'Type it anyway', danger: true })) === true;",      // the handoff request
+    "&& (await confirmDialog(…, { confirm: 'Type it' })) === true;",                           // the ultracode switch
+  ],
   'projects-view.js': [
     "if (!await confirmDialog(…, { confirm: 'Remove' })) return;",                             // a session out of its project
     "if (!await confirmDialog(…, { confirm: 'Detach' })) return;",                             // a folder out of its project

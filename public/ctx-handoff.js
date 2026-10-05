@@ -14,6 +14,11 @@
 // whether the session is busy (after a reload). A session that is busy is
 // never typed into.
 //
+// The same files say whether a session has ultracode on. The header has a
+// button that switches it by typing the /effort command, through the same
+// gate as Hand off (typingGate), and a running session's row carries a bolt
+// while it is on.
+//
 // How the state file is read follows the hook's own "Reader contract"
 // (ctx_handoff.py module docstring): crossed_at ties the file to a request,
 // written_at alone never does, a Stop counts only when it is later than the
@@ -37,6 +42,8 @@
 //   task-runner.js: activeTaskView
 //   utils.js: cleanDisplayName
 //   continue-name.js: window.ContinueName
+//   xterm.js: the buffer of a window._openSessions entry's terminal
+//   icons.js: window.ICONS.bolt
 //   the browser: sessionStorage (per window; survives a reload of that window),
 //           localStorage (every window; the names Continue has given)
 // Those are top-level const/let in classic scripts: global bindings, but NOT
@@ -47,6 +54,9 @@
 // Called from outside: handoffChipState() by sidebar.js buildSessionItem,
 // onActiveSessionChanged() by app.js setActiveSession. Both are typeof-guarded
 // at the call site and checked once at load in app.js.
+// handoffBoltState() by the row builders of both tabs (sidebar.js
+// buildSessionItem, projects-view.js buildSessionRow) and handoffNoteTyped()
+// by terminal-manager.js, typeof-guarded at the call site too.
 
 const REQUEST_LINE = 'Write the context handoff now. [ctx-handoff:request]';
 // Same thresholds as the status line: dim below WARN_AT, amber from it, red
@@ -59,6 +69,20 @@ const OVERRIDE_TITLE = 'This session has not reported the end of its turn. Click
 // The turn marker says "ended", but this window has not been told whether the
 // session is busy: the same question, a tooltip that gives the real reason.
 const OVERRIDE_TITLE_UNSEEN = 'This window has seen no busy or idle event for this session since it loaded. Click to type the request anyway (asks first).';
+
+// What the ultracode button types. Enter follows as a separate write, as it
+// does for the request line.
+const ULTRACODE_TEXT = { on: '/effort ultracode', off: '/effort ultracode off' };
+const ULTRACODE_UNKNOWN_TITLE = 'Not known yet. The hook reports it after the session\'s first turn.';
+// Why the last switch came to nothing: text in the header note.
+const ULTRACODE_NOT_CONFIRMED = 'No confirmation seen';
+const ULTRACODE_NO_WORKFLOWS = 'Ultracode needs dynamic workflows enabled (see /config).';
+const ULTRACODE_NO_MODEL = 'Ultracode isn\'t available on this session\'s model.';
+// How long after a watched turn ended the files must have been read again
+// before a reading that has not moved is called stale. The hook writes at the
+// Stop, and the reads after an idle event go out at 0, 1 and 3 s: the last of
+// them is the first that counts.
+const STALE_AFTER_MS = 2500;
 
 // Why the last request came to nothing: text beside the button, never a popup.
 // Not "did not reach the session": a line typed while a turn is starting is
@@ -194,6 +218,9 @@ function canContinue(state, handoffReadable, running) {
  * The text is the token count and nothing else. A handoff that is due shows as
  * the colour (level 'due', red) and in the tooltip; one that is written adds a
  * tick (level 'written', green).
+ * A reading that is no longer being updated (`staleSince`, a clock time: see
+ * staleReading) keeps its number and colour, adds `stale: true` for the dimmed
+ * look, and says so in the tooltip.
  */
 function chipState(input) {
   const o = input || {};
@@ -201,21 +228,96 @@ function chipState(input) {
   const meter = meterModel(o.sidecar);
   if (!meter) return null;
   const info = handoffInfo(o.state, o.handoffReadable);
+  let chip = { text: meter.text, level: meter.level, title: 'Context ' + meter.full };
   if (info.status === 'due') {
-    return { text: meter.text, level: 'due', title: 'Context ' + meter.full + ' — handoff due' };
+    chip = { text: meter.text, level: 'due', title: 'Context ' + meter.full + ' — handoff due' };
+  } else if (info.status === 'written') {
+    chip = { text: meter.text + ' ✓', level: 'written', title: 'Context ' + meter.full + ' — handoff written' };
   }
-  if (info.status === 'written') {
-    return { text: meter.text + ' ✓', level: 'written', title: 'Context ' + meter.full + ' — handoff written' };
+  if (o.staleSince) {
+    chip.stale = true;
+    chip.title = staleTitle(o.staleSince);
   }
-  return { text: meter.text, level: meter.level, title: 'Context ' + meter.full };
+  return chip;
 }
 
-// Whether the session had ultracode on at its last prompt, as the hook read it
-// from the transcript. The boolean true only: false is "switched off", null
-// and a missing key (an older hook) are "not seen", and none of them is a
-// reason to start the next session in it.
-function inUltracode(state) {
-  return !!state && typeof state === 'object' && state.ultracode === true;
+/**
+ * Whether the reading can be TOLD to be no longer updated. After /clear the
+ * program carries on under a new session id while the terminal stays filed
+ * under the old one, so the files read here stop changing and the meter would
+ * go on showing the old number as if it were current.
+ *   turn      the last whole turn this window watched: { busyAtMs, idleAtMs }
+ *   readAtMs  when the files were last read
+ * Stale = the files were read STALE_AFTER_MS or more after that turn ended,
+ * and nothing in them is as late as its start: not the reading (sidecar.ts),
+ * not the hook's turn markers. → { sinceTs } (seconds), else null.
+ * A busy-then-idle pair is not always a whole turn: a session that stops at a
+ * permission prompt looks idle too, and so does one that was interrupted. So
+ * where the hook's own markers say a turn is still running under this id (a
+ * prompt with no Stop after it), nothing is marked: the hook is alive here,
+ * and its prompt stamp may be a moment older than the spinner, which the
+ * comparison with the turn's start would take for "did not move".
+ * No watched turn, no mark: after a reload nothing is marked until a turn has
+ * been seen from busy to idle. It goes as soon as anything in the files moves.
+ */
+function staleReading(input) {
+  const o = input || {};
+  const turn = o.turn;
+  if (!turn || typeof turn.busyAtMs !== 'number' || typeof turn.idleAtMs !== 'number') return null;
+  if (turn.idleAtMs < turn.busyAtMs) return null;
+  if (typeof o.readAtMs !== 'number' || o.readAtMs - turn.idleAtMs < STALE_AFTER_MS) return null;
+  const sidecar = o.sidecar && typeof o.sidecar === 'object' ? o.sidecar : null;
+  const state = o.state && typeof o.state === 'object' ? o.state : null;
+  if (state && typeof state.last_prompt_at === 'number' && !turnEnded(state)) return null;
+  const readingTs = sidecar && typeof sidecar.ts === 'number' && isFinite(sidecar.ts) ? sidecar.ts : null;
+  // Without a time on the reading there is nothing to say "since".
+  if (readingTs === null) return null;
+  let latest = readingTs;
+  for (const at of state ? [state.last_stop_at, state.last_prompt_at] : []) {
+    if (typeof at === 'number' && isFinite(at) && at > latest) latest = at;
+  }
+  return latest * 1000 < turn.busyAtMs ? { sinceTs: readingTs } : null;
+}
+
+function staleTitle(clock) {
+  return 'Not updated since ' + clock + '. If you ran /clear in this session, the real count is lower.';
+}
+
+/**
+ * Whether a line may be typed into the session, and plainly or only after
+ * asking. One computation for every control that types (Hand off, Update, the
+ * ultracode button), so no two of them can disagree. Takes what buttonModel
+ * takes; the three states and `busyKnown` are described there.
+ * → { allowed, override, why, overrideTitle }
+ *   allowed   false = never typed into, and `why` says which reason
+ *   override  allowed, but a click asks first; `overrideTitle` says why
+ */
+function typingGate(input) {
+  const o = input || {};
+  const state = o.state && typeof o.state === 'object' ? o.state : null;
+  const request = o.request && typeof o.request === 'object' ? o.request : {};
+  const lastStopMs = state && typeof state.last_stop_at === 'number' ? state.last_stop_at * 1000 : null;
+  // The spinner came on after the last Stop the hook recorded: a turn is
+  // running that the state file has not caught up with.
+  const busyAfterStop = o.lastBusyAtMs != null && lastStopMs !== null && o.lastBusyAtMs > lastStopMs;
+  // The turn marker fails open on the prompt side (a failed userprompt write
+  // leaves the old Stop in place), so a Stop only counts when it is later than
+  // the last line this file typed. atMs survives the request going back to idle.
+  const sentAtMs = typeof request.atMs === 'number' && request.atMs > 0 ? request.atMs : null;
+  const stopAfterSent = sentAtMs === null || (lastStopMs !== null && lastStopMs > sentAtMs);
+  const ended = turnEnded(state) && !busyAfterStop && stopAfterSent;
+  const allowed = !!o.running && !o.ownedElsewhere && !o.pendingRow && o.busy !== true;
+  const override = allowed && (!ended || o.busyKnown !== true);
+
+  let why = '';
+  if (!allowed) {
+    if (o.ownedElsewhere) why = 'Shown in another window';
+    else if (o.pendingRow) why = 'Session is still starting';
+    else if (o.busy === true) why = 'Session is working';
+    else why = 'Session is not running';
+  }
+  // The turn not having ended is the stronger reason, so it is the one named.
+  return { allowed, override, why, overrideTitle: ended ? OVERRIDE_TITLE_UNSEEN : OVERRIDE_TITLE };
 }
 
 /**
@@ -267,30 +369,9 @@ function buttonModel(input) {
     return model;
   }
 
-  const lastStopMs = state && typeof state.last_stop_at === 'number' ? state.last_stop_at * 1000 : null;
-  // The spinner came on after the last Stop the hook recorded: a turn is
-  // running that the state file has not caught up with.
-  const busyAfterStop = o.lastBusyAtMs != null && lastStopMs !== null && o.lastBusyAtMs > lastStopMs;
-  // The turn marker fails open on the prompt side (a failed userprompt write
-  // leaves the old Stop in place), so a Stop only counts when it is later than
-  // the last line this file typed. atMs survives the request going back to idle.
-  const sentAtMs = typeof request.atMs === 'number' && request.atMs > 0 ? request.atMs : null;
-  const stopAfterSent = sentAtMs === null || (lastStopMs !== null && lastStopMs > sentAtMs);
-  const ended = turnEnded(state) && !busyAfterStop && stopAfterSent;
-  const allowed = running && !o.ownedElsewhere && !o.pendingRow && o.busy !== true;
-  const busyKnown = o.busyKnown === true;
-  const override = allowed && (!ended || !busyKnown);
-
-  let why = '';
-  if (!allowed) {
-    if (o.ownedElsewhere) why = 'Shown in another window';
-    else if (o.pendingRow) why = 'Session is still starting';
-    else if (o.busy === true) why = 'Session is working';
-    else why = 'Session is not running';
-  }
-  // The turn not having ended is the stronger reason, so it is the one named.
-  const overrideTitle = ended ? OVERRIDE_TITLE_UNSEEN : OVERRIDE_TITLE;
-  const typingTitle = okTitle => (!allowed ? why : override ? overrideTitle : okTitle);
+  const gate = typingGate(o);
+  const { allowed, override } = gate;
+  const typingTitle = okTitle => (!allowed ? gate.why : override ? gate.overrideTitle : okTitle);
 
   const info = handoffInfo(state, o.handoffReadable);
   if (canContinue(state, o.handoffReadable, running)) {
@@ -328,6 +409,157 @@ function buttonModel(input) {
   // The later of the two things that went wrong is the one on screen.
   if (typeof o.continueError === 'string' && o.continueError) model.note = o.continueError;
   return model;
+}
+
+// What the hook itself says: true / false, or null when it has not looked.
+// It reads the switch from the transcript (ctx_handoff.py scan_ultracode) and
+// writes true or false only once it has found a switch record there. Its null
+// after a scan (ultra_scan says where the scan stopped) is "never switched in
+// this session", which is off, by the hook's own rule ("treat anything but
+// true as not ultracode") -- once it has recorded a Stop. Before that the scan
+// is the one at the session's first prompt, and a session STARTED in ultracode
+// (every "Continue in new session (ultracode)") seems to get its switch record
+// only after that scan (one transcript, not measured): calling it off for the
+// whole first turn would be a guess. Its null with no scan, a missing key (an
+// older hook) and no state file at all are "not looked yet" too.
+function ultracodeHook(state) {
+  if (!state || typeof state !== 'object') return null;
+  if (typeof state.ultracode === 'boolean') return state.ultracode;
+  const scanned = !!state.ultra_scan && typeof state.ultra_scan === 'object';
+  return scanned && typeof state.last_stop_at === 'number' ? false : null;
+}
+
+/**
+ * Whether the session has ultracode on, as well as this window can tell:
+ * true, false, or null for "not known". This is the value shown everywhere
+ * (the button, the rows) and the one Continue passes on.
+ *
+ * The hook's value is behind right after a switch. `confirmed` ({ value, atMs })
+ * is the last switch this window saw the terminal itself confirm, and it
+ * stands until the hook has recorded a Stop later than it. A prompt later
+ * than it is not enough: the hook scans at the prompt BEFORE the transcript
+ * holds that prompt's own records, so what it writes then is still the value
+ * from before the switch (ctx_handoff.py, "Known limit").
+ */
+function ultracodeValue(state, confirmed) {
+  const hook = ultracodeHook(state);
+  const seen = confirmed && typeof confirmed === 'object' && typeof confirmed.value === 'boolean'
+    && typeof confirmed.atMs === 'number';
+  if (!seen) return hook;
+  if (hook === null) return confirmed.value;
+  const stopAt = state.last_stop_at;
+  const stoppedSince = typeof stopAt === 'number' && isFinite(stopAt) && stopAt * 1000 >= confirmed.atMs;
+  return stoppedSince ? hook : confirmed.value;
+}
+
+// A slash command typed onto the end of a half-written prompt is sent as part
+// of that prompt. `typed` is the last input typed by hand into the terminal,
+// { atMs, enter }: when the last of it was not Enter, it may still be sitting
+// in the input box. The end of a turn is NOT a bound on that: what is typed
+// ahead while the session works is still in the box when the turn ends, which
+// is exactly when the button is clicked. It errs towards asking (a draft
+// deleted again still counts, and so does a key that answered a permission
+// prompt, until the next Enter typed by hand), and it cannot see text the
+// program put there itself (dictation).
+function draftOpen(typed) {
+  return !!typed && typeof typed === 'object' && typeof typed.atMs === 'number' && typed.enter !== true;
+}
+
+/**
+ * What the header's ultracode button shows and what a click may do. Takes
+ * what buttonModel takes, and:
+ *   ultracodeValue  true / false / null (see ultracodeValue)
+ *   switching       a typed switch is waiting for the terminal to confirm it
+ *   typed           the last input typed by hand (see draftOpen)
+ *   headerOff       the header is not this session's just now
+ * → { visible, label, look, enabled, override, target, title }
+ *   look    'on' (filled), 'off' (outline) or 'unknown' (outline, dimmed)
+ *   target  what a click switches to: 'off' when it is on, 'on' when it is off
+ * It types under the same gate as Hand off, so it is disabled wherever Hand off
+ * is and asks first wherever Hand off does, and it asks first over a draft too.
+ * A value that is not known is never clickable: no guessing a direction.
+ */
+function ultracodeModel(input) {
+  const o = input || {};
+  const value = typeof o.ultracodeValue === 'boolean' ? o.ultracodeValue : null;
+  const model = {
+    visible: false, label: 'Ultracode', look: value === null ? 'unknown' : value ? 'on' : 'off',
+    enabled: false, override: false, target: null, title: '',
+  };
+  if (o.isTerminal || !o.running || o.headerOff) return model;
+  model.visible = true;
+  if (o.switching) {
+    model.label = 'Ultracode…';
+    model.title = 'Waiting for the session to confirm the switch';
+    return model;
+  }
+  if (value === null) {
+    model.title = ULTRACODE_UNKNOWN_TITLE;
+    return model;
+  }
+  // "Writing…": a line of this file's is already on its way into the session.
+  if (o.request && o.request.phase === 'requested') {
+    model.title = 'Waiting for the session to write the handoff';
+    return model;
+  }
+  const gate = typingGate(o);
+  if (!gate.allowed) {
+    model.title = gate.why;
+    return model;
+  }
+  model.enabled = true;
+  model.override = gate.override || draftOpen(o.typed);
+  model.target = value ? 'off' : 'on';
+  model.title = (value ? 'Ultracode is on. Click to switch it off' : 'Ultracode is off. Click to switch it on')
+    + (model.override ? ' (asks first).' : '.');
+  return model;
+}
+
+// Asked before typing where ultracodeModel says override. It names the exact
+// text, and what the gate could not rule out.
+function ultracodeQuestion(target) {
+  return 'Type "' + ULTRACODE_TEXT[target] + '" into this session?\n\n'
+    + 'Only when it is waiting at an empty prompt. If it is asking you something, or you have text typed there, cancel.';
+}
+
+// The lines the program prints after /effort, counted on the rows of the
+// terminal's screen: "Ultracode on (this session only): …" (older versions:
+// "Set effort level to ultracode …"), "Ultracode off. …", and its two
+// refusals. Capital U on purpose: the typed command is echoed in lower case.
+// "isn.t": the apostrophe may come back as a typographic one.
+// → the four counts, or null when there are no rows to read. A terminal always
+// has rows, so an empty list is a read that failed and not a screen with
+// nothing on it.
+function ultracodeScreen(rows) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const count = { on: 0, off: 0, noWorkflows: 0, noModel: 0 };
+  for (const row of rows) {
+    const text = String(row);
+    if (/Ultracode on\b|Set effort level to ultracode/.test(text)) count.on++;
+    if (/Ultracode off\b/.test(text)) count.off++;
+    if (/Ultracode needs dynamic workflows/.test(text)) count.noWorkflows++;
+    if (/Ultracode isn.t available/.test(text)) count.noModel++;
+  }
+  return count;
+}
+
+/**
+ * What the screen says about a typed switch: `before` and `after` are
+ * ultracodeScreen counts from before the text was typed and from now. Only
+ * MORE lines than before count, so a line left on screen by an earlier switch
+ * settles nothing; and a screen that could not be read either time settles
+ * nothing at all. A refusal is looked for first: beside a new refusal, a new
+ * line of the target's is not this switch's, and "not switched" is the side
+ * to be wrong on.
+ * → { outcome: 'confirmed' | 'refused' | 'waiting', reason }
+ */
+function ultracodeOutcome(target, before, after) {
+  const waiting = { outcome: 'waiting', reason: '' };
+  if (!before || !after) return waiting;
+  if (after.noWorkflows > before.noWorkflows) return { outcome: 'refused', reason: ULTRACODE_NO_WORKFLOWS };
+  if (after.noModel > before.noModel) return { outcome: 'refused', reason: ULTRACODE_NO_MODEL };
+  if (after[target] > before[target]) return { outcome: 'confirmed', reason: '' };
+  return waiting;
 }
 
 // The folder a sibling session starts in: the session's own, else the cwd the
@@ -459,6 +691,31 @@ function parseStoredRequest(text, nowMs) {
   return { phase: value.phase, atMs: value.atMs, reason };
 }
 
+// A confirmed ultracode switch as this file left it in sessionStorage, or null
+// for anything else. A time in the future is refused, as above: no report of
+// the hook's could ever be later than it.
+function parseStoredUltracode(text, nowMs) {
+  if (typeof text !== 'string' || !text) return null;
+  let value;
+  try { value = JSON.parse(text); } catch { return null; }
+  if (!value || typeof value !== 'object' || typeof value.value !== 'boolean') return null;
+  if (typeof value.atMs !== 'number' || !isFinite(value.atMs) || value.atMs <= 0) return null;
+  if (typeof nowMs === 'number' && value.atMs > nowMs + 1000) return null;
+  return { value: value.value, atMs: value.atMs };
+}
+
+// A draft that may be open, as this file left it in sessionStorage, or null
+// for anything else. Only a draft is ever stored (handoffStoreTyped), so what
+// comes back is always "the last of it was not Enter".
+function parseStoredTyped(text) {
+  if (typeof text !== 'string' || !text) return null;
+  let value;
+  try { value = JSON.parse(text); } catch { return null; }
+  if (!value || typeof value !== 'object') return null;
+  if (typeof value.atMs !== 'number' || !isFinite(value.atMs) || value.atMs <= 0) return null;
+  return { atMs: value.atMs, enter: false };
+}
+
 // Which of the running sessions the 15 s poll reads on this tick: each one
 // once every POLL_EVERY_TICKS, on its own tick rather than all at once (every
 // read is synchronous work in the main process). Sorted, so a session keeps
@@ -492,6 +749,13 @@ const HANDOFF_CONTINUE_NO_FOLDER = 'The new session could not be started: this s
 const HANDOFF_ERROR_SHOWN_MS = 60000;
 // sessionStorage key prefix for a session's request record.
 const HANDOFF_STORE_PREFIX = 'handoff-request:';
+// ...and for the last ultracode switch its terminal confirmed.
+const HANDOFF_ULTRACODE_PREFIX = 'handoff-ultracode:';
+// ...and for a draft that may be open in its input box.
+const HANDOFF_TYPED_PREFIX = 'handoff-typed:';
+// When the terminal's screen is looked at after the switch text was typed. The
+// last look is the one that gives up.
+const HANDOFF_ULTRACODE_LOOK_MS = [1000, 2500, 5000];
 // Every this many ticks, entries nobody needs any more are dropped.
 const HANDOFF_PRUNE_EVERY_TICKS = 60;
 
@@ -564,7 +828,11 @@ function handoffStoreRequest(entry) {
 function handoffForgetStored(id) {
   try {
     const store = handoffStorage();
-    if (store && typeof id === 'string' && HANDOFF_ID_RE.test(id)) store.removeItem(HANDOFF_STORE_PREFIX + id);
+    if (store && typeof id === 'string' && HANDOFF_ID_RE.test(id)) {
+      store.removeItem(HANDOFF_STORE_PREFIX + id);
+      store.removeItem(HANDOFF_ULTRACODE_PREFIX + id);
+      store.removeItem(HANDOFF_TYPED_PREFIX + id);
+    }
   } catch {}
 }
 
@@ -576,6 +844,60 @@ function handoffRestoreRequest(id) {
   } catch {
     return null;
   }
+}
+
+// The last ultracode switch the terminal confirmed, kept the same way: after a
+// reload the hook's value would be back on screen although it is the older.
+function handoffStoreUltracode(entry) {
+  try {
+    const store = handoffStorage();
+    if (!store || !HANDOFF_ID_RE.test(entry.id)) return;
+    const key = HANDOFF_ULTRACODE_PREFIX + entry.id;
+    if (entry.ultraConfirmed) store.setItem(key, JSON.stringify(entry.ultraConfirmed));
+    else store.removeItem(key);
+  } catch {}
+}
+
+function handoffRestoreUltracode(id) {
+  try {
+    const store = handoffStorage();
+    if (!store || typeof id !== 'string' || !HANDOFF_ID_RE.test(id)) return null;
+    return parseStoredUltracode(store.getItem(HANDOFF_ULTRACODE_PREFIX + id), Date.now());
+  } catch {
+    return null;
+  }
+}
+
+// A draft that may be open in the session's input box (draftOpen), kept the
+// same way: main's own busy flag makes a click plain again straight after a
+// reload, when the text is still sitting there and this file's memory of it
+// would be gone. The key is there only while a draft may be.
+function handoffStoreTyped(entry) {
+  try {
+    const store = handoffStorage();
+    if (!store || !HANDOFF_ID_RE.test(entry.id)) return;
+    const key = HANDOFF_TYPED_PREFIX + entry.id;
+    if (draftOpen(entry.typed)) store.setItem(key, JSON.stringify({ atMs: entry.typed.atMs }));
+    else store.removeItem(key);
+  } catch {}
+}
+
+function handoffRestoreTyped(id) {
+  try {
+    const store = handoffStorage();
+    if (!store || typeof id !== 'string' || !HANDOFF_ID_RE.test(id)) return null;
+    return parseStoredTyped(store.getItem(HANDOFF_TYPED_PREFIX + id));
+  } catch {
+    return null;
+  }
+}
+
+// Stored only when "ended in Enter" CHANGES: this runs on every keystroke,
+// and a draft is one write when it starts and one when its Enter comes.
+function handoffSetTyped(entry, enter) {
+  const changed = !entry.typed || entry.typed.enter !== enter;
+  entry.typed = { atMs: Date.now(), enter };
+  if (changed) handoffStoreTyped(entry);
 }
 
 function handoffSetRequest(entry, request) {
@@ -606,6 +928,18 @@ function handoffEntry(id) {
       continueError: '',       // why the last Continue came to nothing
       continueErrorAtMs: 0,
       pruneMarked: false,      // handoffPrune found it unneeded on its last pass
+      // The last whole turn this window watched, { busyAtMs, idleAtMs }, and
+      // when the files were last read: what staleReading goes by. Not kept
+      // across a reload either.
+      turn: null,
+      readAtMs: 0,
+      // The last input typed by hand into the terminal: { atMs, enter }. Never
+      // the text (handoffNoteTyped). An open draft is kept across a reload.
+      typed: handoffRestoreTyped(id),
+      ultraConfirmed: handoffRestoreUltracode(id), // { value, atMs }: the last switch the terminal confirmed
+      ultraSwitch: null,       // { target, atMs } while a typed switch waits for the terminal's line
+      ultraNote: '',           // why the last switch came to nothing
+      ultraNoteAtMs: 0,
     };
     handoffRt.cache.set(id, entry);
   }
@@ -650,13 +984,13 @@ function handoffIsTerminal(id) {
   return !!session && session.type === 'terminal';
 }
 
-// Everything buttonModel and chipState take, for one session. The three flags
-// that can only DISABLE typing fail closed: each starts as "do not type" and
-// is lowered only by a successful read of the app's own value. That covers a
-// global that throws on access (temporal dead zone), one that does not exist
-// at all, and a missing window._isOwnedElsewhere. (`running` fails closed
-// separately: without activePtyIds it is false, and nothing is typed into a
-// session that is not running.)
+// Everything buttonModel, ultracodeModel and chipState take, for one session.
+// The three flags that can only DISABLE typing fail closed: each starts as "do
+// not type" and is lowered only by a successful read of the app's own value.
+// That covers a global that throws on access (temporal dead zone), one that
+// does not exist at all, and a missing window._isOwnedElsewhere. (`running`
+// fails closed separately: without activePtyIds it is false, and nothing is
+// typed into a session that is not running.)
 //
 // `busy` is the app's own flag OR main's (when main reports one): the app's is
 // kept up by events and is the fresher of the two, main's is the only one that
@@ -675,6 +1009,8 @@ function handoffInputs(id) {
   const mainBusy = entry && typeof entry.mainBusy === 'boolean' ? entry.mainBusy : null;
   if (mainBusy === true) busy = true;
   const errorShown = !!entry && !!entry.continueError && nowMs - entry.continueErrorAtMs < HANDOFF_ERROR_SHOWN_MS;
+  const ultracode = entry ? ultracodeValue(entry.state, entry.ultraConfirmed) : null;
+  const ultraNoteShown = !!entry && !!entry.ultraNote && nowMs - entry.ultraNoteAtMs < HANDOFF_ERROR_SHOWN_MS;
   return {
     isTerminal: handoffIsTerminal(id),
     running: handoffIsRunning(id),
@@ -684,12 +1020,21 @@ function handoffInputs(id) {
     sidecar: entry ? entry.sidecar : null,
     state: entry ? entry.state : null,
     handoffReadable: entry ? entry.handoffReadable : false,
-    ultracode: !!entry && inUltracode(entry.state),
+    ultracode: ultracode === true,
+    ultracodeValue: ultracode,
+    switching: !!entry && !!entry.ultraSwitch,
+    typed: entry ? entry.typed : null,
+    ultracodeNote: ultraNoteShown ? entry.ultraNote : '',
     request: entry ? entry.request : handoffIdleRequest(),
     continueLocked: !!entry && nowMs < entry.continueLockUntil,
     continueError: errorShown ? entry.continueError : '',
     nowMs,
   };
+}
+
+function handoffStale(entry) {
+  if (!entry) return null;
+  return staleReading({ turn: entry.turn, readAtMs: entry.readAtMs, sidecar: entry.sidecar, state: entry.state });
 }
 
 /**
@@ -701,16 +1046,54 @@ function handoffChipState(sessionId) {
   try {
     const entry = handoffRt.cache.get(sessionId);
     if (!entry) return null;
+    const stale = handoffStale(entry);
     return chipState({
       sidecar: entry.sidecar,
       state: entry.state,
       handoffReadable: entry.handoffReadable,
       running: handoffIsRunning(sessionId),
       isTerminal: handoffIsTerminal(sessionId),
+      staleSince: stale ? handoffClock(stale.sinceTs) : '',
     });
   } catch (err) {
     handoffLogOnce('handoffChipState failed', err);
     return null;
+  }
+}
+
+/**
+ * The ultracode bolt for a session row, on the Sessions tab and the Projects
+ * tab: { html, title } for a running session that has ultracode on, else null.
+ * Rows stay quiet: "not known" looks like "off" here. Synchronous and
+ * never-throwing, like handoffChipState and for the same reason.
+ */
+function handoffBoltState(sessionId) {
+  try {
+    const entry = handoffRt.cache.get(sessionId);
+    if (!entry || !handoffIsRunning(sessionId) || handoffIsTerminal(sessionId)) return null;
+    if (ultracodeValue(entry.state, entry.ultraConfirmed) !== true) return null;
+    const icons = typeof window !== 'undefined' ? window.ICONS : null;
+    if (!icons || typeof icons.bolt !== 'function') return null;
+    return { html: icons.bolt(11), title: 'Ultracode is on' };
+  } catch (err) {
+    handoffLogOnce('handoffBoltState failed', err);
+    return null;
+  }
+}
+
+/**
+ * Called by terminal-manager.js (noteTypedByHand) each time something typed,
+ * pasted or dropped by hand goes to a session's terminal: when, and whether it
+ * ended in Enter. Never the text. On every keystroke, so it only writes the
+ * two values down (handoffSetTyped): the header catches up at the next tick,
+ * and a click decides from them afresh.
+ */
+function handoffNoteTyped(sessionId, enter) {
+  try {
+    if (!handoffRt.started || typeof sessionId !== 'string' || !HANDOFF_ID_RE.test(sessionId)) return;
+    handoffSetTyped(handoffEntry(sessionId), enter === true);
+  } catch (err) {
+    handoffLogOnce('handoffNoteTyped failed', err);
   }
 }
 
@@ -896,6 +1279,7 @@ async function handoffDoRefresh(id) {
   // A plain terminal has no Claude context and no sidecar.
   if (handoffIsTerminal(id)) return;
   const entry = handoffEntry(id);
+  const startedMs = Date.now();
   let pair = null;
   try {
     pair = await handoffReadPair(id);
@@ -911,7 +1295,11 @@ async function handoffDoRefresh(id) {
   // The session was re-keyed (forked) while the read was out: what came back
   // describes the old id's files.
   if (handoffRt.cache.get(id) !== entry) return;
-  if (pair.sidecar !== undefined) entry.sidecar = pair.sidecar;
+  if (pair.sidecar !== undefined) {
+    entry.sidecar = pair.sidecar;
+    // The time the read went out: what came back is at least that fresh.
+    entry.readAtMs = startedMs;
+  }
   if (pair.state !== undefined) entry.state = pair.state;
   // Not kept from an earlier read: a reply without the flag is "not told".
   entry.mainBusy = typeof pair.busy === 'boolean' ? pair.busy : null;
@@ -968,11 +1356,20 @@ function handoffShow(el, on) {
 function handoffPaintChips(id) {
   if (!HANDOFF_ID_RE.test(id)) return;
   const chip = handoffChipState(id);
-  const className = 'handoff-chip' + (chip && chip.level ? ' handoff-' + chip.level : '');
+  const className = 'handoff-chip' + (chip && chip.level ? ' handoff-' + chip.level : '')
+    + (chip && chip.stale ? ' handoff-stale' : '');
   document.querySelectorAll('.session-item[data-session-id="' + id + '"] .handoff-chip').forEach(el => {
     handoffSetText(el, chip ? chip.text : '');
     handoffSetClass(el, className);
     handoffSetTitle(el, chip ? chip.title : '');
+  });
+  // The ultracode bolt, in the same pass and under the same rule; these rows
+  // are on the Projects tab as well. Whether there is one is compared, not the
+  // markup: the browser hands innerHTML back re-spelled.
+  const bolt = handoffBoltState(id);
+  document.querySelectorAll('[data-session-id="' + id + '"] .handoff-bolt').forEach(el => {
+    if (!!el.innerHTML !== !!bolt) el.innerHTML = bolt ? bolt.html : '';
+    handoffSetTitle(el, bolt ? bolt.title : '');
   });
 }
 
@@ -1018,6 +1415,20 @@ function handoffBuildHeader() {
   note.id = 'handoff-note';
   note.style.display = 'none';
 
+  // A bolt and a label, so the label can change without the icon being built
+  // again.
+  const ultracode = document.createElement('button');
+  ultracode.id = 'handoff-ultracode-btn';
+  ultracode.type = 'button';
+  ultracode.className = 'handoff-btn';
+  ultracode.style.display = 'none';
+  const ultracodeIcon = document.createElement('span');
+  ultracodeIcon.className = 'handoff-btn-icon';
+  try { ultracodeIcon.innerHTML = window.ICONS.bolt(11); } catch {}
+  const ultracodeLabel = document.createElement('span');
+  ultracode.append(ultracodeIcon, ultracodeLabel);
+  ultracode.addEventListener('click', handoffGuard('ultracode click failed', handoffOnUltracodeClick));
+
   const primary = document.createElement('button');
   primary.id = 'handoff-primary-btn';
   primary.type = 'button';
@@ -1035,9 +1446,10 @@ function handoffBuildHeader() {
 
   controls.insertBefore(meter, status.nextSibling);
   controls.insertBefore(note, stopBtn);
+  controls.insertBefore(ultracode, stopBtn);
   controls.insertBefore(primary, stopBtn);
   controls.insertBefore(update, stopBtn);
-  return { meter, meterText, meterTrack, meterFill, meterState, note, primary, update };
+  return { meter, meterText, meterTrack, meterFill, meterState, note, ultracode, ultracodeLabel, primary, update };
 }
 
 // "Disabled" is aria-disabled plus a class, not the disabled attribute: a
@@ -1078,6 +1490,7 @@ function handoffRenderHeader() {
   if (handoffHeaderOff(id)) {
     handoffShow(els.meter, false);
     handoffShow(els.note, false);
+    handoffShow(els.ultracode, false);
     handoffShow(els.primary, false);
     handoffShow(els.update, false);
     return;
@@ -1114,9 +1527,23 @@ function handoffRenderHeader() {
   handoffSetText(els.meterState, stateText);
   handoffSetClass(els.meterState, stateClass);
   handoffSetTitle(els.meterState, stateTitle);
-  handoffSetTitle(els.meterText, meter
-    ? 'Context in use: ' + meter.full + (meter.ts !== null ? ' (read ' + handoffClock(meter.ts) + ')' : '')
-    : '');
+  // A reading that is no longer being updated keeps its number, dimmed, and
+  // the tooltip says since when.
+  const stale = meter ? handoffStale(handoffRt.cache.get(id)) : null;
+  handoffSetClass(els.meter, stale ? 'handoff-stale' : '');
+  let meterTitle = '';
+  if (stale) meterTitle = staleTitle(handoffClock(stale.sinceTs));
+  else if (meter) meterTitle = 'Context in use: ' + meter.full + (meter.ts !== null ? ' (read ' + handoffClock(meter.ts) + ')' : '');
+  handoffSetTitle(els.meterText, meterTitle);
+
+  const ultra = ultracodeModel(input);
+  handoffSetButton(els.ultracode, {
+    visible: ultra.visible,
+    enabled: ultra.enabled,
+    title: ultra.title,
+    extraClass: 'handoff-btn-ultracode-' + ultra.look + (ultra.override ? ' handoff-btn-override' : ''),
+  });
+  if (ultra.visible) handoffSetText(els.ultracodeLabel, ultra.label);
 
   const model = buttonModel(input);
   handoffSetButton(els.primary, {
@@ -1134,7 +1561,8 @@ function handoffRenderHeader() {
   });
   // With or without a button: a session that ended before its handoff was
   // written has no button left to sit beside.
-  const note = model.note ? String(model.note) : '';
+  // A switch that just came to nothing is the latest thing that went wrong.
+  const note = input.ultracodeNote || (model.note ? String(model.note) : '');
   handoffShow(els.note, !!note);
   handoffSetText(els.note, note);
   handoffSetTitle(els.note, note);
@@ -1294,7 +1722,7 @@ async function handoffContinue(id) {
     // An ultracode session continues as one. Set after the defaults, so it
     // would win over an effort from them (they carry none today);
     // `--effort ultracode` is ultracode on at xhigh (harnesses/claude.js).
-    if (inUltracode(entry.state)) options.effort = 'ultracode';
+    if (ultracodeValue(entry.state, entry.ultraConfirmed) === true) options.effort = 'ultracode';
     options.initialPrompt = continuePrompt(info.path);
     const name = handoffContinueName(id);
     const newId = await launchNewSession(target, options, { name });
@@ -1318,6 +1746,10 @@ async function handoffContinue(id) {
 // looked like a second ago. null when that control is not on offer.
 function handoffTypingControl(id, which) {
   if (handoffHeaderOff(id)) return null;
+  // The ultracode button's text is on its way into the session, its Enter
+  // perhaps not yet: a line typed now would be sent joined to it.
+  const entry = handoffRt.cache.get(id);
+  if (entry && entry.ultraSwitch) return null;
   const model = buttonModel(handoffInputs(id));
   if (!model.visible) return null;
   if (which === 'update') return model.update.visible ? model.update : null;
@@ -1375,6 +1807,124 @@ function handoffOnUpdateClick() {
   return id ? handoffTypeRequest(id, 'update') : undefined;
 }
 
+// --- The ultracode button ---
+
+// The button as a click finds it NOW, or null when it is not on offer.
+// headerOff is added here and not in handoffInputs: with the header off the
+// render never gets as far as the model, so a click is its only reader.
+function handoffUltracodeControl(id) {
+  const model = ultracodeModel({ ...handoffInputs(id), headerOff: handoffHeaderOff(id) });
+  return model.visible ? model : null;
+}
+
+// As handoffConfirmOverride, with the button's own question: the call below is
+// awaited, and so is every call of this function. Anything but an explicit yes
+// is a no.
+async function handoffConfirmUltracode(target) {
+  try {
+    return typeof confirmDialog === 'function'
+      && (await confirmDialog(ultracodeQuestion(target), { confirm: 'Type it' })) === true;
+  } catch { return false; }
+}
+
+// The rows of a session's terminal screen, or null when they cannot be read
+// (no terminal in this window). The LIVE screen, from the buffer's baseY, and
+// not what is in view (TermDiag.viewportRows starts at viewportY): the text
+// goes straight to the pty and scrolls nothing. With the view scrolled up the
+// program's line is printed below it, and a line of an earlier switch that
+// scrolls into view would be counted as this one's.
+function handoffScreenRows(id) {
+  try {
+    const open = window._openSessions ? window._openSessions.get(id) : null;
+    const terminal = open ? open.terminal : null;
+    const buffer = terminal && terminal.buffer ? terminal.buffer.active : null;
+    if (!buffer || typeof buffer.baseY !== 'number' || !(terminal.rows > 0)) return null;
+    const rows = [];
+    for (let y = 0; y < terminal.rows; y++) {
+      const line = buffer.getLine(buffer.baseY + y);
+      rows.push(line ? line.translateToString(true) : '');
+    }
+    return rows;
+  } catch {
+    return null;
+  }
+}
+
+// One look at the terminal after a typed switch. The hook would say so too,
+// but not before the session's next prompt; the program's own line is on the
+// screen within the second. Nothing is shown as switched on the click alone:
+// without that line the button goes back to the look it had, and the note says
+// why.
+function handoffUltracodeLook(entry, pending, before, last) {
+  if (entry.ultraSwitch !== pending) return;
+  const result = ultracodeOutcome(pending.target, before, ultracodeScreen(handoffScreenRows(entry.id)));
+  if (result.outcome === 'waiting' && !last) return;
+  entry.ultraSwitch = null;
+  if (result.outcome === 'confirmed') {
+    entry.ultraConfirmed = { value: pending.target === 'on', atMs: Date.now() };
+    handoffStoreUltracode(entry);
+  } else {
+    entry.ultraNote = result.outcome === 'refused' ? result.reason : ULTRACODE_NOT_CONFIRMED;
+    entry.ultraNoteAtMs = Date.now();
+    // Nothing came back: the text may be sitting in the input box unsent (an
+    // Enter that only closed the command menu). That is a draft like any
+    // other, so the next click asks first, until an Enter is typed there by
+    // hand. A refusal is the program answering: the text went in.
+    if (result.outcome !== 'refused') handoffSetTyped(entry, false);
+  }
+  handoffPaint(entry.id);
+}
+
+// Types the switch the way handoffSendRequest types its line: the text, then
+// Enter as a separate write. The screen is counted BEFORE the text goes in.
+function handoffSendUltracode(id, target) {
+  if (typeof window.api.sendInput !== 'function') return;
+  const entry = handoffEntry(id);
+  const before = ultracodeScreen(handoffScreenRows(id));
+  const pending = { target, atMs: Date.now() };
+  entry.ultraSwitch = pending;
+  entry.ultraNote = '';
+  window.api.sendInput(id, ULTRACODE_TEXT[target]);
+  setTimeout(handoffGuard('sending Enter failed', () => {
+    // entry.id, not id: it follows the session through a fork.
+    window.api.sendInput(entry.id, '\r');
+  }), 250);
+  const lastLook = HANDOFF_ULTRACODE_LOOK_MS[HANDOFF_ULTRACODE_LOOK_MS.length - 1];
+  for (const delay of HANDOFF_ULTRACODE_LOOK_MS) {
+    setTimeout(handoffGuard('ultracode look failed', () => {
+      handoffUltracodeLook(entry, pending, before, delay === lastLook);
+    }), delay);
+  }
+  handoffRenderHeader();
+}
+
+async function handoffToggleUltracode(id) {
+  let control = handoffUltracodeControl(id);
+  if (!control || !control.enabled) return;
+  // The direction is the click's: what the button said when it was pressed.
+  const target = control.target;
+  if (control.override) {
+    if (!await handoffConfirmUltracode(target)) return;
+    // As in handoffTypeRequest: the question was open for as long as the user
+    // took, so wait, read again and decide again. A value that changed
+    // meanwhile is not switched back.
+    await handoffDelay(HANDOFF_MIN_READ_GAP_MS);
+    await handoffRefresh(id);
+    if (handoffActiveId() !== id) return;
+    control = handoffUltracodeControl(id);
+    if (!control || !control.enabled || control.target !== target) {
+      handoffRenderHeader();
+      return;
+    }
+  }
+  handoffSendUltracode(id, target);
+}
+
+function handoffOnUltracodeClick() {
+  const id = handoffActiveId();
+  return id ? handoffToggleUltracode(id) : undefined;
+}
+
 // --- Triggers ---
 
 // Entries nobody needs: not running, not on screen, no read out, no request
@@ -1389,7 +1939,7 @@ function handoffPrune() {
   const running = new Set(handoffRunningIds());
   for (const [id, entry] of handoffRt.cache) {
     const needed = id === active || running.has(id) || handoffRt.inflight.has(id)
-      || entry.request.phase !== 'idle' || nowMs < entry.continueLockUntil;
+      || entry.request.phase !== 'idle' || nowMs < entry.continueLockUntil || !!entry.ultraSwitch;
     if (needed) {
       entry.pruneMarked = false;
     } else if (!entry.pruneMarked) {
@@ -1477,6 +2027,10 @@ function handoffInit() {
       if (busy) {
         entry.lastBusyAtMs = Date.now();
       } else {
+        // Busy and now idle again: a whole turn, watched (staleReading).
+        if (entry.lastBusyAtMs !== null && (!entry.turn || entry.turn.busyAtMs !== entry.lastBusyAtMs)) {
+          entry.turn = { busyAtMs: entry.lastBusyAtMs, idleAtMs: Date.now() };
+        }
         // A turn just ended: the hook is writing both files about now. Now,
         // and twice more in case this beat it.
         handoffRefresh(sessionId);
@@ -1499,6 +2053,8 @@ function handoffInit() {
         entry.id = newId;
         handoffRt.cache.set(newId, entry);
         handoffStoreRequest(entry);
+        handoffStoreUltracode(entry);
+        handoffStoreTyped(entry);
       }
       return handoffRefresh(newId);
     }));
@@ -1518,6 +2074,10 @@ if (typeof module !== 'undefined' && module.exports) {
     fmtTokens, chipLevel, deriveCtxDir, meterModel, meterWidth, turnEnded, handoffInfo,
     canContinue, chipState, buttonModel, continuePrompt, requestOutcome, nextRequest,
     parseStoredRequest, pollDue, launchFolder,
-    handoffChipState, onActiveSessionChanged,
+    ULTRACODE_TEXT, ULTRACODE_UNKNOWN_TITLE, ULTRACODE_NOT_CONFIRMED, ULTRACODE_NO_WORKFLOWS, ULTRACODE_NO_MODEL,
+    STALE_AFTER_MS,
+    typingGate, ultracodeValue, draftOpen, ultracodeModel, ultracodeQuestion, ultracodeScreen, ultracodeOutcome,
+    parseStoredUltracode, parseStoredTyped, staleReading, staleTitle,
+    handoffChipState, handoffBoltState, handoffNoteTyped, onActiveSessionChanged,
   };
 }

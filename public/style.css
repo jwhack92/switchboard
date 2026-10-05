@@ -7517,12 +7517,32 @@ body.session-drop-target #session-drop-overlay { display: flex; }
 .handoff-chip.handoff-written { color: #3ecf5a; }
 
 /* A narrow sidebar: the time label gives way, not the chip or the id. */
-.session-item .session-meta:has(.handoff-chip:not(:empty)) .session-time {
+.session-item .session-meta:has(.handoff-chip:not(:empty)) .session-time,
+.session-item .session-meta:has(.handoff-bolt:not(:empty)) .session-time {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* A reading that is no longer being updated (ctx-handoff.js staleReading; the
+   visible case is a session after /clear). The number stays, dimmed, and the
+   tooltip says since when. */
+.handoff-chip.handoff-stale { opacity: 0.45; }
+
+/* ---- Ultracode bolt on a session row, Sessions tab and Projects tab ----
+   Always in the row like the chip, and empty unless the session is running
+   with ultracode on. */
+.handoff-bolt {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  flex-shrink: 0;
+  color: #b9a2ff;
+}
+.handoff-bolt:empty { display: none; }
+/* With no chip in front of it, the bolt is what takes the free space. */
+.session-item .session-meta .handoff-chip:empty + .handoff-bolt { margin-left: auto; }
 
 /* ---- Meter in the terminal header ----
    Built like the status bar's quota meter (.quota-track / .quota-fill). */
@@ -7556,6 +7576,8 @@ body.session-drop-target #session-drop-overlay { display: flex; }
 .handoff-meter-state { font-weight: 500; }
 .handoff-meter-state.handoff-due { color: #e05070; }
 .handoff-meter-state.handoff-written { color: #3ecf5a; }
+#handoff-meter.handoff-stale .handoff-meter-text,
+#handoff-meter.handoff-stale .handoff-meter-track { opacity: 0.45; }
 
 /* ---- Hand off / Continue / Update buttons in the terminal header ---- */
 .handoff-btn {
@@ -7613,6 +7635,29 @@ body.session-drop-target #session-drop-overlay { display: flex; }
   background: transparent;
 }
 .handoff-btn:focus-visible { outline: 2px solid #8ccbff; outline-offset: 1px; }
+
+/* ---- Ultracode button, just before Hand off ----
+   Filled while ultracode is on, the plain outline while it is off, and the
+   outline dimmed (.handoff-btn-disabled) while it is not known. Violet: not
+   Continue's green, and not the amber of a button that asks first, whose
+   dashed border it keeps when it asks first itself. "On" stays filled while
+   the button is disabled (switching, session working), under the pointer too. */
+.handoff-btn-icon {
+  display: inline-flex;
+  vertical-align: -1px;
+  margin-right: 4px;
+}
+.handoff-btn.handoff-btn-ultracode-on,
+.handoff-btn.handoff-btn-ultracode-on.handoff-btn-disabled:hover {
+  background: rgba(160,130,255,0.2);
+  border-color: rgba(160,130,255,0.55);
+  color: #d9ccff;
+}
+.handoff-btn.handoff-btn-ultracode-on:not(.handoff-btn-disabled):hover {
+  background: rgba(160,130,255,0.28);
+  border-color: rgba(160,130,255,0.75);
+  color: #e6ddff;
+}
 
 /* Why the last request came to nothing. Clipped; the full text is the tooltip. */
 #handoff-note {

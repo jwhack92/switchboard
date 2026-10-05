@@ -606,6 +606,10 @@ function buildSessionRow(project, session, { showTrack = true, className = 'pane
   if (session.scheduleId && typeof scheduleChipHtml === 'function') parts.push(scheduleChipHtml(session));
   // The CLI mark, same as the status bar: the logo says which CLI, no word needed.
   parts.push(`<span class="pane-cli-icon${session.type === 'terminal' ? ' is-terminal' : ''}" title="${escapeHtml(cliLabel(session))}">${cliIcon(session, 12)}</span>`);
+  // Ultracode on: the bolt the Sessions tab shows (ctx-handoff.js). Always in
+  // the row and empty otherwise, so it can be filled in place between renders.
+  const bolt = typeof handoffBoltState === 'function' ? handoffBoltState(id) : null;
+  parts.push(`<span class="handoff-bolt"${bolt ? ` title="${escapeHtml(bolt.title)}"` : ''}>${bolt ? bolt.html : ''}</span>`);
   // The last message's time, the same as the Sessions tab. A session with no
   // transcript yet shows when it started.
   parts.push(`<span>${escapeHtml(formatDate(new Date(session.modified || sessionEventTime(session))))}</span>`);

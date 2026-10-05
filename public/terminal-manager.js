@@ -53,6 +53,15 @@ function decodeOsc52Payload(payload) {
   return new TextDecoder().decode(bytes);
 }
 
+// ctx-handoff.js asks before typing a command over a draft in the prompt. It
+// is told when something went to a session by hand and whether that ended in
+// Enter, never what it was. Called wherever this file sends such input.
+function noteTypedByHand(sessionId, data) {
+  try {
+    if (typeof handoffNoteTyped === 'function') handoffNoteTyped(sessionId, typeof data === 'string' && data.endsWith('\r'));
+  } catch {}
+}
+
 function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } = {}) {
   const handleKey = (e) => {
     // Cmd/Ctrl+F → open terminal search bar
@@ -76,6 +85,7 @@ function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } 
     // Shift+Enter → newline (kitty protocol CSI 13;2u) so Claude Code treats it as newline, not submit.
     if (e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
       if (e.type === 'keydown') {
+        noteTypedByHand(getSessionId(), '\x1b[13;2u');
         window.api.sendInput(getSessionId(), '\x1b[13;2u');
       }
       return false;
@@ -85,6 +95,7 @@ function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } 
     // Send the same Shift+Enter kitty sequence that Claude Code recognizes as newline.
     if (!isMac && e.key === 'Enter' && e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
       if (e.type === 'keydown') {
+        noteTypedByHand(getSessionId(), '\x1b[13;2u');
         window.api.sendInput(getSessionId(), '\x1b[13;2u');
       }
       return false;
@@ -124,6 +135,7 @@ function setupTerminalKeyBindings(terminal, container, getSessionId, { onFind } 
         // Hold-Space is the CLI's push-to-talk. You are about to talk, so stop
         // talking at you — otherwise the mic hears the synthesised voice.
         if (window.speech) window.speech.cancel();
+        noteTypedByHand(getSessionId(), ' ');
         window.api.sendInput(getSessionId(), ' ');
       }
       return false;
@@ -756,6 +768,7 @@ function createTerminalEntry(session) {
   terminal.onData(data => {
     if (data === '\x1b[I' || data === '\x1b[O') return;
     try { window.TermDiag && window.TermDiag.recordInput(entry.session.sessionId, data); } catch {}
+    noteTypedByHand(entry.session.sessionId, data);
     window.api.sendInput(entry.session.sessionId, data);
   });
   setupTerminalKeyBindings(terminal, container, () => entry.session.sessionId, { onFind: openSearchBar });
@@ -961,6 +974,7 @@ function setupDragAndDrop(container, getSessionId) {
     const files = e.dataTransfer.files;
     if (!files.length) return;
     const paths = Array.from(files).map(f => shellEscape(window.api.getPathForFile(f)));
+    noteTypedByHand(getSessionId(), paths.join(' '));
     window.api.sendInput(getSessionId(), paths.join(' '));
   });
 }
@@ -972,7 +986,7 @@ if (typeof module !== 'undefined' && module.exports) {
     isImeComposing, shouldSendSpaceDirectly, decodeOsc52Payload,
     safeFit, rowsThatActuallyFit, visibleEscapes,
     forceRepaint, scheduleSettledRepaint, SETTLE_REPAINT_MS, MAX_REPAINT_WAIT_MS,
-    applySyncMarkers, ESC_SYNC_START, ESC_SYNC_END };
+    applySyncMarkers, ESC_SYNC_START, ESC_SYNC_END, noteTypedByHand };
 }
 
 // Console handles for the raw recorder. Deliberately short — they get typed by

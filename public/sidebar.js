@@ -890,9 +890,23 @@ function buildSessionItem(session) {
     if (chip) {
       handoffChip.textContent = chip.text;
       if (chip.level) handoffChip.className += ' handoff-' + chip.level;
+      if (chip.stale) handoffChip.className += ' handoff-stale';
       handoffChip.title = chip.title;
     }
     metaEl.insertBefore(handoffChip, shortIdEl);
+  } catch {}
+
+  // Ultracode on: a bolt beside the chip (ctx-handoff.js). Built, left empty
+  // and filled in place the same way, and guarded for the same reason.
+  try {
+    const boltEl = document.createElement('span');
+    boltEl.className = 'handoff-bolt';
+    const bolt = typeof handoffBoltState === 'function' ? handoffBoltState(session.sessionId) : null;
+    if (bolt) {
+      boltEl.innerHTML = bolt.html;
+      boltEl.title = bolt.title;
+    }
+    metaEl.insertBefore(boltEl, shortIdEl);
   } catch {}
 
   // Started by a scheduled task: a clock, with which one and when in its

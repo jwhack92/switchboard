@@ -3158,3 +3158,1456 @@ test('browser: a sibling whose terminal did not open is not remembered', async (
   assert.equal(h.launchExtras[0].name, 'Relaunch work 2');
   assert.deepEqual(remembered(localStorage), []);
 });
+
+// ── the ultracode button, and the mark on a reading that has stopped ────────
+//
+// Added with the ultracode button. The names are taken here and not at the
+// top, so that everything above this line stands exactly as it was: those
+// tests are the proof that Hand off behaves as it did before the gate moved
+// out of buttonModel.
+
+const {
+  ULTRACODE_TEXT, ULTRACODE_UNKNOWN_TITLE, ULTRACODE_NOT_CONFIRMED, ULTRACODE_NO_WORKFLOWS, ULTRACODE_NO_MODEL,
+  STALE_AFTER_MS,
+  typingGate, ultracodeValue, draftOpen, ultracodeModel, ultracodeQuestion, ultracodeScreen, ultracodeOutcome,
+  parseStoredUltracode, staleReading, staleTitle,
+} = require(MODULE_PATH);
+
+const ON_LINE = 'Ultracode on (this session only): workflows may run. Effort stays high.';
+const OLD_ON_LINE = 'Set effort level to ultracode (this session only): workflows may run';
+const OFF_LINE = 'Ultracode off. Effort stays high.';
+
+// Every combination the gate looks at.
+function gateCases() {
+  const states = [hookState(), null, oldHookState(), hookState({ last_stop_at: 900 }), hookState({ last_prompt_at: null })];
+  const requests = [{ phase: 'idle' }, { phase: 'idle', atMs: STOP_MS + 5 }, { phase: 'timeout', atMs: STOP_MS - 5, reason: 'x' }];
+  const cases = [];
+  for (const running of [true, false]) {
+    for (const ownedElsewhere of [false, true]) {
+      for (const pendingRow of [false, true]) {
+        for (const busy of [false, true, undefined]) {
+          for (const busyKnown of [true, false]) {
+            for (const state of states) {
+              for (const lastBusyAtMs of [null, STOP_MS - 1, STOP_MS + 1]) {
+                for (const request of requests) {
+                  cases.push(buttonArgs({ running, ownedElsewhere, pendingRow, busy, busyKnown, state, lastBusyAtMs, request }));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return cases;
+}
+
+function ultraArgs(over = {}) {
+  return buttonArgs({ ultracodeValue: false, switching: false, typed: null, headerOff: false, ...over });
+}
+
+test('typingGate: Hand off is exactly what the gate says, in every combination', () => {
+  let plain = 0;
+  let asks = 0;
+  for (const args of gateCases()) {
+    const gate = typingGate(args);
+    const model = buttonModel(args);
+    assert.equal(gate.override && !gate.allowed, false, 'an override is always an allowed control');
+    if (!args.running) {
+      assert.equal(model.visible, false);
+      assert.equal(gate.allowed, false);
+      assert.equal(gate.why, args.ownedElsewhere ? 'Shown in another window' : args.pendingRow ? 'Session is still starting' : args.busy === true ? 'Session is working' : 'Session is not running');
+      continue;
+    }
+    assert.equal(model.primary.kind, 'handoff');
+    assert.equal(model.primary.enabled, gate.allowed);
+    assert.equal(model.primary.override, gate.override);
+    if (!gate.allowed) assert.equal(model.primary.title, gate.why);
+    else if (gate.override) assert.equal(model.primary.title, gate.overrideTitle);
+    else assert.equal(model.primary.title, 'Ask this session to write its context handoff');
+    if (gate.allowed && !gate.override) plain++;
+    if (gate.override) asks++;
+  }
+  assert.ok(plain > 0 && asks > 0, 'the table reaches both the plain and the ask-first state');
+});
+
+test('typingGate: no input at all is "not allowed"', () => {
+  assert.deepEqual(typingGate(), { allowed: false, override: false, why: 'Session is not running', overrideTitle: OVERRIDE_TITLE });
+  assert.equal(typingGate(buttonArgs()).overrideTitle, OVERRIDE_TITLE_UNSEEN, 'a turn that has ended leaves only "not told" to name');
+});
+
+test('ultracodeModel: never plainly clickable where Hand off would ask first, never clickable where Hand off is not', () => {
+  for (const args of gateCases()) {
+    for (const value of [true, false]) {
+      const hand = buttonModel(args).primary;
+      const ultra = ultracodeModel({ ...args, ultracodeValue: value });
+      assert.equal(ultra.enabled, hand.enabled);
+      assert.equal(ultra.override, hand.override);
+      assert.equal(ultra.enabled && !ultra.override && (hand.override || !hand.enabled), false);
+      // ...and where it is disabled it gives Hand off's reason.
+      if (args.running && !hand.enabled) assert.equal(ultra.title, hand.title);
+    }
+  }
+});
+
+test('ultracodeModel: hidden for a plain terminal, a session that is not running, and a header that is off', () => {
+  for (const over of [{ isTerminal: true }, { running: false }, { headerOff: true }]) {
+    const model = ultracodeModel(ultraArgs({ ultracodeValue: true, ...over }));
+    assert.equal(model.visible, false, JSON.stringify(over));
+    assert.equal(model.enabled, false, JSON.stringify(over));
+    assert.equal(model.target, null, JSON.stringify(over));
+  }
+  assert.deepEqual(ultracodeModel(), {
+    visible: false, label: 'Ultracode', look: 'unknown', enabled: false, override: false, target: null, title: '',
+  });
+});
+
+test('ultracodeModel: known on is filled and a click switches it off; known off is the outline and a click switches it on', () => {
+  assert.deepEqual(ultracodeModel(ultraArgs({ ultracodeValue: true })), {
+    visible: true, label: 'Ultracode', look: 'on', enabled: true, override: false, target: 'off',
+    title: 'Ultracode is on. Click to switch it off.',
+  });
+  assert.deepEqual(ultracodeModel(ultraArgs({ ultracodeValue: false })), {
+    visible: true, label: 'Ultracode', look: 'off', enabled: true, override: false, target: 'on',
+    title: 'Ultracode is off. Click to switch it on.',
+  });
+});
+
+test('ultracodeModel: a value that is not known is dimmed and never clickable: no guessing a direction', () => {
+  assert.equal(ULTRACODE_UNKNOWN_TITLE, 'Not known yet. The hook reports it after the session\'s first turn.');
+  for (const value of [null, undefined, 'true', 1, 0]) {
+    const model = ultracodeModel(ultraArgs({ ultracodeValue: value }));
+    assert.deepEqual(model, {
+      visible: true, label: 'Ultracode', look: 'unknown', enabled: false, override: false, target: null,
+      title: ULTRACODE_UNKNOWN_TITLE,
+    }, String(value));
+  }
+});
+
+test('ultracodeModel: while a typed switch is unconfirmed it says "Ultracode…", is not clickable, and keeps the look it had', () => {
+  for (const [value, look] of [[true, 'on'], [false, 'off'], [null, 'unknown']]) {
+    const model = ultracodeModel(ultraArgs({ ultracodeValue: value, switching: true }));
+    assert.equal(model.label, `Ultracode${ELLIPSIS}`);
+    assert.equal(model.enabled, false);
+    assert.equal(model.target, null);
+    assert.equal(model.look, look, 'never the look of the switch that was only asked for');
+    assert.equal(model.title, 'Waiting for the session to confirm the switch');
+  }
+});
+
+test('ultracodeModel: where typing is not allowed it is disabled, with the reason Hand off gives', () => {
+  const reasons = [
+    [{ ownedElsewhere: true }, 'Shown in another window'],
+    [{ pendingRow: true }, 'Session is still starting'],
+    [{ busy: true }, 'Session is working'],
+  ];
+  for (const [over, why] of reasons) {
+    const model = ultracodeModel(ultraArgs({ ultracodeValue: true, ...over }));
+    assert.equal(model.visible, true);
+    assert.equal(model.enabled, false);
+    assert.equal(model.look, 'on', 'what it is stays readable');
+    assert.equal(model.title, why);
+    assert.equal(model.title, buttonModel(buttonArgs(over)).primary.title);
+  }
+});
+
+test('ultracodeModel: a handoff request on its way into the session disables it', () => {
+  const model = ultracodeModel(ultraArgs({ ultracodeValue: true, request: { phase: 'requested', atMs: STOP_MS + 1 } }));
+  assert.equal(model.enabled, false);
+  assert.equal(model.title, 'Waiting for the session to write the handoff');
+});
+
+test('ultracodeModel: it asks first wherever the gate does, and the tooltip says so', () => {
+  for (const over of [{ state: null }, { busyKnown: false }, { lastBusyAtMs: STOP_MS + 1 }]) {
+    const model = ultracodeModel(ultraArgs({ ultracodeValue: true, ...over }));
+    assert.equal(model.enabled, true, JSON.stringify(over));
+    assert.equal(model.override, true, JSON.stringify(over));
+    assert.equal(model.target, 'off');
+    assert.equal(model.title, 'Ultracode is on. Click to switch it off (asks first).');
+  }
+});
+
+test('draftOpen: the last thing typed by hand was not Enter, whenever that was', () => {
+  assert.equal(draftOpen(null), false, 'nothing typed in this window');
+  assert.equal(draftOpen(undefined), false);
+  assert.equal(draftOpen({ atMs: STOP_MS + 1, enter: false }), true);
+  assert.equal(draftOpen({ atMs: STOP_MS + 1, enter: true }), false, 'the last of it was Enter');
+  // Only the boolean true is an Enter; a record without a time is no record.
+  assert.equal(draftOpen({ atMs: STOP_MS + 1, enter: 'yes' }), true);
+  assert.equal(draftOpen({ enter: false }), false);
+  assert.equal(draftOpen('typed'), false);
+});
+
+test('ultracodeModel: text typed ahead while the turn ran is still a draft when the turn has ended', () => {
+  // The end of a turn does not empty the input box. Typed before the hook's
+  // Stop, at it, or with no Stop on record: the click asks first all the same.
+  const stops = [hookState(), hookState({ last_stop_at: 5000 }), oldHookState(), null];
+  for (const state of stops) {
+    for (const atMs of [STOP_MS - 5000, STOP_MS, STOP_MS + 1]) {
+      const model = ultracodeModel(ultraArgs({ state, typed: { atMs, enter: false } }));
+      assert.equal(model.enabled, true);
+      assert.equal(model.override, true, JSON.stringify({ atMs, stop: state && state.last_stop_at }));
+    }
+  }
+});
+
+test('ultracodeModel: the draft rule turns a plain click into one that asks first, and nothing else', () => {
+  const draft = { atMs: STOP_MS + 1, enter: false };
+  const plain = ultracodeModel(ultraArgs({ ultracodeValue: false }));
+  const over = ultracodeModel(ultraArgs({ ultracodeValue: false, typed: draft }));
+  assert.equal(plain.override, false);
+  assert.equal(over.enabled, true);
+  assert.equal(over.override, true);
+  assert.equal(over.title, 'Ultracode is off. Click to switch it on (asks first).');
+  assert.equal(ultracodeModel(ultraArgs({ typed: { atMs: STOP_MS + 1, enter: true } })).override, false);
+  // A draft never makes a disabled button clickable.
+  assert.equal(ultracodeModel(ultraArgs({ typed: draft, busy: true })).enabled, false);
+  assert.equal(ultracodeModel(ultraArgs({ typed: draft, busy: true })).override, false);
+  // Hand off does not have the rule.
+  assert.equal(buttonModel(buttonArgs({ typed: draft })).primary.override, false);
+});
+
+// Where the hook's scan of the transcript stopped: its mark that it has looked.
+const SCANNED = { path: 'C:\\t\\sess-1.jsonl', offset: 4096 };
+
+test('ultracodeValue: the hook\'s boolean when nothing was confirmed here; a scan that found no switch is off; no scan is "not known"', () => {
+  assert.equal(ultracodeValue(hookState({ ultracode: true }), null), true);
+  assert.equal(ultracodeValue(hookState({ ultracode: false }), null), false);
+  // The hook writes true or false only once the transcript holds a switch: a
+  // session that was never switched stays null there, and that is off.
+  assert.equal(ultracodeValue(hookState({ ultracode: null, ultra_scan: SCANNED }), null), false);
+  assert.equal(ultracodeValue(hookState({ ultracode: true, ultra_scan: SCANNED }), null), true);
+  assert.equal(ultracodeValue(hookState({ ultracode: null, ultra_scan: null }), null), null, 'the hook has not looked');
+  assert.equal(ultracodeValue(hookState({ ultracode: null }), null), null);
+  assert.equal(ultracodeValue(hookState(), null), null, 'an older hook writes no key');
+  assert.equal(ultracodeValue(null, null), null);
+  assert.equal(ultracodeValue(hookState({ ultracode: 'true' }), undefined), null);
+  assert.equal(ultracodeValue(hookState({ ultra_scan: 'yes' }), null), null);
+});
+
+test('ultracodeValue: a confirmation stands until the hook records a Stop later than it; then the hook\'s value wins', () => {
+  // The hook last recorded a Stop at 1010 s.
+  const state = hookState({ ultracode: false });
+  assert.equal(ultracodeValue(state, { value: true, atMs: STOP_MS + 1 }), true, 'confirmed after that Stop');
+  assert.equal(ultracodeValue(state, { value: true, atMs: STOP_MS }), false, 'a Stop at that moment or later');
+  assert.equal(ultracodeValue(state, { value: true, atMs: STOP_MS - 1 }), false);
+  // A prompt later than the confirmation is not enough: the hook scans there
+  // before the transcript holds that prompt's records, so its value is still
+  // the one from before the switch, for the whole of that turn.
+  const prompted = hookState({ ultracode: false, last_prompt_at: 1020 });
+  assert.equal(ultracodeValue(prompted, { value: true, atMs: STOP_MS + 1 }), true);
+  const stopped = hookState({ ultracode: true, last_prompt_at: 1020, last_stop_at: 1030 });
+  assert.equal(ultracodeValue(stopped, { value: false, atMs: STOP_MS + 1 }), true, 'the Stop after it has seen them');
+  // A scan after the confirmation that found no switch is the hook saying off.
+  const never = hookState({ ultracode: null, ultra_scan: SCANNED, last_stop_at: 1030 });
+  assert.equal(ultracodeValue(never, { value: true, atMs: STOP_MS + 1 }), false);
+  // No Stop on record at all (an older hook): the confirmation stands.
+  assert.equal(ultracodeValue(oldHookState({ ultracode: true }), { value: false, atMs: 5 }), false);
+});
+
+test('ultracodeValue: a hook that has not looked never takes a confirmed switch away', () => {
+  const later = hookState({ ultracode: null, last_stop_at: 5000 });
+  assert.equal(ultracodeValue(later, { value: true, atMs: STOP_MS + 1 }), true);
+  assert.equal(ultracodeValue(null, { value: false, atMs: 5 }), false);
+  // A record that is not one is no confirmation.
+  for (const bad of [{ value: 'true', atMs: 5 }, { value: true }, { atMs: 5 }, 'true', 7]) {
+    assert.equal(ultracodeValue(hookState({ ultracode: false }), bad), false, JSON.stringify(bad));
+  }
+});
+
+test('the typed texts are the exact commands, with no newline or carriage return (Enter is sent separately)', () => {
+  assert.deepEqual({ ...ULTRACODE_TEXT }, { on: '/effort ultracode', off: '/effort ultracode off' });
+  for (const text of Object.values(ULTRACODE_TEXT)) assert.equal(/[\r\n]/.test(text), false);
+});
+
+test('the question names the exact text and says when to cancel', () => {
+  assert.equal(ultracodeQuestion('off'),
+    'Type "/effort ultracode off" into this session?\n\n'
+    + 'Only when it is waiting at an empty prompt. If it is asking you something, or you have text typed there, cancel.');
+  assert.equal(ultracodeQuestion('on').split('\n')[0], 'Type "/effort ultracode" into this session?');
+});
+
+test('ultracodeScreen: counts the program\'s own lines, and never the typed command', () => {
+  assert.equal(ultracodeScreen(null), null);
+  assert.equal(ultracodeScreen(undefined), null);
+  // A terminal always has rows: none at all is a read that failed.
+  assert.equal(ultracodeScreen([]), null);
+  assert.deepEqual(ultracodeScreen(['', '']), { on: 0, off: 0, noWorkflows: 0, noModel: 0 });
+  assert.deepEqual(ultracodeScreen([
+    '> /effort ultracode',
+    '  ' + ON_LINE,
+    '> /effort ultracode off',
+    '  ' + OFF_LINE,
+    OLD_ON_LINE,
+    'Ultracode needs dynamic workflows enabled (see /config) first',
+    'Ultracode isn\'t available on haiku',
+    'Ultracode isn’t available on haiku',
+    'ultracode on, in a sentence of the model\'s',
+    '',
+  ]), { on: 2, off: 1, noWorkflows: 1, noModel: 2 });
+});
+
+test('ultracodeOutcome: only MORE lines than before settle a switch', () => {
+  const none = ultracodeScreen(['']);
+  const on = ultracodeScreen([ON_LINE]);
+  const off = ultracodeScreen([OFF_LINE]);
+  assert.deepEqual(ultracodeOutcome('on', none, on), { outcome: 'confirmed', reason: '' });
+  assert.deepEqual(ultracodeOutcome('on', none, ultracodeScreen([OLD_ON_LINE])), { outcome: 'confirmed', reason: '' });
+  assert.deepEqual(ultracodeOutcome('off', none, off), { outcome: 'confirmed', reason: '' });
+  // The line of an earlier switch is still on screen: nothing new.
+  assert.equal(ultracodeOutcome('on', on, on).outcome, 'waiting');
+  assert.equal(ultracodeOutcome('on', on, ultracodeScreen([ON_LINE, ON_LINE])).outcome, 'confirmed');
+  // The other direction's line is not this switch's.
+  assert.equal(ultracodeOutcome('on', none, off).outcome, 'waiting');
+  assert.equal(ultracodeOutcome('off', none, on).outcome, 'waiting');
+  assert.equal(ultracodeOutcome('on', none, none).outcome, 'waiting');
+});
+
+test('ultracodeOutcome: a refusal is looked for before a confirmation', () => {
+  const none = ultracodeScreen(['']);
+  // A new refusal and, beside it, a line of the target's that was not there
+  // at the count before: refused. Not switched is the side to be wrong on.
+  for (const [line, reason] of [['Ultracode needs dynamic workflows enabled', ULTRACODE_NO_WORKFLOWS], ['Ultracode isn\'t available on haiku', ULTRACODE_NO_MODEL]]) {
+    assert.deepEqual(ultracodeOutcome('on', none, ultracodeScreen([ON_LINE, line])), { outcome: 'refused', reason });
+    assert.deepEqual(ultracodeOutcome('off', none, ultracodeScreen([line, OFF_LINE])), { outcome: 'refused', reason });
+  }
+  // An old refusal still on screen does not stand in a confirmation's way.
+  const refusedBefore = ultracodeScreen(['Ultracode isn\'t available on haiku']);
+  assert.equal(ultracodeOutcome('on', refusedBefore, ultracodeScreen(['Ultracode isn\'t available on haiku', ON_LINE])).outcome, 'confirmed');
+  // A screen read as no rows at all, before or after, settles nothing.
+  assert.equal(ultracodeOutcome('on', ultracodeScreen([]), ultracodeScreen([ON_LINE])).outcome, 'waiting');
+  assert.equal(ultracodeOutcome('on', none, ultracodeScreen([])).outcome, 'waiting');
+});
+
+test('ultracodeOutcome: a refusal line is a refusal with its reason; an unreadable screen settles nothing', () => {
+  const none = ultracodeScreen(['']);
+  assert.deepEqual(ultracodeOutcome('on', none, ultracodeScreen(['Ultracode needs dynamic workflows enabled (see /config)'])),
+    { outcome: 'refused', reason: ULTRACODE_NO_WORKFLOWS });
+  assert.deepEqual(ultracodeOutcome('on', none, ultracodeScreen(['Ultracode isn\'t available on haiku'])),
+    { outcome: 'refused', reason: ULTRACODE_NO_MODEL });
+  const refusedBefore = ultracodeScreen(['Ultracode isn\'t available on haiku']);
+  assert.equal(ultracodeOutcome('on', refusedBefore, refusedBefore).outcome, 'waiting', 'an old refusal is not this one');
+  // Not read before: what is on screen now could be from any time.
+  assert.equal(ultracodeOutcome('on', null, ultracodeScreen([ON_LINE])).outcome, 'waiting');
+  assert.equal(ultracodeOutcome('on', none, null).outcome, 'waiting');
+});
+
+test('parseStoredUltracode: the record as stored, and nothing else', () => {
+  const now = 5000000;
+  assert.deepEqual(parseStoredUltracode(JSON.stringify({ value: true, atMs: now - 10 }), now), { value: true, atMs: now - 10 });
+  assert.deepEqual(parseStoredUltracode(JSON.stringify({ value: false, atMs: now - 10, extra: 1 }), now), { value: false, atMs: now - 10 });
+  const bad = [
+    null, undefined, '', 'not json', 'null', '7', '[]',
+    JSON.stringify({ value: 'true', atMs: now }), JSON.stringify({ atMs: now }), JSON.stringify({ value: true }),
+    JSON.stringify({ value: true, atMs: 0 }), JSON.stringify({ value: true, atMs: -5 }), JSON.stringify({ value: true, atMs: '5' }),
+  ];
+  for (const text of bad) assert.equal(parseStoredUltracode(text, now), null, String(text));
+  // A time in the future: no report of the hook's could ever be later.
+  assert.notEqual(parseStoredUltracode(JSON.stringify({ value: true, atMs: now + 1000 }), now), null, 'one second of slack');
+  assert.equal(parseStoredUltracode(JSON.stringify({ value: true, atMs: now + 1001 }), now), null);
+});
+
+// ── the stale reading, pure ────────────────────────────────────────────────
+
+// A turn this window watched: busy at 3000 s, idle at 3060 s, and the files
+// read 3 s after that. The default reading and turn markers are far older.
+const TURN = { busyAtMs: 3000000, idleAtMs: 3060000 };
+function staleArgs(over = {}) {
+  return { turn: TURN, readAtMs: TURN.idleAtMs + 3000, sidecar: sidecar({ ts: 2000.5 }), state: hookState(), ...over };
+}
+
+test('staleReading: a watched turn, a read after it, and nothing in the files as late as its start', () => {
+  assert.deepEqual(staleReading(staleArgs()), { sinceTs: 2000.5 });
+  // The state file may be missing altogether: the reading alone decides then.
+  assert.deepEqual(staleReading(staleArgs({ state: null })), { sinceTs: 2000.5 });
+});
+
+test('staleReading: no watched turn, no mark', () => {
+  assert.equal(staleReading(), null);
+  assert.equal(staleReading(staleArgs({ turn: null })), null);
+  assert.equal(staleReading(staleArgs({ turn: { busyAtMs: null, idleAtMs: TURN.idleAtMs } })), null, 'went idle, never seen busy');
+  assert.equal(staleReading(staleArgs({ turn: { busyAtMs: TURN.busyAtMs } })), null, 'still busy');
+  assert.equal(staleReading(staleArgs({ turn: { busyAtMs: 5000, idleAtMs: 4000 } })), null);
+});
+
+test('staleReading: not before the files were read a few seconds after the turn ended', () => {
+  assert.equal(STALE_AFTER_MS, 2500);
+  assert.equal(staleReading(staleArgs({ readAtMs: TURN.idleAtMs + STALE_AFTER_MS - 1 })), null);
+  assert.notEqual(staleReading(staleArgs({ readAtMs: TURN.idleAtMs + STALE_AFTER_MS })), null);
+  assert.equal(staleReading(staleArgs({ readAtMs: TURN.idleAtMs - 1 })), null, 'the read is from before the turn ended');
+  assert.equal(staleReading(staleArgs({ readAtMs: 0 })), null);
+  assert.equal(staleReading(staleArgs({ readAtMs: undefined })), null);
+});
+
+test('staleReading: the mark goes as soon as anything in the files has moved since the turn began', () => {
+  const busySec = TURN.busyAtMs / 1000;
+  assert.equal(staleReading(staleArgs({ sidecar: sidecar({ ts: busySec }) })), null, 'the reading moved');
+  assert.equal(staleReading(staleArgs({ sidecar: sidecar({ ts: busySec + 30 }) })), null);
+  assert.notEqual(staleReading(staleArgs({ sidecar: sidecar({ ts: busySec - 0.001 }) })), null);
+  // The hook is alive for this id (it stamped the turn), so this is not a
+  // terminal whose files have stopped.
+  assert.equal(staleReading(staleArgs({ state: hookState({ last_stop_at: busySec + 60 }) })), null);
+  assert.equal(staleReading(staleArgs({ state: hookState({ last_prompt_at: busySec }) })), null);
+  // A reading without a time has nothing to say "since".
+  assert.equal(staleReading(staleArgs({ sidecar: sidecar({ ts: null }) })), null);
+  assert.equal(staleReading(staleArgs({ sidecar: null })), null);
+});
+
+test('chipState: a stale reading keeps its number and colour, is flagged, and the tooltip says since when', () => {
+  assert.equal(staleTitle('14:05'), 'Not updated since 14:05. If you ran /clear in this session, the real count is lower.');
+  const fresh = chipState(chipArgs());
+  assert.equal('stale' in fresh, false, 'no key at all on a reading that is current');
+  const stale = chipState(chipArgs({ staleSince: '14:05' }));
+  assert.deepEqual(stale, { text: fresh.text, level: fresh.level, stale: true, title: staleTitle('14:05') });
+  const due = chipState(chipArgs({ state: hookState({ pending: true }), staleSince: '09:00' }));
+  assert.equal(due.level, 'due');
+  assert.equal(due.stale, true);
+  assert.equal(due.title, staleTitle('09:00'));
+  assert.equal(chipState(chipArgs({ running: false, staleSince: '14:05' })), null);
+});
+
+// ── the ultracode button in the browser half ───────────────────────────────
+
+const ULTRA_KEY = 'handoff-ultracode:' + SID;
+
+function ultraHeader(h) {
+  const btn = h.byId['handoff-ultracode-btn'];
+  const shown = !!btn && btn.style.display !== 'none';
+  return {
+    shown,
+    label: shown ? btn.children[1].textContent : null,
+    enabled: shown && btn.getAttribute('aria-disabled') === 'false',
+    asksFirst: shown && btn.className.includes('handoff-btn-override'),
+    look: shown ? (/handoff-btn-ultracode-(on|off|unknown)/.exec(btn.className) || [])[1] : null,
+    title: shown ? btn.getAttribute('title') : null,
+  };
+}
+
+async function clickUltra(h) {
+  h.byId['handoff-ultracode-btn'].listeners.click();
+  await flush();
+}
+
+// A terminal as xterm.js shows it to the page. knobs.rows is the live screen,
+// knobs.scrollback what has gone off its top, and knobs.viewTop the first
+// buffer line in view (null = scrolled to the bottom, the live screen).
+function fakeTerminal(knobs) {
+  const lineAt = (y) => {
+    const text = knobs.scrollback.concat(knobs.rows)[y];
+    return text === undefined ? undefined : { translateToString: () => text };
+  };
+  return {
+    get rows() { return knobs.rows.length; },
+    buffer: {
+      get active() {
+        const baseY = knobs.scrollback.length;
+        return { baseY, viewportY: knobs.viewTop === null ? baseY : knobs.viewTop, getLine: lineAt };
+      },
+    },
+  };
+}
+
+// A session whose turn has ended, with the hook's ultracode value as given
+// (undefined = the hook wrote no key), a terminal whose screen is h.knobs.rows,
+// and the bolt icon. reloaded = this window has had no busy or idle event.
+async function bootUltra(ultracode, { reloaded = false, storage, startMs, readCtxState } = {}) {
+  const h = boot({ storage, startMs, readCtxState });
+  h.knobs.rows = ['> hello', ''];
+  h.knobs.scrollback = [];
+  h.knobs.viewTop = null;
+  h.knobs.terminal = fakeTerminal(h.knobs);
+  // TermDiag reads what is IN VIEW, as the shipped one does: the button must
+  // not go by it (the scrolled-up tests below).
+  h.run(`
+    window.TermDiag = { viewportRows: (terminal) => {
+      const rows = [];
+      const buffer = terminal.buffer.active;
+      for (let y = 0; y < terminal.rows; y++) {
+        const line = buffer.getLine(buffer.viewportY + y);
+        rows.push(line ? line.translateToString(true) : '');
+      }
+      return rows;
+    } };
+    window._openSessions = new Map([['${SID}', { terminal: __knobs.terminal }]]);
+    window.ICONS = { bolt: (size) => '<svg data-bolt="' + size + '"></svg>' };
+  `);
+  if (readCtxState) h.knobs.ctxReply = () => mainReply(h, { state: endedState(h, ultracode === undefined ? {} : { ultracode }), busy: false });
+  h.setSidecar(VM_SIDECAR);
+  h.setState(endedState(h, ultracode === undefined ? {} : { ultracode }));
+  if (!reloaded) h.busyEvent(false);
+  await h.refresh();
+  return h;
+}
+
+test('browser: the button sits just before Hand off, with a bolt and a label', async () => {
+  const h = await bootUltra(false);
+  const ids = h.byId['terminal-header-controls'].children.map(el => el.id);
+  assert.equal(ids.indexOf('handoff-ultracode-btn') + 1, ids.indexOf('handoff-primary-btn'));
+  const btn = h.byId['handoff-ultracode-btn'];
+  assert.equal(btn.children.length, 2);
+  assert.equal(btn.children[0].className, 'handoff-btn-icon');
+  assert.deepEqual(ultraHeader(h), {
+    shown: true, label: 'Ultracode', enabled: true, asksFirst: false, look: 'off',
+    title: 'Ultracode is off. Click to switch it on.',
+  });
+  assert.equal(h.header().primary, 'Hand off', 'Hand off is where it was');
+});
+
+test('browser: the button shows what the hook reported, and nothing clickable while that is not known', async () => {
+  const on = await bootUltra(true);
+  assert.equal(ultraHeader(on).look, 'on');
+  assert.equal(ultraHeader(on).title, 'Ultracode is on. Click to switch it off.');
+
+  const unknown = await bootUltra(undefined);
+  assert.deepEqual(ultraHeader(unknown), {
+    shown: true, label: 'Ultracode', enabled: false, asksFirst: false, look: 'unknown', title: ULTRACODE_UNKNOWN_TITLE,
+  });
+  await clickUltra(unknown);
+  await unknown.advance(6000);
+  assert.deepEqual(unknown.sent, []);
+  assert.equal(unknown.confirms.length, 0);
+
+  // A session that was never switched: the hook has scanned its transcript
+  // and found no switch. That is off, and the click that switches it on.
+  const never = await bootUltra(undefined);
+  never.setState(endedState(never, { ultracode: null, ultra_scan: SCANNED }));
+  await never.advance(500);
+  await never.refresh();
+  assert.equal(ultraHeader(never).look, 'off');
+  assert.equal(ultraHeader(never).enabled, true);
+  await clickUltra(never);
+  assert.deepEqual(never.sent, [[SID, '/effort ultracode']]);
+});
+
+test('browser: hidden for a plain terminal and for a session that is not running', async () => {
+  const terminal = await bootUltra(true);
+  terminal.run(`sessionMap.get('${SID}').type = 'terminal'`);
+  await terminal.tick();
+  assert.equal(ultraHeader(terminal).shown, false);
+
+  const stopped = await bootUltra(true);
+  stopped.run('activePtyIds = new Set()');
+  await stopped.tick();
+  assert.equal(ultraHeader(stopped).shown, false);
+  await clickUltra(stopped);
+  await stopped.advance(6000);
+  assert.deepEqual(stopped.sent, []);
+});
+
+test('browser: a plain click types the text, then Enter separately, and shows the switch only once the terminal confirms it', async () => {
+  const h = await bootUltra(false);
+  await clickUltra(h);
+  assert.deepEqual(h.sent, [[SID, '/effort ultracode']]);
+  assert.equal(h.confirms.length, 0);
+  // Never shown as done on the click alone.
+  assert.deepEqual(ultraHeader(h), {
+    shown: true, label: `Ultracode${ELLIPSIS}`, enabled: false, asksFirst: false, look: 'off',
+    title: 'Waiting for the session to confirm the switch',
+  });
+  assert.equal(h.inputs().ultracode, false);
+  await h.advance(249);
+  assert.equal(h.sent.length, 1);
+  await h.advance(1);
+  assert.deepEqual(h.sent, [[SID, '/effort ultracode'], [SID, '\r']]);
+  // A click meanwhile types nothing more.
+  await clickUltra(h);
+  assert.equal(h.sent.length, 2);
+
+  h.knobs.rows = ['> /effort ultracode', '  ' + ON_LINE, ''];
+  await h.advance(749);
+  assert.equal(ultraHeader(h).look, 'off', 'the first look is a second after the text');
+  await h.advance(1);
+  assert.deepEqual(ultraHeader(h), {
+    shown: true, label: 'Ultracode', enabled: true, asksFirst: false, look: 'on',
+    title: 'Ultracode is on. Click to switch it off.',
+  });
+  assert.equal(h.inputs().ultracode, true, 'although the hook still says off');
+  assert.deepEqual(JSON.parse(h.storage.get(ULTRA_KEY)), { value: true, atMs: h.now });
+  assert.equal(h.header().note, null);
+  // The later looks change nothing.
+  await h.advance(6000);
+  assert.equal(ultraHeader(h).look, 'on');
+  assert.equal(h.sent.length, 2);
+  assert.deepEqual(h.errors, []);
+});
+
+test('browser: switching off types the off text and is confirmed by the off line', async () => {
+  const h = await bootUltra(true);
+  await clickUltra(h);
+  assert.deepEqual(h.sent, [[SID, '/effort ultracode off']]);
+  h.knobs.rows = ['> /effort ultracode off', '  ' + OFF_LINE];
+  // Seen at the second look, not the first: the line came late.
+  await h.advance(1000);
+  assert.equal(ultraHeader(h).look, 'off');
+  assert.equal(h.inputs().ultracodeValue, false);
+  assert.equal(ultraHeader(h).title, 'Ultracode is off. Click to switch it on.');
+});
+
+test('browser: a line that arrives late is still seen, up to the last look', async () => {
+  const h = await bootUltra(false);
+  await clickUltra(h);
+  await h.advance(2600);
+  assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
+  h.knobs.rows = [OLD_ON_LINE];
+  await h.advance(2400);
+  assert.equal(ultraHeader(h).look, 'on', 'the older wording counts too');
+  assert.equal(h.header().note, null);
+});
+
+test('browser: no confirmation after 5 s goes back to the look it had, with a note', async () => {
+  const h = await bootUltra(false);
+  // The line of an earlier switch is on screen already: it settles nothing.
+  h.knobs.rows = ['  ' + ON_LINE, '> something else'];
+  await clickUltra(h);
+  await h.advance(4999);
+  assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
+  assert.equal(h.header().note, null);
+  await h.advance(1);
+  // Back to the look it had; and the text may be sitting in the input box
+  // unsent, so the next click asks first.
+  assert.deepEqual(ultraHeader(h), {
+    shown: true, label: 'Ultracode', enabled: true, asksFirst: true, look: 'off',
+    title: 'Ultracode is off. Click to switch it on (asks first).',
+  });
+  assert.equal(ULTRACODE_NOT_CONFIRMED, 'No confirmation seen');
+  assert.equal(h.header().note, ULTRACODE_NOT_CONFIRMED);
+  assert.equal(h.storage.has(ULTRA_KEY), false);
+  assert.equal(h.inputs().ultracode, false);
+  // The note does not stay for ever.
+  await h.ticks(61);
+  assert.equal(h.header().note, null);
+});
+
+test('browser: after "No confirmation seen" the next click asks first, until an Enter is typed there by hand', async () => {
+  const h = await bootUltra(false);
+  await clickUltra(h);
+  await h.advance(5000);
+  assert.equal(h.sent.length, 2);
+  h.knobs.confirmAnswer = false;
+  await clickUltra(h);
+  await h.advance(1000);
+  assert.deepEqual(h.confirms, [ultracodeQuestion('on')]);
+  assert.equal(h.sent.length, 2, 'not typed a second time onto the first');
+  assert.equal(h.header().primaryOverride, false, 'Hand off is as it was');
+  // He pressed Enter in the terminal: whatever was in the box has gone in.
+  h.run(`handoffNoteTyped('${SID}', true)`);
+  await h.tick();
+  assert.equal(ultraHeader(h).asksFirst, false);
+
+  // A refusal is the program answering, so the text did go in: no draft.
+  const refused = await bootUltra(false);
+  await clickUltra(refused);
+  refused.knobs.rows = ['Ultracode isn\'t available on haiku'];
+  await refused.advance(5000);
+  assert.equal(refused.header().note, ULTRACODE_NO_MODEL);
+  assert.equal(ultraHeader(refused).asksFirst, false);
+});
+
+test('browser: a screen that cannot be read is never a confirmation', async () => {
+  const h = await bootUltra(false);
+  h.run('window._openSessions = new Map()');
+  await clickUltra(h);
+  assert.deepEqual(h.sent, [[SID, '/effort ultracode']]);
+  // Readable by the time of the looks, with the line on it: still nothing,
+  // because nobody counted before the text was typed.
+  h.run(`window._openSessions = new Map([['${SID}', { terminal: __knobs.terminal }]])`);
+  h.knobs.rows = [ON_LINE];
+  await h.advance(5000);
+  assert.equal(ultraHeader(h).look, 'off');
+  assert.equal(h.header().note, ULTRACODE_NOT_CONFIRMED);
+});
+
+test('browser: a screen read as no rows, or one whose buffer throws, is not a count of zero', async () => {
+  const reads = {
+    'no rows at all': (h) => { h.knobs.rows = []; },
+    'a terminal without a buffer': (h) => h.run(`window._openSessions = new Map([['${SID}', { terminal: { rows: 24 } }]])`),
+    'a buffer that throws': (h) => h.run(`window._openSessions = new Map([['${SID}', { terminal: { rows: 24, buffer: { get active() { throw new Error('disposed'); } } } }]])`),
+  };
+  for (const [name, breakIt] of Object.entries(reads)) {
+    const h = await bootUltra(false);
+    breakIt(h);
+    await clickUltra(h);
+    // Readable again, with the line on it. Zero before would make this "more".
+    h.run(`window._openSessions = new Map([['${SID}', { terminal: __knobs.terminal }]])`);
+    h.knobs.rows = ['> /effort ultracode', ON_LINE];
+    await h.advance(5000);
+    assert.equal(ultraHeader(h).look, 'off', name);
+    assert.equal(h.header().note, ULTRACODE_NOT_CONFIRMED, name);
+    assert.equal(h.storage.has(ULTRA_KEY), false, name);
+    assert.deepEqual(h.errors, [], name);
+  }
+});
+
+test('browser: with the view scrolled up, the line printed below it still confirms the switch', async () => {
+  const h = await bootUltra(false);
+  h.knobs.scrollback = ['earlier output 1', 'earlier output 2', 'earlier output 3'];
+  h.knobs.viewTop = 0;   // reading earlier output; the live screen is below
+  await clickUltra(h);
+  h.knobs.rows = ['> /effort ultracode', '  ' + ON_LINE];
+  await h.advance(1000);
+  assert.equal(ultraHeader(h).look, 'on');
+  assert.equal(h.header().note, null);
+  assert.equal(JSON.parse(h.storage.get(ULTRA_KEY)).value, true);
+});
+
+test('browser: a line of an earlier switch that scrolls into view is not this switch\'s confirmation', async () => {
+  const h = await bootUltra(false);
+  // An "Ultracode on" from long ago is in the scrollback, out of view.
+  h.knobs.scrollback = ['  ' + ON_LINE, 'older 2', 'older 3', 'older 4'];
+  h.knobs.viewTop = 2;
+  await clickUltra(h);
+  // The program refuses, on the live screen; and the view moves to the old line.
+  h.knobs.rows = ['> /effort ultracode', 'Ultracode needs dynamic workflows enabled (see /config) first'];
+  h.knobs.viewTop = 0;
+  await h.advance(1000);
+  assert.equal(ultraHeader(h).look, 'off');
+  assert.equal(h.header().note, ULTRACODE_NO_WORKFLOWS);
+  assert.equal(h.storage.has(ULTRA_KEY), false);
+  assert.equal(bolt(h), null);
+
+  // The same without a refusal: the old line in view settles nothing.
+  const quiet = await bootUltra(false);
+  quiet.knobs.scrollback = ['  ' + ON_LINE, 'older 2', 'older 3', 'older 4'];
+  quiet.knobs.viewTop = 2;
+  await clickUltra(quiet);
+  quiet.knobs.viewTop = 0;
+  await quiet.advance(5000);
+  assert.equal(ultraHeader(quiet).look, 'off');
+  assert.equal(quiet.header().note, ULTRACODE_NOT_CONFIRMED);
+  assert.equal(quiet.storage.has(ULTRA_KEY), false);
+});
+
+test('browser: a refusal is the note, and the button goes back', async () => {
+  const cases = [
+    ['Ultracode needs dynamic workflows enabled (see /config) before it can be used.', ULTRACODE_NO_WORKFLOWS],
+    ['Ultracode isn\'t available on claude-haiku. Pick another model.', ULTRACODE_NO_MODEL],
+  ];
+  for (const [line, reason] of cases) {
+    const h = await bootUltra(false);
+    await clickUltra(h);
+    h.knobs.rows = ['> /effort ultracode', line];
+    await h.advance(1000);
+    assert.equal(ultraHeader(h).look, 'off', line);
+    assert.equal(ultraHeader(h).label, 'Ultracode', line);
+    assert.equal(h.header().note, reason);
+    assert.equal(h.storage.has(ULTRA_KEY), false);
+  }
+});
+
+test('browser: where Hand off asks first, so does this: the question names the text, and a yes waits, reads again, then types', async () => {
+  const h = await bootUltra(true, { reloaded: true });
+  assert.equal(h.header().primaryOverride, true);
+  assert.equal(ultraHeader(h).asksFirst, true);
+  assert.equal(ultraHeader(h).title, 'Ultracode is on. Click to switch it off (asks first).');
+  await clickUltra(h);
+  assert.deepEqual(h.confirms, [ultracodeQuestion('off')]);
+  assert.deepEqual(h.confirmOptions.map((o) => ({ ...o })), [{ confirm: 'Type it' }]);
+  assert.deepEqual(h.sent, [], 'nothing is typed in the same task as the yes');
+  await h.advance(499);
+  assert.deepEqual(h.sent, []);
+  await h.advance(1);
+  assert.deepEqual(h.sent, [[SID, '/effort ultracode off']]);
+  await h.advance(250);
+  assert.deepEqual(h.sent[1], [SID, '\r']);
+});
+
+test('browser: a no, or an answer that is not exactly true, types nothing', async () => {
+  const declined = await bootUltra(true, { reloaded: true });
+  declined.knobs.confirmAnswer = false;
+  await clickUltra(declined);
+  await declined.advance(6000);
+  assert.equal(declined.confirms.length, 1);
+  assert.deepEqual(declined.sent, []);
+  assert.equal(ultraHeader(declined).label, 'Ultracode');
+  assert.equal(ultraHeader(declined).look, 'on');
+
+  const answers = {
+    'a truthy value that is not true': () => 'yes',
+    'a rejection': () => Promise.reject(new Error('dialog failed')),
+    'undefined': () => undefined,
+  };
+  for (const [name, answer] of Object.entries(answers)) {
+    const h = await bootUltra(true, { reloaded: true });
+    h.run('confirmDialog = ' + answer.toString());
+    await clickUltra(h);
+    await h.advance(6000);
+    assert.deepEqual(h.sent, [], name);
+  }
+  const missing = await bootUltra(true, { reloaded: true });
+  missing.run('confirmDialog = undefined');
+  await clickUltra(missing);
+  await missing.advance(6000);
+  assert.deepEqual(missing.sent, [], 'dialogs.js did not load');
+});
+
+test('browser: a session that went busy while the question was open is not typed into', async () => {
+  const h = await bootUltra(true, { reloaded: true });
+  h.run(`confirmDialog = async () => { sessionBusyState.set('${SID}', true); return true; }`);
+  await clickUltra(h);
+  await h.advance(6000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(ultraHeader(h).enabled, false);
+  assert.equal(ultraHeader(h).title, 'Session is working');
+  assert.equal(ultraHeader(h).label, 'Ultracode', 'not left saying it is switching');
+});
+
+test('browser: a value that changed while the question was open is not switched back', async () => {
+  const h = await bootUltra(true, { reloaded: true });
+  // The hook reports "off" while the box is open: the click was to switch off.
+  h.run(`confirmDialog = async () => { __knobs.duringQuestion(); return true; }`);
+  h.knobs.duringQuestion = () => h.setState(endedState(h, { ultracode: false }));
+  await clickUltra(h);
+  await h.advance(6000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(ultraHeader(h).look, 'off');
+});
+
+test('browser: something typed by hand since the last turn, not ended with Enter, makes the click ask first', async () => {
+  const h = await bootUltra(false);
+  assert.equal(ultraHeader(h).asksFirst, false);
+  h.run(`handoffNoteTyped('${SID}', false)`);
+  assert.equal(JSON.stringify(h.inputs().typed), JSON.stringify({ atMs: h.now, enter: false }), 'the time and the flag, never the text');
+  await h.tick();
+  assert.equal(ultraHeader(h).asksFirst, true);
+  assert.equal(h.header().primaryOverride, false, 'Hand off does not have the rule');
+  h.knobs.confirmAnswer = false;
+  await clickUltra(h);
+  await h.advance(1000);
+  assert.deepEqual(h.confirms, [ultracodeQuestion('on')]);
+  assert.deepEqual(h.sent, []);
+  // The last of it was Enter: no draft.
+  h.run(`handoffNoteTyped('${SID}', true)`);
+  await h.tick();
+  assert.equal(ultraHeader(h).asksFirst, false);
+  // An id that is not one is ignored, and nothing throws.
+  h.run(`handoffNoteTyped('../x', false); handoffNoteTyped(null, false)`);
+  assert.deepEqual(h.errors, []);
+});
+
+test('browser: the draft is asked about even when the click comes before the header has caught up', async () => {
+  const h = await bootUltra(false);
+  h.run(`handoffNoteTyped('${SID}', false)`);
+  // No tick: the button still looks plain. The click decides afresh.
+  assert.equal(ultraHeader(h).asksFirst, false);
+  h.knobs.confirmAnswer = false;
+  await clickUltra(h);
+  assert.equal(h.confirms.length, 1);
+  assert.deepEqual(h.sent, []);
+});
+
+test('browser: the hook\'s next report takes over from the confirmation', async () => {
+  const h = await bootUltra(false);
+  await clickUltra(h);
+  h.knobs.rows = [ON_LINE];
+  await h.advance(1000);
+  assert.equal(h.inputs().ultracodeValue, true);
+  // The next prompt: the hook scans before the transcript holds the switch,
+  // and still says off. The button and the row do not go back for that turn.
+  await h.advance(5000);
+  h.setState(endedState(h, { ultracode: false, last_prompt_at: h.sec }));
+  await h.refresh();
+  assert.equal(h.inputs().ultracodeValue, true);
+  // The turn ends: the hook has looked again and says so itself...
+  await h.advance(5000);
+  h.setState(endedState(h, { ultracode: true, last_prompt_at: h.sec - 3, last_stop_at: h.sec }));
+  await h.refresh();
+  assert.equal(h.inputs().ultracodeValue, true);
+  // ...and when it reports "off" (switched by hand in the terminal), that wins.
+  await h.advance(5000);
+  h.setState(endedState(h, { ultracode: false, last_prompt_at: h.sec - 3, last_stop_at: h.sec }));
+  await h.refresh();
+  assert.equal(h.inputs().ultracodeValue, false);
+  assert.equal(ultraHeader(h).look, 'off');
+});
+
+test('browser: the confirmation survives a reload of the window, and follows the session through a fork', async () => {
+  const storage = new Map();
+  const first = await bootUltra(false, { storage });
+  await clickUltra(first);
+  first.knobs.rows = [ON_LINE];
+  await first.advance(1000);
+  assert.equal(storage.has(ULTRA_KEY), true);
+
+  // The same window, loaded again a little later: the hook still says off.
+  const second = await bootUltra(false, { storage, startMs: first.now + 5000 });
+  assert.equal(second.inputs().ultracodeValue, true);
+  assert.equal(ultraHeader(second).look, 'on');
+
+  second.run(`activePtyIds = new Set(['${NEW_SID}']); activeSessionId = '${NEW_SID}';`);
+  second.listeners.fork(SID, NEW_SID);
+  await flush();
+  assert.equal(storage.has(ULTRA_KEY), false);
+  assert.equal(JSON.parse(storage.get('handoff-ultracode:' + NEW_SID)).value, true);
+});
+
+test('browser: Continue in new session passes on the value the button shows, not the hook\'s older one', async () => {
+  const storage = new Map([[ULTRA_KEY, JSON.stringify({ value: true, atMs: 2000000000 - 1000 })]]);
+  const h = boot({ storage });
+  h.setSidecar(VM_SIDECAR);
+  h.setHandoffFile(true);
+  h.setState(writtenVmState(h, { ultracode: false }));
+  h.busyEvent(false);
+  await h.refresh();
+  assert.equal(h.header().primary, 'Continue in new session (ultracode)');
+  await h.click('primary');
+  assert.equal(JSON.parse(h.launches[0]).options.effort, 'ultracode');
+
+  // And the other way round: switched off here, the hook still says on.
+  const off = boot({ storage: new Map([[ULTRA_KEY, JSON.stringify({ value: false, atMs: 2000000000 - 1000 })]]) });
+  off.setSidecar(VM_SIDECAR);
+  off.setHandoffFile(true);
+  off.setState(writtenVmState(off, { ultracode: true }));
+  off.busyEvent(false);
+  await off.refresh();
+  assert.equal(off.header().primary, 'Continue in new session');
+  await off.click('primary');
+  assert.equal('effort' in JSON.parse(off.launches[0]).options, false);
+});
+
+// ── the bolt on a session row ──────────────────────────────────────────────
+
+const bolt = (h, id = SID) => JSON.parse(h.run(`JSON.stringify(handoffBoltState('${id}'))`));
+
+test('browser: a running session with ultracode on has the bolt; every other row has nothing', async () => {
+  const on = await bootUltra(true);
+  assert.deepEqual(bolt(on), { html: '<svg data-bolt="11"></svg>', title: 'Ultracode is on' });
+  assert.equal(bolt(await bootUltra(false)), null);
+  assert.equal(bolt(await bootUltra(undefined)), null, 'not known is quiet on a row');
+  assert.equal(bolt(on, NEW_SID), null, 'a session this file has read nothing for');
+
+  on.run('activePtyIds = new Set()');
+  assert.equal(bolt(on), null, 'not running');
+  const terminal = await bootUltra(true);
+  terminal.run(`sessionMap.get('${SID}').type = 'terminal'`);
+  assert.equal(bolt(terminal), null);
+  // icons.js did not load: no bolt, and no error.
+  const noIcons = await bootUltra(true);
+  noIcons.run('window.ICONS = undefined');
+  assert.equal(bolt(noIcons), null);
+  assert.deepEqual(noIcons.errors, []);
+});
+
+test('browser: the rows on screen get the bolt in the same pass as the chip, and lose it when ultracode goes off', async () => {
+  const h = await bootUltra(false);
+  const chipEl = fakeElement('span', {});
+  const boltEl = fakeElement('span', {});
+  boltEl.innerHTML = '';
+  const selectors = [];
+  h.knobs.rowEls = (selector) => {
+    selectors.push(selector);
+    return selector.endsWith('.handoff-bolt') ? [boltEl] : [chipEl];
+  };
+  h.run('document.querySelectorAll = (selector) => __knobs.rowEls(selector)');
+  await h.refresh();
+  assert.equal(chipEl.textContent, '412K');
+  assert.equal(boltEl.innerHTML, '');
+  assert.equal(boltEl.hasAttribute('title'), false);
+  // Both tabs' rows carry data-session-id; the chip is the Sessions tab's.
+  assert.ok(selectors.includes(`[data-session-id="${SID}"] .handoff-bolt`));
+  assert.ok(selectors.includes(`.session-item[data-session-id="${SID}"] .handoff-chip`));
+
+  // Switched on from the header: the row follows at the confirmation, with no
+  // read of the hook's files in between.
+  await clickUltra(h);
+  h.knobs.rows = [ON_LINE];
+  await h.advance(1000);
+  assert.equal(boltEl.innerHTML, '<svg data-bolt="11"></svg>');
+  assert.equal(boltEl.getAttribute('title'), 'Ultracode is on');
+
+  // The browser hands innerHTML back re-spelled: it is not written again.
+  boltEl.innerHTML = '<svg data-bolt="11"/>';
+  await h.refresh();
+  assert.equal(boltEl.innerHTML, '<svg data-bolt="11"/>');
+
+  await h.advance(5000);
+  h.setState(endedState(h, { ultracode: false, last_stop_at: h.sec }));
+  await h.refresh();
+  assert.equal(boltEl.innerHTML, '');
+  assert.equal(boltEl.hasAttribute('title'), false);
+});
+
+// ── the stale reading in the browser half ──────────────────────────────────
+
+const clockOf = (seconds) => {
+  const date = new Date(seconds * 1000);
+  return String(date.getHours()).padStart(2, '0') + ':' + String(date.getMinutes()).padStart(2, '0');
+};
+const STALE_TITLE = staleTitle(clockOf(VM_SIDECAR.ts));
+
+function meterLook(h) {
+  const meter = h.byId['handoff-meter'];
+  return { stale: meter.className === 'handoff-stale', text: meter.children[0].textContent, title: meter.children[0].getAttribute('title') };
+}
+
+test('browser: without a watched turn nothing is marked, however old the reading is', async () => {
+  // The window has only seen the session go idle (a reload mid-turn).
+  const h = await bootEnded();
+  await h.ticks(30);
+  await h.refresh();
+  const look = meterLook(h);
+  assert.equal(look.stale, false);
+  assert.ok(look.title.startsWith('Context in use: '));
+  assert.equal(JSON.parse(h.run(`JSON.stringify(handoffChipState('${SID}'))`)).stale, undefined);
+});
+
+test('browser: a turn watched from busy to idle with files that did not move marks the meter and the chip; a reading that moves clears it', async () => {
+  const h = await bootEnded();
+  const chipEl = fakeElement('span', {});
+  h.knobs.rowEls = (selector) => (selector.endsWith('.handoff-chip') ? [chipEl] : []);
+  h.run('document.querySelectorAll = (selector) => __knobs.rowEls(selector)');
+  const before = meterLook(h).text;
+
+  // What a terminal looks like after /clear: the session works and stops, and
+  // the files of the id it is filed under stay as they were.
+  h.busyEvent(true);
+  await h.advance(20000);
+  h.busyEvent(false);
+  await h.advance(2000);
+  await h.tick();
+  assert.equal(meterLook(h).stale, false, 'not before the read three seconds after the turn ended');
+  await h.advance(1000);
+  let look = meterLook(h);
+  assert.equal(look.stale, true);
+  assert.equal(look.text, before, 'the number stays');
+  assert.equal(look.title, STALE_TITLE);
+  assert.equal(chipEl.textContent, '412K');
+  assert.equal(chipEl.className, 'handoff-chip handoff-danger handoff-stale');
+  assert.equal(chipEl.getAttribute('title'), STALE_TITLE);
+  assert.deepEqual(JSON.parse(h.run(`JSON.stringify(handoffChipState('${SID}'))`)),
+    { text: '412K', level: 'danger', title: STALE_TITLE, stale: true });
+
+  // It stays through the next turn...
+  h.busyEvent(true);
+  await h.advance(3000);
+  await h.tick();
+  assert.equal(meterLook(h).stale, true);
+  h.busyEvent(false);
+  await h.advance(4000);
+  assert.equal(meterLook(h).stale, true);
+
+  // ...and goes as soon as the reading moves.
+  h.setSidecar({ ...VM_SIDECAR, total_input_tokens: 85000, used_percentage: 8, ts: h.sec });
+  await h.refresh();
+  look = meterLook(h);
+  assert.equal(look.stale, false);
+  assert.ok(look.title.startsWith('Context in use: 85K'));
+  assert.equal(chipEl.className, 'handoff-chip');
+  assert.equal(chipEl.textContent, '85K');
+  assert.deepEqual(h.errors, []);
+});
+
+test('browser: an ordinary turn, whose files move, is never marked', async () => {
+  const h = await bootEnded();
+  h.busyEvent(true);
+  await h.advance(20000);
+  // The status line wrote during the turn and the hook stamped its Stop, a
+  // second before the title went idle: both are later than the turn's START,
+  // which is what they are compared with, and earlier than its end.
+  h.setSidecar({ ...VM_SIDECAR, ts: h.sec - 1 });
+  h.setState(endedState(h, { last_prompt_at: h.sec - 20, last_stop_at: h.sec }));
+  await h.advance(1000);
+  h.busyEvent(false);
+  await h.advance(5000);
+  await h.tick();
+  assert.equal(meterLook(h).stale, false);
+  // The hook stamped the turn but the reading did not move: the hook is alive
+  // for this id, so this is not the /clear case either.
+  h.busyEvent(true);
+  await h.advance(20000);
+  h.setState(endedState(h, { last_prompt_at: h.sec - 20, last_stop_at: h.sec }));
+  await h.advance(1000);
+  h.busyEvent(false);
+  await h.advance(5000);
+  await h.tick();
+  assert.equal(meterLook(h).stale, false);
+});
+
+test('browser: a session that stops at a permission prompt mid-turn is not marked: the hook says a turn is running', async () => {
+  const h = await bootEnded();
+  // The prompt hook stamps a moment BEFORE the spinner comes on, and nothing
+  // else is written before the session stops to ask.
+  await h.advance(10000);
+  h.setState(endedState(h, { last_prompt_at: h.sec - 0.3 }));
+  h.busyEvent(true);
+  await h.advance(2000);
+  h.busyEvent(false);
+  await h.advance(5000);
+  await h.tick();
+  assert.equal(meterLook(h).stale, false);
+  assert.equal(JSON.parse(h.run(`JSON.stringify(handoffChipState('${SID}'))`)).stale, undefined);
+  // Answered, it works on and stops to ask again: still the same turn.
+  h.busyEvent(true);
+  await h.advance(30000);
+  h.busyEvent(false);
+  await h.advance(5000);
+  await h.tick();
+  assert.equal(meterLook(h).stale, false);
+});
+
+test('staleReading: nothing is marked while the hook\'s own markers say a turn is running', () => {
+  const busySec = TURN.busyAtMs / 1000;
+  // The prompt was stamped 0.3 s before the busy event and no Stop followed.
+  assert.equal(staleReading(staleArgs({ state: hookState({ last_prompt_at: busySec - 0.3, last_stop_at: busySec - 60 }) })), null);
+  assert.equal(staleReading(staleArgs({ state: hookState({ last_prompt_at: busySec - 500, last_stop_at: null }) })), null);
+  // The Stop is the later of the two: the turn ended, and nothing moved since.
+  assert.notEqual(staleReading(staleArgs({ state: hookState({ last_prompt_at: busySec - 500, last_stop_at: busySec - 400 }) })), null);
+  // An older hook writes neither marker: the reading alone decides.
+  assert.notEqual(staleReading(staleArgs({ state: oldHookState() })), null);
+});
+
+// ── where the draft rule hears about typing: terminal-manager.js ───────────
+
+const TERMINAL_MANAGER = path.join(__dirname, '..', 'public', 'terminal-manager.js');
+
+test('terminal-manager: what is typed by hand is passed on as "ended in Enter or not", never as text', () => {
+  const { noteTypedByHand } = require('../public/terminal-manager');
+  const seen = [];
+  global.handoffNoteTyped = (...args) => { seen.push(args); };
+  try {
+    noteTypedByHand('s1', 'a');
+    noteTypedByHand('s1', '\r');
+    noteTypedByHand('s1', 'pasted line\r');
+    noteTypedByHand('s1', '\x1b[200~pasted\r\x1b[201~');
+    noteTypedByHand('s1', '\x1b[13;2u');
+    noteTypedByHand('s1', undefined);
+    assert.deepEqual(seen, [['s1', false], ['s1', true], ['s1', true], ['s1', false], ['s1', false], ['s1', false]]);
+    // A hand-off file that throws must never cost the keystroke.
+    global.handoffNoteTyped = () => { throw new Error('boom'); };
+    assert.doesNotThrow(() => noteTypedByHand('s1', 'a'));
+  } finally {
+    delete global.handoffNoteTyped;
+  }
+  // ctx-handoff.js did not load: nothing to tell, nothing thrown.
+  assert.doesNotThrow(() => noteTypedByHand('s1', 'a'));
+});
+
+test('terminal-manager: every send of hand-typed input is noted first, with the same session and data', () => {
+  const lines = fs.readFileSync(TERMINAL_MANAGER, 'utf8').split(/\r?\n/);
+  let sends = 0;
+  lines.forEach((line, index) => {
+    const send = /^\s*window\.api\.sendInput\((.*)\);\s*$/.exec(line);
+    if (!send) return;
+    sends++;
+    assert.equal(lines[index - 1].trim(), `noteTypedByHand(${send[1]});`, `terminal-manager.js:${index + 1}`);
+  });
+  // The terminal's own input, the two newline keys, Space, and a dropped file.
+  assert.equal(sends, 5);
+  assert.equal(lines.filter((line) => line.includes('sendInput(')).length, sends, 'a send in a spelling this scan does not read');
+});
+
+// ── the click: whether the text goes in, and where ─────────────────────────
+
+test('browser: with the header off (grid view, a task log in the pane) a click types nothing', async () => {
+  const offs = { 'grid view': 'gridViewActive = true', 'a task log': 'activeTaskView = { id: 7 }' };
+  for (const [name, js] of Object.entries(offs)) {
+    for (const reloaded of [false, true]) {
+      const h = await bootUltra(true, { reloaded });
+      // No render in between: the button is still on screen, as it is from the
+      // view changing until the next tick. The header may name another session
+      // than the active one there.
+      h.run(js);
+      await clickUltra(h);
+      await h.advance(6000);
+      assert.deepEqual(h.sent, [], name);
+      assert.equal(h.confirms.length, 0, name);
+    }
+  }
+});
+
+test('browser: another session took the pane while the question was open: nothing is typed into the one it was asked about', async () => {
+  const h = await bootUltra(true, { reloaded: true });
+  h.run(`confirmDialog = async () => { activeSessionId = '${NEW_SID}'; return true; }`);
+  await clickUltra(h);
+  await h.advance(6000);
+  assert.deepEqual(h.sent, []);
+});
+
+test('browser: a fork between the text and its Enter sends the Enter to the session\'s new id', async () => {
+  const h = await bootUltra(false);
+  await clickUltra(h);
+  assert.deepEqual(h.sent, [[SID, '/effort ultracode']]);
+  await h.advance(100);
+  h.run(`activePtyIds = new Set(['${NEW_SID}']); activeSessionId = '${NEW_SID}';`);
+  h.listeners.fork(SID, NEW_SID);
+  await flush();
+  await h.advance(150);
+  assert.deepEqual(h.sent.slice(1), [[NEW_SID, '\r']]);
+});
+
+test('browser: once a switch is settled the later looks leave it alone', async () => {
+  const h = await bootUltra(false);
+  await clickUltra(h);
+  h.knobs.rows = ['> /effort ultracode', '  ' + ON_LINE];
+  await h.advance(1000);
+  assert.equal(ultraHeader(h).look, 'on');
+  // By the last look the line has gone off the top of the screen.
+  h.knobs.rows = ['a long answer', 'that pushed it off'];
+  await h.advance(5000);
+  assert.equal(ultraHeader(h).look, 'on');
+  assert.equal(ultraHeader(h).asksFirst, false);
+  assert.equal(h.header().note, null);
+  assert.equal(JSON.parse(h.storage.get(ULTRA_KEY)).value, true);
+});
+
+test('browser: the screen is counted before the text goes in, so a line that is there straight after it is new', async () => {
+  const h = await bootUltra(false);
+  h.knobs.onSend = (data) => {
+    if (data === ULTRACODE_TEXT.on) h.knobs.rows = ['> /effort ultracode', '  ' + ON_LINE];
+  };
+  h.run(`{
+    const send = window.api.sendInput;
+    window.api.sendInput = (id, data) => { __knobs.onSend(data); send(id, data); };
+  }`);
+  await clickUltra(h);
+  await h.advance(1000);
+  assert.equal(ultraHeader(h).look, 'on');
+});
+
+test('browser: Hand off types nothing while a switch is on its way in', async () => {
+  const h = await bootUltra(false);
+  await clickUltra(h);
+  await h.advance(100);
+  // Between the text and its Enter: a request line now would be sent joined to it.
+  await h.click('primary');
+  await h.advance(400);
+  assert.deepEqual(h.sent, [[SID, '/effort ultracode'], [SID, '\r']], 'one line and one Enter');
+  assert.equal(h.request().phase, 'idle');
+  // Still waiting for the terminal's line: still nothing.
+  await h.click('primary');
+  assert.equal(h.sent.length, 2);
+  // Settled: Hand off types as it always did.
+  h.knobs.rows = ['  ' + ON_LINE];
+  await h.advance(600);
+  assert.equal(ultraHeader(h).look, 'on');
+  await h.click('primary');
+  assert.deepEqual(h.sent[2], [SID, REQUEST_LINE]);
+  assert.equal(h.confirms.length, 0);
+});
+
+// ── the draft: typed ahead, and across a reload ────────────────────────────
+
+const { parseStoredTyped } = require(MODULE_PATH);
+const TYPED_KEY = 'handoff-typed:' + SID;
+
+test('browser: text typed ahead while the session worked is still there when the turn ends: the click asks first', async () => {
+  const h = await bootUltra(false);
+  // He sends a prompt, and while the session works types the start of the next.
+  h.run(`handoffNoteTyped('${SID}', true)`);
+  h.busyEvent(true);
+  await h.advance(5000);
+  h.run(`handoffNoteTyped('${SID}', false)`);
+  await h.advance(5000);
+  // The turn ends: a Stop LATER than the typing, then the idle event.
+  h.setState(endedState(h, { ultracode: false, last_prompt_at: h.sec - 10, last_stop_at: h.sec }));
+  h.busyEvent(false);
+  await h.refresh();
+  assert.equal(h.header().primaryOverride, false, 'the gate itself is plain');
+  assert.equal(ultraHeader(h).asksFirst, true);
+  assert.equal(ultraHeader(h).title, 'Ultracode is off. Click to switch it on (asks first).');
+  h.knobs.confirmAnswer = false;
+  await clickUltra(h);
+  await h.advance(6000);
+  assert.deepEqual(h.confirms, [ultracodeQuestion('on')]);
+  assert.deepEqual(h.sent, [], 'not typed onto the end of the half-written prompt');
+});
+
+test('browser: handoffNoteTyped keeps a time and a boolean, whatever it is handed', async () => {
+  const h = await bootUltra(false);
+  for (const given of ['\'the text itself\'', '1', '{}', 'undefined']) {
+    h.run(`handoffNoteTyped('${SID}', ${given})`);
+    assert.deepEqual(h.inputs().typed, { atMs: h.now, enter: false }, given);
+  }
+  h.run(`handoffNoteTyped('${SID}', true)`);
+  assert.deepEqual(h.inputs().typed, { atMs: h.now, enter: true });
+  assert.equal([...h.storage.values()].some((value) => value.includes('text itself')), false);
+});
+
+test('parseStoredTyped: a stored draft comes back as "not ended in Enter", and nothing else comes back at all', () => {
+  assert.deepEqual(parseStoredTyped(JSON.stringify({ atMs: 5000 })), { atMs: 5000, enter: false });
+  assert.deepEqual(parseStoredTyped(JSON.stringify({ atMs: 5000, enter: true, text: 'x' })), { atMs: 5000, enter: false });
+  const bad = [null, undefined, '', 'not json', 'null', '7', '[]', '{}', JSON.stringify({ atMs: 0 }), JSON.stringify({ atMs: '5' })];
+  for (const text of bad) assert.equal(parseStoredTyped(text), null, String(text));
+});
+
+test('browser: a draft is remembered across a reload of the window, where main\'s busy flag makes the click plain', async () => {
+  const storage = new Map();
+  const first = await bootUltra(false, { storage, readCtxState: true });
+  first.run(`handoffNoteTyped('${SID}', false)`);
+  assert.deepEqual(JSON.parse(storage.get(TYPED_KEY)), { atMs: first.now }, 'the time, and never the text');
+
+  // The same window, loaded again: no busy event yet, but main says "not busy",
+  // so the gate asks nothing. The text is still in the input box.
+  const second = await bootUltra(false, { storage, readCtxState: true, reloaded: true, startMs: first.now + 5000 });
+  assert.equal(second.inputs().busyKnown, true);
+  assert.equal(second.header().primaryOverride, false);
+  assert.deepEqual(second.inputs().typed, { atMs: first.now, enter: false });
+  assert.equal(ultraHeader(second).asksFirst, true);
+  second.knobs.confirmAnswer = false;
+  await clickUltra(second);
+  await second.advance(1000);
+  assert.equal(second.confirms.length, 1);
+  assert.deepEqual(second.sent, []);
+
+  // Enter typed by hand: no draft, and nothing left behind for the next reload.
+  second.run(`handoffNoteTyped('${SID}', true)`);
+  assert.equal(storage.has(TYPED_KEY), false);
+  const third = await bootUltra(false, { storage, readCtxState: true, reloaded: true, startMs: second.now + 5000 });
+  assert.equal(third.inputs().typed, null);
+  assert.equal(ultraHeader(third).asksFirst, false);
+});
+
+test('browser: the draft is written to storage when it starts and when its Enter comes, not on every key', async () => {
+  const h = await bootUltra(false);
+  const writes = [];
+  h.knobs.wrote = (what) => writes.push(what);
+  h.run(`{
+    const { setItem, removeItem } = sessionStorage;
+    sessionStorage.setItem = (key, value) => { __knobs.wrote('set ' + key); setItem(key, value); };
+    sessionStorage.removeItem = (key) => { __knobs.wrote('remove ' + key); removeItem(key); };
+  }`);
+  for (let key = 0; key < 20; key++) {
+    await h.advance(50);
+    h.run(`handoffNoteTyped('${SID}', false)`);
+  }
+  assert.deepEqual(writes, ['set ' + TYPED_KEY]);
+  assert.equal(h.inputs().typed.atMs, h.now, 'the time in memory follows every key');
+  h.run(`handoffNoteTyped('${SID}', true); handoffNoteTyped('${SID}', true)`);
+  assert.deepEqual(writes, ['set ' + TYPED_KEY, 'remove ' + TYPED_KEY]);
+});
+
+test('browser: a fork takes the draft with the session', async () => {
+  const h = await bootUltra(false);
+  h.run(`handoffNoteTyped('${SID}', false)`);
+  h.run(`activePtyIds = new Set(['${NEW_SID}']); activeSessionId = '${NEW_SID}';`);
+  h.listeners.fork(SID, NEW_SID);
+  await flush();
+  assert.equal(h.storage.has(TYPED_KEY), false);
+  assert.equal(h.storage.has('handoff-typed:' + NEW_SID), true);
+});
+
+// ── a session's first turn ─────────────────────────────────────────────────
+
+test('ultracodeValue: before the first Stop a scan that found no switch is "not known", not off', () => {
+  // A session started in ultracode gets its switch record after the hook's
+  // scan at its first prompt: "off" there would be a guess, for a whole turn.
+  assert.equal(ultracodeValue(hookState({ ultracode: null, ultra_scan: SCANNED, last_stop_at: null }), null), null);
+  assert.equal(ultracodeValue(oldHookState({ ultracode: null, ultra_scan: SCANNED }), null), null);
+  // What the hook says outright is believed at once, and so is a confirmation.
+  assert.equal(ultracodeValue(hookState({ ultracode: true, ultra_scan: SCANNED, last_stop_at: null }), null), true);
+  assert.equal(ultracodeValue(hookState({ ultracode: null, ultra_scan: SCANNED, last_stop_at: null }), { value: true, atMs: 5 }), true);
+  // Once a turn has ended the same scan is the hook saying off.
+  assert.equal(ultracodeValue(hookState({ ultracode: null, ultra_scan: SCANNED }), null), false);
+});
+
+test('browser: during a session\'s first turn the button gives no direction and the row no bolt', async () => {
+  const h = await bootUltra(undefined);
+  h.setState(endedState(h, { ultracode: null, ultra_scan: SCANNED, last_stop_at: null }));
+  await h.advance(500);
+  await h.refresh();
+  assert.deepEqual(ultraHeader(h), {
+    shown: true, label: 'Ultracode', enabled: false, asksFirst: false, look: 'unknown', title: ULTRACODE_UNKNOWN_TITLE,
+  });
+  assert.equal(bolt(h), null);
+});
+
+// ── the rows as the two tabs build them ────────────────────────────────────
+//
+// The sidebar rebuilds its rows on every render, so the builders are what
+// shows the chip and the bolt most of the time; handoffPaintChips only fills
+// in between renders. The two must write the same thing or the row flickers.
+// The builders' own lines are taken from the shipped files and run here.
+
+const SIDEBAR_SOURCE = fs.readFileSync(path.join(__dirname, '..', 'public', 'sidebar.js'), 'utf8');
+const PROJECTS_SOURCE = fs.readFileSync(path.join(__dirname, '..', 'public', 'projects-view.js'), 'utf8');
+
+function shippedBlock(source, pattern, what) {
+  const found = pattern.exec(source);
+  assert.ok(found, what + ' is not where this test looks for it');
+  return found[0];
+}
+
+// buildSessionItem's two guarded blocks, run against a meta line of our own.
+function builtSidebarRow(h) {
+  const code = shippedBlock(SIDEBAR_SOURCE, /\n  try \{\n    const handoffChip = [\s\S]*?\n  \} catch \{\}\n/, 'the chip block of buildSessionItem')
+    + shippedBlock(SIDEBAR_SOURCE, /\n  try \{\n    const boltEl = [\s\S]*?\n  \} catch \{\}\n/, 'the bolt block of buildSessionItem');
+  const metaEl = fakeElement('div', {});
+  const shortIdEl = fakeElement('span', {});
+  metaEl.append(shortIdEl);
+  h.knobs.row = { metaEl, shortIdEl, session: { sessionId: SID } };
+  h.run(`(function ({ metaEl, shortIdEl, session }) {${code}})(__knobs.row)`);
+  assert.equal(metaEl.children.length, 3, 'the chip, the bolt, the short id');
+  const [chipEl, boltEl] = metaEl.children;
+  return {
+    chip: { className: chipEl.className, text: chipEl.textContent, title: chipEl.title || null },
+    bolt: { className: boltEl.className, html: boltEl.innerHTML || '', title: boltEl.title || null },
+  };
+}
+
+// What handoffPaintChips leaves on the same two spans when it finds them empty.
+function paintedRow(h) {
+  const chipEl = fakeElement('span', {});
+  chipEl.className = 'handoff-chip';
+  const boltEl = fakeElement('span', {});
+  boltEl.className = 'handoff-bolt';
+  h.knobs.rowEls = (selector) => (selector.endsWith('.handoff-bolt') ? [boltEl] : [chipEl]);
+  h.run(`document.querySelectorAll = (selector) => __knobs.rowEls(selector); handoffPaintChips('${SID}')`);
+  return {
+    chip: { className: chipEl.className, text: chipEl.textContent, title: chipEl.getAttribute('title') },
+    bolt: { className: boltEl.className, html: boltEl.innerHTML || '', title: boltEl.getAttribute('title') },
+  };
+}
+
+test('sidebar.js: the row it builds carries exactly what the painter writes: the chip, its stale look, the bolt', async () => {
+  // Ultracode on and a reading that has stopped moving: every class at once.
+  const h = await bootUltra(true);
+  h.busyEvent(true);
+  await h.advance(20000);
+  h.busyEvent(false);
+  await h.advance(3000);
+  const built = builtSidebarRow(h);
+  assert.deepEqual(built, paintedRow(h));
+  assert.deepEqual(built, {
+    chip: { className: 'handoff-chip handoff-danger handoff-stale', text: '412K', title: STALE_TITLE },
+    bolt: { className: 'handoff-bolt', html: '<svg data-bolt="11"></svg>', title: 'Ultracode is on' },
+  });
+
+  // Nothing to say: both spans are there and empty, for the painter to fill.
+  const quiet = await bootUltra(false);
+  quiet.run('activePtyIds = new Set()');
+  const empty = builtSidebarRow(quiet);
+  assert.deepEqual(empty, paintedRow(quiet));
+  assert.deepEqual(empty, {
+    chip: { className: 'handoff-chip', text: '', title: null },
+    bolt: { className: 'handoff-bolt', html: '', title: null },
+  });
+
+  // ctx-handoff.js did not load: the row is built all the same.
+  const bare = boot();
+  bare.run('handoffChipState = undefined; handoffBoltState = undefined;');
+  assert.deepEqual(builtSidebarRow(bare), empty);
+});
+
+// The bolt's two lines of buildSessionRow, with the names that function has
+// in scope there: `id` is the session's, the others are ids of something else.
+function builtProjectsBolt(h) {
+  const code = shippedBlock(PROJECTS_SOURCE,
+    /\n  const bolt = typeof handoffBoltState === 'function' \? [^\n]*\n  parts\.push\(`<span class="handoff-bolt"[^\n]*\n/,
+    'the bolt lines of buildSessionRow');
+  h.knobs.row = { id: SID, session: { sessionId: SID, id: NEW_SID, projectId: 'p1' }, project: { id: 'p1' }, parts: [] };
+  h.run(`(function ({ id, session, project, parts }) {
+    const escapeHtml = (text) => String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+    ${code}
+  })(__knobs.row)`);
+  return h.knobs.row.parts;
+}
+
+test('projects-view.js: its row carries the bolt span the painter fills, for the session\'s own id', async () => {
+  const h = await bootUltra(true);
+  const painted = paintedRow(h).bolt;
+  assert.equal(painted.html, '<svg data-bolt="11"></svg>');
+  assert.deepEqual(builtProjectsBolt(h), [`<span class="handoff-bolt" title="${painted.title}">${painted.html}</span>`]);
+  const off = await bootUltra(false);
+  assert.deepEqual(builtProjectsBolt(off), ['<span class="handoff-bolt"></span>']);
+  // The painter finds that span through the row's data-session-id.
+  assert.match(PROJECTS_SOURCE, /\n  const id = session\.sessionId;\n[\s\S]*?\n  row\.dataset\.sessionId = id;\n/);
+});
