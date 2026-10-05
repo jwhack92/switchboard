@@ -576,6 +576,37 @@ function showNextAppDialog() {
   }
 }
 
+/**
+ * Where the keyboard goes when a box closes.
+ *
+ * Back to the field the user was typing in, if it is still on the page (for a
+ * terminal that is xterm's hidden textarea, so typing carries on). With
+ * preventScroll, as xterm itself focuses that textarea: it sits far off to
+ * the left until it is moved to the cursor, and a plain focus() would scroll
+ * the terminal sideways to bring it into view.
+ *
+ * A box opened with the mouse finds the clicked button focused instead (the
+ * header's Stop, say). Going back to that would leave the keyboard on a
+ * button, so the terminal on screen gets it, which is also where a sidebar
+ * repaint puts it (sidebar.js renderProjects).
+ */
+function restoreFocusAfterAppDialog(previous) {
+  const there = !!previous && previous !== document.body && previous.isConnected && typeof previous.focus === 'function';
+  const typing = there && (previous.tagName === 'INPUT' || previous.tagName === 'TEXTAREA' || previous.isContentEditable === true);
+  if (!typing) {
+    try {
+      // app.js globals; absent or not yet set up, this falls through.
+      const entry = activeSessionId ? openSessions.get(activeSessionId) : null;
+      if (entry && entry.terminal && entry.element && entry.element.offsetParent !== null) {
+        entry.terminal.focus();
+        return;
+      }
+    } catch {}
+  }
+  // Only if it is still on the page: the row or menu that asked may be gone.
+  if (there) { try { previous.focus({ preventScroll: true }); } catch {} }
+}
+
 function openAppDialog(request, done) {
   const overlay = document.createElement('div');
   overlay.className = 'add-project-overlay app-dialog-overlay';
@@ -624,20 +655,17 @@ function openAppDialog(request, done) {
   const openedWhileTyping = openedAt - appDialogLastKeyAt < APP_DIALOG_GUARD_MS;
   const KEY_EVENTS = ['keydown', 'keypress', 'keyup'];
   let finished = false;
+  // Which of the box's buttons had the focus last, for taking it back below.
+  let lastInBox = null;
 
   function finish(result) {
     if (finished) return;
     finished = true;
     appDialogLastAnswerAt = performance.now();
     for (const type of KEY_EVENTS) window.removeEventListener(type, onKey, true);
+    if (typeof document.removeEventListener === 'function') document.removeEventListener('focusin', onFocusIn, true);
     overlay.remove();
-    // Only if it is still on the page: the row or menu that asked may be gone.
-    // preventScroll, as xterm itself focuses its textarea: that textarea sits
-    // far off to the left until it is moved to the cursor, and a plain focus()
-    // would scroll the terminal sideways to bring it into view.
-    if (previous && previous !== document.body && previous.isConnected && typeof previous.focus === 'function') {
-      try { previous.focus({ preventScroll: true }); } catch {}
-    }
+    restoreFocusAfterAppDialog(previous);
     done(result);
   }
 
@@ -703,6 +731,18 @@ function openAppDialog(request, done) {
   // behind to swallow every key in the window.
   document.body.appendChild(overlay);
   for (const type of KEY_EVENTS) window.addEventListener(type, onKey, true);
+  // Code behind the box can still move the focus while it is up: a sidebar
+  // repaint used to hand it to the terminal, and showSession() on an event
+  // from main does. A native box owned the keyboard; this one has to take the
+  // focus straight back, so that the next key is its own and ONE Enter
+  // answers it ("click Stop, press Enter"). The check at the top of onKey
+  // stays, for a focus change that reported no event.
+  function onFocusIn(e) {
+    if (finished) return;
+    if (dialog.contains(e.target)) { lastInBox = e.target; return; }
+    try { (lastInBox || confirmBtn).focus(); } catch {}
+  }
+  if (typeof document.addEventListener === 'function') document.addEventListener('focusin', onFocusIn, true);
   // On the confirm button, as in the native box.
   confirmBtn.focus();
 }
