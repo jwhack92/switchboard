@@ -987,13 +987,30 @@ function startRename(summaryEl, session) {
   const input = document.createElement('input');
   input.type = 'text';
   input.className = 'session-rename-input';
-  input.value = session.name || session.aiTitle || session.summary;
+  input.value = session.name || session.aiTitle || session.summary || '';
+  // Read back, not kept from above: a text input drops line breaks from what
+  // it is given, and it is the box's own text that "unchanged" is judged by.
+  const openedWith = input.value;
+  // The box sits inside the session row, whose click opens the session and
+  // moves the keyboard to its terminal: that blurs the box and closes it.
+  input.addEventListener('click', (e) => e.stopPropagation());
+  // A right-click in the box (to paste) is not one on the row either: the
+  // row's would open "Move to project" on top of the half-typed name.
+  input.addEventListener('contextmenu', (e) => e.stopPropagation());
 
   summaryEl.replaceWith(input);
   input.focus();
   input.select();
 
   const save = async () => {
+    // Left as it was opened: nothing was typed, so nothing is saved and the
+    // row goes back as it was. Without this an automatic title that changed
+    // while the box was open, or one the box could not hold exactly, no longer
+    // matched `fallback` below and was saved as a typed name.
+    if (input.value === openedWith) {
+      input.replaceWith(summaryEl);
+      return;
+    }
     const newName = input.value.trim();
     const fallback = session.aiTitle || session.summary;
     const nameToSave = (newName && newName !== fallback) ? newName : null;

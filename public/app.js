@@ -427,6 +427,21 @@ window.api.onSessionForked((oldId, newId) => {
 
   terminalHeaderId.textContent = newId;
 
+  // Main moves the running session to the new id but not its saved name
+  // (session-transitions.js), so the reload below would bring the row back
+  // unnamed. Save the name under the new id first, the way a rename does, and
+  // keep a name Continue gave "ours" (ctx-handoff.js handoffNameStore), so the
+  // next Continue still counts its number up. Neither may stop the re-key.
+  const carriedName = entry.session.name;
+  if (typeof carriedName === 'string' && carriedName.trim()) {
+    const notSaved = (err) => console.warn('[fork] the session name was not carried to the new id', err);
+    try { Promise.resolve(window.api.renameSession(newId, carriedName)).catch(notSaved); } catch (err) { notSaved(err); }
+    try {
+      const names = typeof handoffNameStore === 'function' ? handoffNameStore() : null;
+      if (names && names.isOurs(oldId, carriedName)) names.remember(newId, carriedName);
+    } catch {}
+  }
+
   loadProjects().then(() => {
     const item = document.querySelector(`[data-session-id="${newId}"]`);
     if (item) {
@@ -1288,17 +1303,25 @@ async function loadProjects({ resort = false, reason = 'project' } = {}) {
  * launchScheduledSession). A background schedule that fired while the user was
  * mid-sentence in another session must not yank the view — the terminal is
  * still created and attached, it is just not shown.
+ *
+ * `name` starts the session with a typed name already on it, as if it had been
+ * renamed the moment it appeared ("Continue in new session" passes one:
+ * ctx-handoff.js handoffContinue, continue-name.js).
+ *
+ * Resolves to the new session's id, or null when its terminal could not be
+ * opened.
  */
-async function launchNewSession(project, sessionOptions, { focus = true } = {}) {
+async function launchNewSession(project, sessionOptions, { focus = true, name = null } = {}) {
   const sessionId = crypto.randomUUID();
   const projectPath = project.projectPath;
   const options = { ...(sessionOptions || {}) };
+  const givenName = typeof name === 'string' && name.trim() ? name.trim() : null;
   const session = {
     sessionId,
     summary: 'New session',
     firstPrompt: '',
     projectPath,
-    name: null,
+    name: givenName,
     starred: 0,
     archived: 0,
     messageCount: 0,
@@ -1342,6 +1365,15 @@ async function launchNewSession(project, sessionOptions, { focus = true } = {}) 
 
   const entry = createTerminalEntry(session);
 
+  // Saved the way a rename is, and sent before the terminal is asked for, so
+  // main has the name ahead of the request that starts the session and nothing
+  // can index the session and find it unnamed. Not awaited, and a save that
+  // fails is only logged: the session matters more than what it is called.
+  if (givenName) {
+    const notSaved = (err) => console.warn('[launch] the session name was not saved', err);
+    try { Promise.resolve(window.api.renameSession(sessionId, givenName)).catch(notSaved); } catch (err) { notSaved(err); }
+  }
+
   // Open terminal in main process with session options. `null` rather than an
   // empty object: main treats a present options object as an explicit config.
   const result = await window.api.openTerminal(
@@ -1349,7 +1381,7 @@ async function launchNewSession(project, sessionOptions, { focus = true } = {}) 
   if (!result.ok) {
     entry.terminal.write(`\r\nError: ${result.error}\r\n`);
     entry.closed = true;
-    return;
+    return null;
   }
   if (typeof setSessionMcpActive === 'function') setSessionMcpActive(sessionId, !!result.mcpActive);
 
@@ -1357,6 +1389,7 @@ async function launchNewSession(project, sessionOptions, { focus = true } = {}) 
   // any session, but does not take over whatever the user is looking at.
   if (focus) showSession(sessionId);
   pollActiveSessions();
+  return sessionId;
 }
 
 // Legacy alias

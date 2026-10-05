@@ -1852,6 +1852,8 @@ test('parseStoredRequest: a time in the future is refused (no Stop could ever be
 // globals exist.
 
 const SOURCE = fs.readFileSync(path.join(__dirname, '..', 'public', 'ctx-handoff.js'), 'utf8');
+// Loaded before it in index.html; here only for the tests that ask (opts.names).
+const NAMES_SOURCE = fs.readFileSync(path.join(__dirname, '..', 'public', 'continue-name.js'), 'utf8');
 const SID = 'aaaaaaaa-1111-2222-3333-444444444444';
 const VM_DIR = 'C:\\Users\\x\\AppData\\Local\\claude-ctx';
 const VM_HANDOFF = 'C:\\h\\handoff.md';
@@ -1889,7 +1891,9 @@ function fakeElement(tag, byId) {
 
 // opts: globals 'app' (default) | 'none' | 'tdz'; diagDir; storage (a Map
 // shared between two boots = a reload of one window); startMs; readCtxState
-// (true = window.api has the main-process call, answered by knobs.ctxReply).
+// (true = window.api has the main-process call, answered by knobs.ctxReply);
+// names (true = continue-name.js is loaded first, as in the app); localStorage
+// (what window.localStorage is; shared between two boots = a restart).
 function boot(opts = {}) {
   let now = opts.startMs || 2000000000;
   const files = new Map();
@@ -1897,6 +1901,7 @@ function boot(opts = {}) {
   const confirms = [];
   const errors = [];
   const launches = [];
+  const launchExtras = [];   // the third argument of each launch
   const reads = [];
   const timers = [];
   const listeners = {};
@@ -1966,9 +1971,12 @@ function boot(opts = {}) {
     setInterval: () => 0,
     __knobs: knobs,
     __launches: launches,
+    __launchExtras: launchExtras,
   });
   const run = (js) => vm.runInContext(js, context);
 
+  if (opts.localStorage) context.window.localStorage = opts.localStorage;
+  if (opts.names) run(NAMES_SOURCE);
   run(SOURCE);
   const globals = opts.globals || 'app';
   if (globals === 'app') {
@@ -1982,9 +1990,10 @@ function boot(opts = {}) {
       const sessionMap = new Map([['${SID}', { sessionId: '${SID}', projectPath: 'C:\\\\proj', type: 'claude' }]]);
       window._isOwnedElsewhere = () => false;
       async function resolveDefaultSessionOptions(target) { return __knobs.resolveOptions(target); }
-      async function launchNewSession(target, options) {
+      async function launchNewSession(target, options, extra) {
         __launches.push(JSON.stringify({ target, options }));
-        return __knobs.launch(target, options);
+        __launchExtras.push(extra);
+        return __knobs.launch(target, options, extra);
       }
     `);
   } else if (globals === 'tdz') {
@@ -1997,7 +2006,7 @@ function boot(opts = {}) {
 
   const visible = (el) => !!el && el.style.display !== 'none';
   const h = {
-    files, sent, confirms, errors, launches, reads, storage, knobs, listeners, byId, run,
+    files, sent, confirms, errors, launches, launchExtras, reads, storage, knobs, listeners, byId, run,
     get now() { return now; },
     get sec() { return now / 1000; },
     // Moves the clock on, running every timer that falls due on the way.
@@ -2912,4 +2921,204 @@ test('browser: entries for sessions that are gone are dropped; the active and th
   assert.equal(h.run('handoffRt.cache.size'), 1);
   assert.equal(h.run(`handoffRt.cache.has('${SID}')`), true);
   assert.ok(h.run('handoffRt.lastReadAtMs.size') <= 1);
+});
+
+// ── Continue names the sibling ──────────────────────────────────────────────
+//
+// Jason: "When I continue in new session, the session name should be the
+// previous session name with an incrementing number". The rule itself is
+// test/continue-name.test.js; this is the wiring in handoffContinue: which
+// title is read, what is passed to launchNewSession, what is remembered, and
+// that none of it can cost him the launch.
+
+const NEW_SID = 'bbbbbbbb-1111-2222-3333-444444444444';
+// cleanDisplayName as shipped (public/utils.js), for the test that wants the
+// title cleaned the way the lists clean it.
+const CLEAN_DISPLAY_NAME = (() => {
+  const utils = fs.readFileSync(path.join(__dirname, '..', 'public', 'utils.js'), 'utf8');
+  const from = utils.indexOf('function cleanDisplayName(name) {');
+  const to = utils.indexOf('function formatDate(date) {');
+  assert.ok(from >= 0 && to > from, 'cleanDisplayName is where it was in utils.js');
+  return utils.slice(from, to);
+})();
+
+/** A Storage over a Map; `broken` makes every call throw. */
+function fakeLocalStorage(broken = false) {
+  const map = new Map();
+  return {
+    map,
+    getItem(key) { if (broken) throw new Error('storage is off'); return map.has(key) ? map.get(key) : null; },
+    setItem(key, value) { if (broken) throw new Error('storage is full'); map.set(key, String(value)); },
+  };
+}
+
+/** What the names store has written: [[id, name], ...]. */
+const remembered = (ls) => JSON.parse(ls.map.get('continue-names') || '[]');
+
+/** A window ready to Continue, with continue-name.js loaded and the old
+ *  session carrying `fields`. Each launch answers with the next id in `ids`. */
+async function bootNamed(fields, { localStorage = fakeLocalStorage(), ids = [NEW_SID] } = {}) {
+  const h = boot({ names: true, localStorage });
+  h.setSidecar(VM_SIDECAR);
+  h.setHandoffFile(true);
+  h.setState(writtenVmState(h));
+  h.run(`Object.assign(sessionMap.get('${SID}'), ${JSON.stringify(fields)})`);
+  const queue = [...ids];
+  h.knobs.launch = async () => queue.shift();
+  await h.refresh();
+  return { h, localStorage };
+}
+
+test('browser: Continue names the sibling after the old session, numbered 2, and remembers it', async () => {
+  const { h, localStorage } = await bootNamed({ name: 'Relaunch work' });
+  await h.click('primary');
+  assert.equal(h.launches.length, 1);
+  assert.deepEqual({ ...h.launchExtras[0] }, { name: 'Relaunch work 2' });
+  assert.deepEqual(remembered(localStorage), [[NEW_SID, 'Relaunch work 2']]);
+  assert.equal(h.run(`sessionMap.get('${SID}').name`), 'Relaunch work', 'the old session keeps its name');
+  assert.deepEqual(h.sent, [], 'and nothing is typed into it');
+  assert.equal(h.errors.filter(line => line.includes('Continue failed')).length, 0);
+});
+
+test('browser: Continue from a session with no typed name uses the title it shows', async () => {
+  const ai = await bootNamed({ aiTitle: 'Fix the scheduler', summary: 'please fix it' });
+  await ai.h.click('primary');
+  assert.equal(ai.h.launchExtras[0].name, 'Fix the scheduler 2');
+
+  // The summary, cleaned as the lists clean it, when that is all there is.
+  const summary = await bootNamed({ summary: 'Implement the following plan: <b>Ship</b>   the  thing' });
+  summary.h.run(CLEAN_DISPLAY_NAME);
+  await summary.h.click('primary');
+  assert.equal(summary.h.launchExtras[0].name, 'Ship the thing 2');
+});
+
+test('browser: Continue counts up a number it gave, and only that', async () => {
+  // The session being continued is itself a sibling Continue named.
+  const ours = fakeLocalStorage();
+  ours.map.set('continue-names', JSON.stringify([[SID, 'Relaunch work 2']]));
+  const chain = await bootNamed({ name: 'Relaunch work 2' }, { localStorage: ours });
+  await chain.h.click('primary');
+  assert.equal(chain.h.launchExtras[0].name, 'Relaunch work 3');
+  assert.deepEqual(remembered(ours), [[SID, 'Relaunch work 2'], [NEW_SID, 'Relaunch work 3']]);
+
+  // A title that ends in a number of its own keeps it.
+  const own = await bootNamed({ name: 'Upgrade Electron 41' });
+  await own.h.click('primary');
+  assert.equal(own.h.launchExtras[0].name, 'Upgrade Electron 41 2');
+
+  // Renamed by hand since Continue named it: the name is his now.
+  const renamed = fakeLocalStorage();
+  renamed.map.set('continue-names', JSON.stringify([[SID, 'Relaunch work 2']]));
+  const byHand = await bootNamed({ name: 'Phase 7' }, { localStorage: renamed });
+  await byHand.h.click('primary');
+  assert.equal(byHand.h.launchExtras[0].name, 'Phase 7 2');
+});
+
+test('browser: the chain survives a restart, and goes on in the same page without storage', async () => {
+  // One storage, two page loads. The first names the sibling...
+  const shared = fakeLocalStorage();
+  const first = await bootNamed({ name: 'Relaunch work' }, { localStorage: shared });
+  await first.h.click('primary');
+  assert.deepEqual(remembered(shared), [[NEW_SID, 'Relaunch work 2']]);
+  // ...and the second, which has only the storage, continues that sibling.
+  // (The harness has one session id, so the stored id is rewritten to it.)
+  shared.map.set('continue-names', JSON.stringify([[SID, 'Relaunch work 2']]));
+  const second = await bootNamed({ name: 'Relaunch work 2' }, { localStorage: shared });
+  await second.h.click('primary');
+  assert.equal(second.h.launchExtras[0].name, 'Relaunch work 3');
+
+  // Storage that throws on every call: the page still remembers what it gave.
+  const { h } = await bootNamed({ name: 'Relaunch work' }, { localStorage: fakeLocalStorage(true) });
+  await h.click('primary');
+  assert.equal(h.launchExtras[0].name, 'Relaunch work 2');
+  assert.equal(h.run(`handoffNameStore().isOurs('${NEW_SID}', 'Relaunch work 2')`), true);
+  assert.equal(h.errors.length, 0);
+});
+
+test('browser: a window whose localStorage cannot even be read still names the sibling', async () => {
+  // Not a Storage that throws when called (above): the property itself
+  // throws, as it does where storage is denied to the page.
+  const { h } = await bootNamed({ name: 'Relaunch work' });
+  h.run(`Object.defineProperty(window, 'localStorage', { configurable: true, get() { throw new Error('denied'); } })`);
+  await h.click('primary');
+  assert.equal(h.launches.length, 1);
+  assert.equal(h.launchExtras[0].name, 'Relaunch work 2');
+  assert.equal(h.run(`handoffNameStore().isOurs('${NEW_SID}', 'Relaunch work 2')`), true, 'remembered by the page');
+  assert.equal(h.errors.length, 0);
+});
+
+test('browser: Continue skips a name another session in the window already shows', async () => {
+  const { h } = await bootNamed({ name: 'Relaunch work' });
+  // Continued twice already, by clicks this page did not see.
+  h.run(`sessionMap.set('other-1', { sessionId: 'other-1', name: 'Relaunch work 2' })`);
+  h.run(`sessionMap.set('other-2', { sessionId: 'other-2', aiTitle: 'Relaunch work 3' })`);
+  await h.click('primary');
+  assert.equal(h.launchExtras[0].name, 'Relaunch work 4');
+});
+
+test('browser: a session with nothing to carry over continues unnamed, as before', async () => {
+  for (const fields of [{}, { summary: 'New session' }, { name: '   ' }]) {
+    const { h, localStorage } = await bootNamed(fields);
+    await h.click('primary');
+    assert.equal(h.launches.length, 1, JSON.stringify(fields));
+    assert.deepEqual(JSON.parse(h.launches[0]), {
+      target: { projectPath: 'C:\\proj' },
+      options: { model: 'm', initialPrompt: 'Read C:/h/handoff.md in full before doing anything else, then continue' },
+    });
+    assert.equal(h.launchExtras[0].name, null);
+    assert.deepEqual(remembered(localStorage), [], 'nothing to remember');
+  }
+});
+
+test('browser: without continue-name.js Continue still starts the sibling, unnamed', async () => {
+  const h = await bootWritten();
+  h.run(`sessionMap.get('${SID}').name = 'Relaunch work'`);
+  await h.click('primary');
+  assert.equal(h.launches.length, 1);
+  assert.equal(h.launchExtras[0].name, null);
+  assert.equal(h.header().note, null);
+});
+
+test('browser: naming that throws never costs the launch', async () => {
+  // The rule throws: an unnamed sibling.
+  const rule = await bootNamed({ name: 'Relaunch work' });
+  rule.h.run(`window.ContinueName.continuedName = () => { throw new Error('rule broke'); }`);
+  await rule.h.click('primary');
+  assert.equal(rule.h.launches.length, 1);
+  assert.equal(rule.h.launchExtras[0].name, null);
+  assert.equal(rule.h.header().note, null);
+
+  // The store cannot be made: unnamed again.
+  const made = await bootNamed({ name: 'Relaunch work' });
+  made.h.run(`window.ContinueName.createStore = () => { throw new Error('no store'); }`);
+  await made.h.click('primary');
+  assert.equal(made.h.launches.length, 1);
+  assert.equal(made.h.launchExtras[0].name, null);
+  assert.equal(made.h.header().note, null);
+
+  // Remembering throws AFTER the session started: not a failed Continue.
+  const after = await bootNamed({ name: 'Relaunch work' });
+  after.h.run(`
+    const realStore = window.ContinueName.createStore;
+    window.ContinueName.createStore = (s) => ({ ...realStore(s), remember() { throw new Error('cannot remember'); } });
+  `);
+  await after.h.click('primary');
+  assert.equal(after.h.launches.length, 1);
+  assert.equal(after.h.launchExtras[0].name, 'Relaunch work 2');
+  assert.equal(after.h.header().note, null);
+  assert.equal(after.h.errors.filter(line => line.includes('Continue failed')).length, 0);
+
+  // The session map cannot be walked for names in use: named all the same.
+  const noMap = await bootNamed({ name: 'Relaunch work' });
+  noMap.h.run(`sessionMap.values = () => { throw new Error('gone'); }`);
+  await noMap.h.click('primary');
+  assert.equal(noMap.h.launchExtras[0].name, 'Relaunch work 2');
+});
+
+test('browser: a sibling whose terminal did not open is not remembered', async () => {
+  // launchNewSession answers null when the terminal could not be opened.
+  const { h, localStorage } = await bootNamed({ name: 'Relaunch work' }, { ids: [null] });
+  await h.click('primary');
+  assert.equal(h.launchExtras[0].name, 'Relaunch work 2');
+  assert.deepEqual(remembered(localStorage), []);
 });

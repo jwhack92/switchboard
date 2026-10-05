@@ -35,7 +35,10 @@
 //           window._openSessions
 //   dialogs.js: resolveDefaultSessionOptions
 //   task-runner.js: activeTaskView
-//   the browser: sessionStorage (per window; survives a reload of that window)
+//   utils.js: cleanDisplayName
+//   continue-name.js: window.ContinueName
+//   the browser: sessionStorage (per window; survives a reload of that window),
+//           localStorage (every window; the names Continue has given)
 // Those are top-level const/let in classic scripts: global bindings, but NOT
 // window properties, and `typeof x` on one that is still uninitialised THROWS
 // (temporal dead zone -- e.g. app.js died half-way through loading). Hence a
@@ -499,6 +502,7 @@ const handoffRt = {
   inflight: new Map(), // sessionId → Promise of the read in progress
   lastReadAtMs: new Map(), // sessionId → when its last read was started
   els: null,           // header elements, once built
+  names: null,         // the names Continue has given (handoffNameStore), once asked for
   logged: new Set(),
   started: false,
   primed: false,       // the first read of every running session has been sent
@@ -1210,7 +1214,55 @@ function handoffContinueFailed(entry, note, err) {
   try { console.error('[handoff] Continue failed: ' + note, err === undefined ? '' : err); } catch {}
 }
 
-// The second click. The old session is left running: nothing here stops it.
+// The title a session shows in the lists (projects-view.js sessionTitle,
+// without its placeholder).
+function handoffShownTitle(session) {
+  if (!session) return '';
+  const raw = session.name || session.aiTitle || session.summary || '';
+  return (typeof cleanDisplayName === 'function' ? cleanDisplayName(raw) : raw) || '';
+}
+
+// The names Continue has given (continue-name.js), or null without that file.
+// One store for the life of the page: it is also the copy that still works
+// when localStorage does not.
+function handoffNameStore() {
+  if (handoffRt.names) return handoffRt.names;
+  const names = typeof window !== 'undefined' ? window.ContinueName : null;
+  if (!names || typeof names.createStore !== 'function') return null;
+  let storage = null;
+  try { storage = window.localStorage; } catch {}
+  handoffRt.names = names.createStore(storage);
+  return handoffRt.names;
+}
+
+// What the sibling of session `id` is called: the old session's title and a
+// number (continue-name.js has the rule). null starts it unnamed, as a session
+// with nothing to carry over is, and as every failure in here does: the name
+// is a courtesy and must never be the reason a Continue did not start.
+function handoffContinueName(id) {
+  try {
+    const names = typeof window !== 'undefined' ? window.ContinueName : null;
+    if (!names || typeof names.continuedName !== 'function') return null;
+    const session = handoffSession(id);
+    if (!session) return null;
+    const store = handoffNameStore();
+    return names.continuedName(handoffShownTitle(session), {
+      ours: !!store && store.isOurs(id, session.name),
+      // Another session this window knows already shows that title.
+      taken: (name) => {
+        for (const other of sessionMap.values()) {
+          if (other && other.sessionId !== id && handoffShownTitle(other) === name) return true;
+        }
+        return false;
+      },
+    });
+  } catch {
+    return null;
+  }
+}
+
+// The second click. The old session is left running, and keeps its name:
+// nothing here stops or renames it.
 async function handoffContinue(id) {
   const entry = handoffRt.cache.get(id);
   if (!entry) return;
@@ -1244,7 +1296,16 @@ async function handoffContinue(id) {
     // `--effort ultracode` is ultracode on at xhigh (harnesses/claude.js).
     if (inUltracode(entry.state)) options.effort = 'ultracode';
     options.initialPrompt = continuePrompt(info.path);
-    await launchNewSession(target, options);
+    const name = handoffContinueName(id);
+    const newId = await launchNewSession(target, options, { name });
+    // Remembered, so that continuing the sibling counts its number up and
+    // does not append another.
+    if (name && typeof newId === 'string') {
+      try {
+        const store = handoffNameStore();
+        if (store) store.remember(newId, name);
+      } catch {}
+    }
   } catch (err) {
     handoffContinueFailed(entry, HANDOFF_CONTINUE_FAILED, err);
   } finally {
