@@ -400,6 +400,31 @@ test("main pty wiring (pin): stop-session answers ok false with error 'not runni
       assert.equal(session.stopRequested, true, id);
     }
   });
+
+  // From the recheck round (second reader's R1c, R1m, R1j): the "seen over
+  // time" subtest counts kills and never looks at the mark again; the
+  // no-window subtest looks at the mark after the call, not at the kill; and
+  // nothing looked at the list after a Stop of an ended session.
+
+  await t.test('the stop mark stays: 9 s after the Stop the session is still marked as stopped', async () => {
+    const h = boot({ blocks: ['stop'] });
+    const a = h.window();
+    const s = h.session('s1', { owner: a });
+    assert.equal((await h.invoke('stop-session', a, 's1')).ok, true);
+    h.timers.advance(9000);
+    assert.equal(s.stopRequested, true, 'still marked 9 s after the Stop');
+  });
+
+  await t.test('a sender that is no app window: the session is marked before the kill; a Stop of an ended session leaves its record on the list', async () => {
+    const h = boot({ blocks: ['stop'] });
+    const a = h.window();
+    const s = h.session('s1', { owner: a });
+    const ended = h.session('s-ended', { owner: a, exited: true });
+    assert.equal((await h.invoke('stop-session', NO_WINDOW, 's1')).ok, true);
+    assert.equal(ptyCalls(s, 'kill')[0].stopRequested, true, 'marked before the kill');
+    await h.invoke('stop-session', a, 's-ended');
+    assert.equal(h.activeSessions.get('s-ended'), ended);
+  });
 });
 
 // --- Pin 2: terminal-input ---
@@ -515,6 +540,19 @@ test('main pty wiring (pin): terminal-input writes once for the owner or an unow
     assert.deepEqual(writes(owned), ['z']);
     h.timers.advance(60000);
     for (const session of [claude, plainTerm, owned]) assert.equal(session.pty.calls.length, 1, 'the one write and nothing after it');
+  });
+
+  // From the recheck round (second reader's R2h): the subtest above has
+  // no plain terminal that a window owns.
+
+  await t.test('a plain terminal a window owns: one write, and still one a minute later', () => {
+    const h = boot({ blocks: ['input'] });
+    const a = h.window();
+    const owned = h.session('t-owned', { owner: a, isPlainTerminal: true });
+    h.emit('terminal-input', a, 't-owned', 'dir\r');
+    h.timers.advance(60000);
+    assert.deepEqual(writes(owned), ['dir\r']);
+    assert.equal(owned.pty.calls.length, 1);
   });
 });
 
@@ -793,6 +831,32 @@ test('main pty wiring (pin): terminal-resize keeps the owner rule, the 200 ms bu
     assert.equal(unowned._suppressBuffer, false, 'released for a terminal no window owns');
     assert.equal(letGo._suppressBuffer, false, 'released for a terminal whose owner went away during the hold');
   });
+
+  // From the recheck round (second reader's R3i, R3j, R3l): the subtest
+  // above lets the window go by hand (registry.clearOwner). Here the view is
+  // closed through the close-terminal handler, which detaches the record too;
+  // a window is destroyed inside the 200 ms; and a terminal nobody owns is
+  // resized by a sender that is no app window.
+
+  await t.test('the hold is released all the same when the view is closed through close-terminal inside the 200 ms, when the window that asked is gone, and when the sender was no app window', () => {
+    const h = boot({ blocks: ['resize', 'close'] });
+    const a = h.window();
+    const b = h.window();
+    const closed = h.session('t-closed', { owner: a, isPlainTerminal: true });
+    const windowGone = h.session('t-window-gone', { owner: b, isPlainTerminal: true });
+    const noWindow = h.session('t-no-window', { isPlainTerminal: true });
+    h.emit('terminal-resize', a, 't-closed', 90, 30);
+    h.emit('terminal-resize', b, 't-window-gone', 90, 30);
+    h.emit('terminal-resize', NO_WINDOW, 't-no-window', 90, 30);
+    for (const session of [closed, windowGone, noWindow]) assert.equal(session._suppressBuffer, true);
+    h.emit('close-terminal', a, 't-closed');
+    assert.equal(closed.rendererAttached, false, 'the real close detaches');
+    b.destroy();
+    h.timers.advance(200);
+    assert.equal(closed._suppressBuffer, false, 'view closed inside the hold');
+    assert.equal(windowGone._suppressBuffer, false, 'window gone inside the hold');
+    assert.equal(noWindow._suppressBuffer, false, 'asked by a sender that is no app window');
+  });
 });
 
 // --- Pin 4: terminal-resize, for a session that has printed nothing yet ---
@@ -1047,6 +1111,27 @@ test("main pty wiring (pin): close-terminal detaches and broadcasts only for the
     assert.equal(stopping.rendererAttached, false);
     assert.equal(stopping.stopRequested, true, 'the mark the Stop set is left as it was');
     assert.equal(h.registry.ownerId('s-stopping'), null);
+  });
+
+  // From the recheck round (second reader's R5d, R5e): the subtest above
+  // closes the plain terminal and the session whose Stop was sent by their
+  // owner only.
+
+  await t.test("a non-owner's close changes nothing for a plain terminal or for a session whose Stop was sent", () => {
+    const h = boot({ blocks: ['close'] });
+    const a = h.window();
+    const b = h.window();
+    const plainTerm = h.session('t1', { owner: a, isPlainTerminal: true });
+    const stopping = h.session('s-stopping', { owner: a, stopRequested: true });
+    h.emit('close-terminal', b, 't1');
+    h.emit('close-terminal', b, 's-stopping');
+    assert.equal(plainTerm.rendererAttached, true);
+    assert.equal(stopping.rendererAttached, true);
+    assert.equal(h.activeSessions.get('t1'), plainTerm);
+    assert.equal(h.activeSessions.get('s-stopping'), stopping);
+    assert.equal(h.registry.ownerId('t1'), a.id);
+    assert.deepEqual(a.sent, []);
+    assert.deepEqual(b.sent, []);
   });
 });
 
@@ -1411,6 +1496,37 @@ test('main pty wiring (pin, second case changed on purpose by the crash guard): 
     assert.equal(session.exited, true);
     assert.equal(h.activeSessions.has('s1'), false);
   });
+
+  // FIRST CASE again: two subtests from the recheck round (second reader's
+  // R1c, R6i, R6h). Every exit above comes right after the Stop, none looks at
+  // the process's calls after its own exit, and none looks at the MCP server
+  // of a session whose view was closed.
+
+  await t.test('the stop mark stays after the 8 s; an exit that comes later still carries the stop flag, and the exit code does not touch the pty', async () => {
+    const env = spawnFakes();
+    const h = boot({ blocks: ['resolve', 'open', 'stop'], globals: env.globals });
+    const a = h.window();
+    const { session, proc } = await start(h, env, a, 's1');
+    assert.equal((await h.invoke('stop-session', a, 's1')).ok, true);
+    h.timers.advance(9000);
+    assert.equal(session.stopRequested, true, 'still marked 9 s after the Stop');
+    proc.emitExit({ exitCode: 1 });
+    assert.deepEqual(got(a, 'process-exited'), [['process-exited', 's1', 1, undefined, true]]);
+    h.timers.advance(60000);
+    assert.deepEqual(proc.calls.map((c) => c.op), ['kill'], 'the one kill of the Stop; nothing at the exit or after it');
+  });
+
+  await t.test('a session whose view was closed through close-terminal has its MCP server shut down and its record removed when it ends', async () => {
+    const env = spawnFakes();
+    const h = boot({ blocks: ['resolve', 'open', 'close'], globals: env.globals });
+    const a = h.window();
+    const { session, proc } = await start(h, env, a, 's1');
+    h.emit('close-terminal', a, 's1');
+    proc.emitExit({ exitCode: 0 });
+    assert.deepEqual(env.mcpShutdowns, ['s1']);
+    assert.equal(session.mcpServer, null);
+    assert.equal(h.activeSessions.size, 0);
+  });
 });
 
 // --- Pin 7: delete-track ---
@@ -1607,6 +1723,19 @@ test('main pty wiring (pin): delete-track with archive marks and kills each live
     }
     assert.deepEqual(elsewhere.pty.calls, []);
   });
+
+  // From the recheck round (second reader's R7d): the subtest above
+  // counts kills over time and never looks at the mark again.
+
+  await t.test('a minute after a delete with archive the sessions of the track are still marked as stopped', async () => {
+    const fakes = trackFakes();
+    const h = boot({ blocks: ['guarded', 'deleteTrack'], globals: fakes.globals });
+    const a = h.window();
+    const s = h.session('s1', { trackId: 'track-1' });
+    await h.invoke('delete-track', a, 'track-1', { archiveSessions: true });
+    h.timers.advance(60000);
+    assert.equal(s.stopRequested, true);
+  });
 });
 
 // --- Pin 8: before-quit ---
@@ -1773,6 +1902,19 @@ test('main pty wiring (pin): before-quit kills every live terminal in its own tr
     assert.equal(ptyCalls(untouched, 'kill').length, 1);
     assert.notEqual(untouched.stopRequested, true);
   });
+
+  // From the recheck round (second reader's R8d): the "seen over time"
+  // subtest above has no terminal that had ended before quit.
+
+  await t.test('a terminal that had ended before quit has had no kill a minute after quit', () => {
+    const q = quitFakes();
+    const h = boot({ blocks: ['beforeQuit'], globals: q.globals });
+    const ended = q.session(h, 's-ended', { exited: true });
+    q.session(h, 's1');
+    q.quit();
+    h.timers.advance(60000);
+    assert.deepEqual(ended.pty.calls, []);
+  });
 });
 
 // --- Pin 9: open-terminal for a session that is running (reattach) ---
@@ -1937,6 +2079,27 @@ test('main pty wiring (pin): reattach moves the owner, tells the old owner to re
     assert.equal(h.mcpWindows.length, 1);
     assert.equal(h.mcpWindows[0][0], 's1');
     assert.equal(h.mcpWindows[0][1], watched[0], 'the MCP server pushes through the wrapper');
+  });
+
+  // From the recheck round (second reader's R9c): in the subtest above the
+  // asking window takes the session from another window. Here a window opens
+  // its own session again (a reload) and a session nobody showed.
+
+  await t.test('the MCP window is the wrapper also when the same window opens its session again and when nobody showed the session', async () => {
+    const env = spawnFakes();
+    const watched = [];
+    const panelPaths = { watchWindow: (win) => { const wrapper = { wraps: win }; watched.push(wrapper); return wrapper; } };
+    const h = boot({ blocks: ['resolve', 'open'], globals: { ...env.globals, panelPaths } });
+    const a = h.window();
+    h.session('s-own', { owner: a });
+    h.session('s-unshown');
+    await reattach(h, a, 's-own');
+    await reattach(h, a, 's-unshown');
+    assert.equal(watched.length, 2);
+    assert.equal(h.mcpWindows[0][1], watched[0]);
+    assert.equal(h.mcpWindows[1][1], watched[1]);
+    assert.equal(watched[0].wraps, a);
+    assert.equal(watched[1].wraps, a);
   });
 });
 
@@ -2105,6 +2268,21 @@ test('main pty wiring (pin): an adopt of a session that is gone answers exited, 
     assert.equal(h.registry.ownerId('s-then'), null);
     assert.equal(s.rendererAttached, false);
     assert.deepEqual(b.sent, []);
+    nothingStarted(env);
+  });
+
+  // From the recheck round (second reader's R10h): the unshown session
+  // above has one earlier id.
+
+  await t.test('a session no window shows is followed from each of its earlier ids', async () => {
+    const { env, h } = bootOpen();
+    const b = h.window();
+    h.session('s-now', { realSessionId: 's-now', priorIds: ['s-first', 's-second'], rendererAttached: false });
+    for (const earlier of ['s-first', 's-second']) {
+      const answer = await adopt(h, b, earlier);
+      assert.equal(answer.ok, false, earlier);
+      assert.equal(answer.rekeyedTo, 's-now', earlier);
+    }
     nothingStarted(env);
   });
 });
