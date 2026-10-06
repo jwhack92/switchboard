@@ -1854,6 +1854,12 @@ test('parseStoredRequest: a time in the future is refused (no Stop could ever be
 const SOURCE = fs.readFileSync(path.join(__dirname, '..', 'public', 'ctx-handoff.js'), 'utf8');
 // Loaded before it in index.html; here only for the tests that ask (opts.names).
 const NAMES_SOURCE = fs.readFileSync(path.join(__dirname, '..', 'public', 'continue-name.js'), 'utf8');
+// public/prompt-screen.js is not there yet. The ready-state fix adds it (the
+// rules that read Claude Code's screen), loaded before ctx-handoff.js in
+// index.html. boot runs it from the day the file exists, as the page will, so
+// that fix has no line of this shared boot to change. null = no such file.
+const PROMPT_SCREEN_FILE = path.join(__dirname, '..', 'public', 'prompt-screen.js');
+const PROMPT_SCREEN_SOURCE = fs.existsSync(PROMPT_SCREEN_FILE) ? fs.readFileSync(PROMPT_SCREEN_FILE, 'utf8') : null;
 const SID = 'aaaaaaaa-1111-2222-3333-444444444444';
 const VM_DIR = 'C:\\Users\\x\\AppData\\Local\\claude-ctx';
 const VM_HANDOFF = 'C:\\h\\handoff.md';
@@ -1889,11 +1895,49 @@ function fakeElement(tag, byId) {
   };
 }
 
+// The screen every boot's terminal starts with: Claude Code 2.1.289 waiting at
+// an empty prompt after a short turn, rebuilt row for row from a recording of
+// the real program in xterm.js (55 rows by 146 columns, nothing scrolled off,
+// cursor on row 51). The input box is the pointer row between two rule rows;
+// the program puts a no-break space after the pointer, and nothing else while
+// the box is empty. The prompt echoed in the conversation starts with the same
+// pointer, and the two rows under the box are the status lines. Only the
+// folder in the banner is not the recording's.
+const PROMPT_POINTER = '\u276f';                      // "❯"
+const PROMPT_BOX_EMPTY = PROMPT_POINTER + '\u00a0';   // the input box with nothing typed
+const PROMPT_COLS = 146;
+const PROMPT_RULE = '\u2500'.repeat(PROMPT_COLS);     // "─" from edge to edge
+const PROMPT_CURSOR_ROW = 51;
+
+function emptyPromptScreen() {
+  const rows = new Array(55).fill('');
+  rows[1] = ' \u2590\u259b\u2588\u2588\u2588\u259b\u2588   Claude Code v2.1.289';
+  rows[2] = '\u259d\u259c\u2588\u2588\u2588\u2588\u2588\u2588\u2580  Opus 5.5 with xhigh effort \u00b7 Claude Max';
+  rows[3] = ' \u259d\u259d   \u259d\u259d   C:\\proj';
+  rows[6] = (PROMPT_POINTER + ' Reply with the single word ok').padEnd(PROMPT_COLS);
+  rows[8] = '\u25cf ok';
+  rows[10] = '\u273b Worked for 6s \u00b7 done 6:38 AM';
+  rows[50] = PROMPT_RULE;
+  rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY;
+  rows[52] = PROMPT_RULE;
+  rows[53] = '  Opus 5.5\u00b7xhigh \u00b7 ctx 50K/1M 5% ' + '\u2591'.repeat(10);
+  rows[54] = '  \u23f5\u23f5 auto mode on (shift+tab to cycle) \u00b7 \u2190 2 agents';
+  return rows;
+}
+
 // opts: globals 'app' (default) | 'none' | 'tdz'; diagDir; storage (a Map
 // shared between two boots = a reload of one window); startMs; readCtxState
 // (true = window.api has the main-process call, answered by knobs.ctxReply);
 // names (true = continue-name.js is loaded first, as in the app); localStorage
 // (what window.localStorage is; shared between two boots = a restart).
+// Also promptScreen (false = the page is loaded without
+// public/prompt-screen.js, as when that file is missing; while there is no
+// such file it changes nothing).
+//
+// With the app's globals the window has a terminal open for the session
+// (fakeTerminal, further down), as app.js's window._openSessions gives it. Its
+// screen is knobs.rows, which starts as emptyPromptScreen() with the cursor in
+// the input box, and what the page types into the session shows up there.
 function boot(opts = {}) {
   let now = opts.startMs || 2000000000;
   const files = new Map();
@@ -1918,6 +1962,20 @@ function boot(opts = {}) {
     // 'throw' = the call itself throws; 'reject' = the invoke rejects, which
     // is what a main process without the handler does.
     ctxFail: null,
+    // The terminal's live screen, what has scrolled off its top, the first
+    // buffer line in view (null = the live screen) and the row of the live
+    // screen the cursor is on.
+    rows: emptyPromptScreen(),
+    scrollback: [],
+    viewTop: null,
+    cursorY: PROMPT_CURSOR_ROW,
+  };
+  knobs.terminal = fakeTerminal(knobs);
+  // The far end of a write: the program draws what was typed on the screen of
+  // the terminal this window has open for that session, when it has one.
+  const typeInto = (id, data) => {
+    const open = context.window._openSessions ? context.window._openSessions.get(id) : null;
+    if (open && open.terminal && typeof open.terminal.fakeTyped === 'function') open.terminal.fakeTyped(data);
   };
 
   const controls = fakeElement('div', byId); controls.id = 'terminal-header-controls';
@@ -1933,10 +1991,25 @@ function boot(opts = {}) {
       if (!files.has(filePath)) return { ok: false, error: 'ENOENT', code: 'ENOENT' };
       return { ok: true, content: files.get(filePath) };
     },
-    sendInput: (id, data) => { sent.push([id, data]); },
+    sendInput: (id, data) => { sent.push([id, data]); typeInto(id, data); },
     onCliBusyState: (cb) => { listeners.busy = cb; },
     onProcessExited: (cb) => { listeners.exit = cb; },
-    onSessionForked: (cb) => { listeners.fork = cb; },
+    // A fork event as the window gets it: the script's own listener first
+    // (index.html loads ctx-handoff.js before app.js), then what app.js's
+    // listener does to the terminal this fake window has open: it goes with the
+    // session to the new id (public/app.js:411-412).
+    onSessionForked: (cb) => {
+      listeners.fork = (oldId, newId, ...rest) => {
+        const result = cb(oldId, newId, ...rest);
+        const open = context.window._openSessions;
+        if (open && open.has(oldId)) {
+          const entry = open.get(oldId);
+          open.delete(oldId);
+          open.set(newId, entry);
+        }
+        return result;
+      };
+    },
   };
   // The later main-process step: one call for both files, and main's busy flag.
   if (opts.readCtxState) {
@@ -1981,6 +2054,7 @@ function boot(opts = {}) {
 
   if (opts.localStorage) context.window.localStorage = opts.localStorage;
   if (opts.names) run(NAMES_SOURCE);
+  if (PROMPT_SCREEN_SOURCE !== null && opts.promptScreen !== false) run(PROMPT_SCREEN_SOURCE);
   run(SOURCE);
   const globals = opts.globals || 'app';
   if (globals === 'app') {
@@ -1993,6 +2067,7 @@ function boot(opts = {}) {
       const sessionBusyState = new Map();
       const sessionMap = new Map([['${SID}', { sessionId: '${SID}', projectPath: 'C:\\\\proj', type: 'claude' }]]);
       window._isOwnedElsewhere = () => false;
+      window._openSessions = new Map([['${SID}', { terminal: __knobs.terminal }]]);
       async function resolveDefaultSessionOptions(target) { return __knobs.resolveOptions(target); }
       async function launchNewSession(target, options, extra) {
         __launches.push(JSON.stringify({ target, options }));
@@ -3589,8 +3664,18 @@ async function clickUltra(h) {
 }
 
 // A terminal as xterm.js shows it to the page. knobs.rows is the live screen,
-// knobs.scrollback what has gone off its top, and knobs.viewTop the first
-// buffer line in view (null = scrolled to the bottom, the live screen).
+// knobs.scrollback what has gone off its top, knobs.viewTop the first buffer
+// line in view (null = scrolled to the bottom, the live screen), and
+// knobs.cursorY the row of the live screen the cursor is on (xterm.js counts
+// cursorY from baseY, as it does here). boot makes one for every window.
+//
+// fakeTyped is not xterm.js: it is the far end of window.api.sendInput, what
+// the program draws when a write reaches it. Text shows in the input box, after
+// the pointer on the cursor row; a write that is only a carriage return is
+// Enter, and empties the box. Nothing is drawn while the cursor is not on a row
+// that starts with the pointer: on a screen with no input box under the cursor
+// the fake does not guess. It does not wrap a long line, repeat the sent line
+// in the conversation, or start a turn.
 function fakeTerminal(knobs) {
   const lineAt = (y) => {
     const text = knobs.scrollback.concat(knobs.rows)[y];
@@ -3601,21 +3686,23 @@ function fakeTerminal(knobs) {
     buffer: {
       get active() {
         const baseY = knobs.scrollback.length;
-        return { baseY, viewportY: knobs.viewTop === null ? baseY : knobs.viewTop, getLine: lineAt };
+        return { baseY, viewportY: knobs.viewTop === null ? baseY : knobs.viewTop, cursorY: knobs.cursorY, getLine: lineAt };
       },
+    },
+    fakeTyped(data) {
+      const row = knobs.rows[knobs.cursorY];
+      if (typeof row !== 'string' || !row.startsWith(PROMPT_POINTER)) return;
+      knobs.rows[knobs.cursorY] = data === '\r' ? PROMPT_BOX_EMPTY : row + data;
     },
   };
 }
 
 // A session whose turn has ended, with the hook's ultracode value as given
-// (undefined = the hook wrote no key), a terminal whose screen is h.knobs.rows,
-// and the bolt icon. reloaded = this window has had no busy or idle event.
+// (undefined = the hook wrote no key), boot's terminal (its screen is
+// h.knobs.rows), and the bolt icon. reloaded = this window has had no busy or
+// idle event.
 async function bootUltra(ultracode, { reloaded = false, storage, startMs, readCtxState } = {}) {
   const h = boot({ storage, startMs, readCtxState });
-  h.knobs.rows = ['> hello', ''];
-  h.knobs.scrollback = [];
-  h.knobs.viewTop = null;
-  h.knobs.terminal = fakeTerminal(h.knobs);
   // TermDiag reads what is IN VIEW, as the shipped one does: the button must
   // not go by it (the scrolled-up tests below).
   h.run(`
@@ -3628,7 +3715,6 @@ async function bootUltra(ultracode, { reloaded = false, storage, startMs, readCt
       }
       return rows;
     } };
-    window._openSessions = new Map([['${SID}', { terminal: __knobs.terminal }]]);
     window.ICONS = { bolt: (size) => '<svg data-bolt="' + size + '"></svg>' };
   `);
   if (readCtxState) h.knobs.ctxReply = () => mainReply(h, { state: endedState(h, ultracode === undefined ? {} : { ultracode }), busy: false });
