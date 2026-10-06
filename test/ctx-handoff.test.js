@@ -4697,3 +4697,148 @@ test('projects-view.js: its row carries the bolt span the painter fills, for the
   // The painter finds that span through the row's data-session-id.
   assert.match(PROJECTS_SOURCE, /\n  const id = session\.sessionId;\n[\s\S]*?\n  row\.dataset\.sessionId = id;\n/);
 });
+
+// ── pin: a plain Hand off click, on the shared terminal ────────────────────
+//
+// Written before the relaunch fixes, to hold through them. Today the click
+// path does not look at the screen at all. The ready-state fix is designed to
+// look at it before typing, and to hold the Enter until the typed line shows in
+// the input box. On an empty prompt neither changes what is typed: the line,
+// then Enter as a write of its own, and no question.
+
+// The live screen of the terminal this window has open for the session, read
+// the way a page reads xterm.js: terminal.rows lines from the buffer's baseY,
+// and the cursor's row.
+function openScreen(h, id = SID) {
+  return JSON.parse(h.run(`(() => {
+    const terminal = window._openSessions.get('${id}').terminal;
+    const buffer = terminal.buffer.active;
+    const rows = [];
+    for (let y = 0; y < terminal.rows; y++) rows.push(buffer.getLine(buffer.baseY + y).translateToString(true));
+    return JSON.stringify({ rows, cursorY: buffer.cursorY });
+  })()`));
+}
+
+// A session-forked event as the window gets it. h.listeners.fork is this
+// script's listener and then the terminal moving to the new id (boot's
+// onSessionForked); this adds the rest of what app.js's own listener does to
+// the globals this fake window has: the session's row moves to the new id, and
+// the new id is the session in view. The list of running ids is main's; here
+// it has the new id at once.
+async function forkEvent(h, oldId, newId) {
+  h.listeners.fork(oldId, newId);
+  h.run(`(() => {
+    const session = sessionMap.get('${oldId}');
+    session.sessionId = '${newId}';
+    sessionMap.delete('${oldId}');
+    sessionMap.set('${newId}', session);
+    if (activeSessionId === '${oldId}') activeSessionId = '${newId}';
+    activePtyIds = new Set([...activePtyIds].map(id => (id === '${oldId}' ? '${newId}' : id)));
+  })()`);
+  await flush();
+}
+
+test('browser (pin): with a terminal showing an empty prompt, a plain Hand off click types the line and Enter follows as a second write, with no question', async (t) => {
+  const POINTER = '❯';
+  const RULE_ROW = /^─{10,}/;
+  const withoutRow = (rows, y) => rows.filter((_, index) => index !== y);
+  // Both shared boots give this window.
+  const windows = {
+    'the window boot gives': () => bootEnded(),
+    'the window bootUltra gives': () => bootUltra(false),
+  };
+
+  for (const [name, start] of Object.entries(windows)) {
+    await t.test(name, async () => {
+      const h = await start();
+
+      // An empty prompt: a full screen, the cursor in the input box, the box
+      // holding the pointer and nothing typed, a rule row above and below it.
+      const empty = openScreen(h);
+      const box = empty.cursorY;
+      assert.equal(empty.rows.length, 55);
+      assert.ok(Number.isInteger(box) && box > 0 && box < 54, `cursor row ${box}`);
+      assert.ok(empty.rows[box].startsWith(POINTER), 'the cursor is on the pointer row');
+      assert.equal(empty.rows[box].slice(POINTER.length).trim(), '', 'nothing is typed in the box');
+      assert.equal(empty.rows[box], POINTER + '\u00a0', 'the empty box as the program draws it: the pointer and a no-break space');
+      assert.match(empty.rows[box - 1], RULE_ROW);
+      assert.match(empty.rows[box + 1], RULE_ROW);
+
+      // A plain click: Hand off is on offer and does not ask first.
+      const header = h.header();
+      assert.equal(header.primary, 'Hand off');
+      assert.equal(header.primaryEnabled, true);
+      assert.equal(header.primaryOverride, false);
+
+      const clickMs = h.now;
+      await h.click('primary');
+      assert.deepEqual(h.sent, [[SID, REQUEST_LINE]], 'the line is typed at the click, as one write');
+      assert.doesNotMatch(h.sent[0][1], /[\r\n]/, 'no Enter inside the line\'s own write');
+      assert.equal(h.confirms.length, 0, 'no question before typing');
+      // The program shows it: after the pointer, on the cursor's row.
+      const typed = openScreen(h);
+      assert.equal(typed.cursorY, box);
+      assert.ok(typed.rows[box].startsWith(POINTER));
+      assert.equal(typed.rows[box].slice(POINTER.length).trim(), REQUEST_LINE);
+      assert.deepEqual(withoutRow(typed.rows, box), withoutRow(empty.rows, box), 'no other row moved');
+
+      await h.advance(249);
+      assert.deepEqual(h.sent, [[SID, REQUEST_LINE]], 'Enter does not come straight after the line');
+      await h.advance(1);
+      assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']], 'Enter follows as a second write');
+      assert.equal(h.confirms.length, 0);
+      assert.deepEqual(openScreen(h), empty, 'Enter sent the line: the box is empty again');
+
+      // The click is on record as a request made then.
+      const request = h.request();
+      assert.equal(request.phase, 'requested');
+      assert.equal(request.reason, '');
+      assert.ok(request.atMs >= clickMs && request.atMs <= clickMs + 250, `atMs ${request.atMs}, click ${clickMs}`);
+      assert.ok(!request.unsent, 'a line whose Enter went is not on record as unsent');
+
+      // One line and one Enter, and nothing after them.
+      await h.advance(2000);
+      assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+      assert.equal(h.confirms.length, 0, 'no question after it either');
+      // Nor does the record change its mind later: the box is empty and stays
+      // empty, and an empty box after the Enter is not "typed but not sent".
+      const later = h.request();
+      assert.equal(later.phase, 'requested');
+      assert.ok(!later.unsent, 'a line whose Enter went is still not on record as unsent, 2 s later');
+    });
+  }
+
+  // The Enter is for the session, not for the id it had at the click: when the
+  // session gets a new id between the two writes, the Enter goes to that id.
+  await t.test('a fork between the line and its Enter', async () => {
+    const h = await bootEnded();
+    const empty = openScreen(h);
+    const box = empty.cursorY;
+    assert.equal(empty.rows[box], POINTER + '\u00a0');
+
+    await h.click('primary');
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+    await h.advance(100);
+    await forkEvent(h, SID, NEW_SID);
+    // The terminal went with the session, the typed line still in its box.
+    assert.equal(h.run(`window._openSessions.has('${SID}')`), false);
+    assert.equal(openScreen(h, NEW_SID).rows[box].slice(POINTER.length).trim(), REQUEST_LINE);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]], 'the fork itself types nothing');
+
+    await h.advance(149);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]], 'the fork does not bring the Enter forward');
+    await h.advance(1);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [NEW_SID, '\r']], 'Enter goes to the id the session has now');
+    assert.equal(h.confirms.length, 0);
+    assert.deepEqual(openScreen(h, NEW_SID), empty, 'Enter sent the line: the box is empty again');
+
+    await h.advance(2000);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [NEW_SID, '\r']]);
+    assert.equal(h.confirms.length, 0, 'no question after it either');
+
+    // The request is on record with the session, under its new id, and stays so.
+    const request = JSON.parse(h.run(`JSON.stringify(handoffRt.cache.get('${NEW_SID}').request)`));
+    assert.equal(request.phase, 'requested');
+    assert.ok(!request.unsent, 'a line whose Enter went is not on record as unsent');
+  });
+});
