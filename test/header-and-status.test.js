@@ -189,6 +189,18 @@ test('header-and-status (pin): the header shows Running or Stopped and the Stop 
     page.ctx.updateTerminalHeader();
     assert.equal(page.seen.ptyTitles, 2);
   });
+
+  // From the recheck round (second reader's n21b, n21d): the first subtest
+  // tries the session on screen first of two, last of two and second of
+  // three; never third or later, never last of three.
+  await t.test('the session on screen is in the running set as the last of three and as the third of four: Running', () => {
+    for (const running of [['other', 'third', 'sess1'], ['other', 'third', 'sess1', 'fourth']]) {
+      const page = bootHeaderStatus({ active: 'sess1', running });
+      page.header.stop.style.display = 'none';
+      page.ctx.updateTerminalHeader();
+      assert.deepEqual(headerState(page.header), HEADER_RUNNING, JSON.stringify(running));
+    }
+  });
 });
 
 // --- Pin 22 -----------------------------------------------------------------
@@ -546,6 +558,18 @@ test('header-and-status (pin): the running check replaces the set with a new Set
     assert.equal(page.ctx.activePtyIds, before);
     assert.deepEqual(dots(page), NOTHING_DRAWN);
     assert.deepEqual(armed(page).map((timer) => timer.ms), [3000]);
+  });
+
+  // From the recheck round (second reader's n23h): the subtests above only
+  // ever store true as a busy state, or nothing. The page stores false too
+  // (a session that went idle), and that card is running, not busy.
+  await t.test('a running card whose session has a busy entry that says false shows running, not busy', async () => {
+    const page = bootRunningCheck({ running: ['row-a'] });
+    page.ctx.sessionBusyState.set('row-a', false);
+    page.answer = async () => ['row-a'];
+    await page.ctx.pollActiveSessions();
+    assert.equal(page.card.dot.className, 'grid-card-dot running');
+    assert.deepEqual([...page.ctx.sessionBusyState], [['row-a', false]], 'a running row keeps its entry as it is');
   });
 });
 

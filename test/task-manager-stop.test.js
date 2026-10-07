@@ -452,4 +452,19 @@ test('task-manager-stop (pin): Stop kills each running process once, also throug
     assert.deepEqual([a2.kills, b2.kills], [1, 1], 'each new child once');
     assert.deepEqual([a1.kills, b1.kills], [1, 1], 'the old ones not again');
   });
+
+  // From the recheck round (second reader's n27b): the adopted child above is
+  // only ever stopped through stop-all, which visits its own run anyway. Here
+  // the compound alone is stopped and typed into.
+  await t.test('Stop of a compound task, and input to it, reach a child that was started on its own first', async () => {
+    const { manager, pty } = boot();
+    await start(manager, 'a');
+    await start(manager, 'both');
+    const [a, b] = pty.procs;
+    manager.sendInput(PROJECT, 'both', 'y');
+    assert.deepEqual([a.writes, b.writes], [['y'], ['y']]);
+    assert.equal(manager.stopTask(PROJECT, 'both').ok, true);
+    assert.deepEqual([a.kills, b.kills], [1, 1]);
+    assert.equal(manager.getRun(PROJECT, 'a').stopRequested, true);
+  });
 });
