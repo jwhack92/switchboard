@@ -164,6 +164,7 @@ function childMain() {
     requested.push(request);
     const bare = request.replace(/^node:/, '');
     if (request === './token-usage') return origLoad.apply(this, arguments);     // the real one
+    if (request === './pty-guard') return origLoad.apply(this, arguments);       // the real one: it is pure
     if (bare === 'fs') return guardedFs;
     if (bare === 'fs/promises') return guardedFs.promises;
     if (bare === 'electron') return electron;

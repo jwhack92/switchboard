@@ -90,6 +90,19 @@ const { buildPtyEnv } = require('./pty-env');
 
 const cleanPtyEnv = buildPtyEnv(process.env);
 
+// The pty guard: the one gate for every terminal write, resize and kill
+// (pty-guard.js). Nothing else in this file calls a session's pty. Required
+// after the electron-reloader line: a change in pty-guard.js needs an app restart.
+const { createPtyGuard } = require('./pty-guard');
+const ptyGuard = createPtyGuard({
+  log,
+  setTimer: setTimeout,
+  clearTimer: clearTimeout,
+  // A stop that has not ended its terminal after 8 s. The id is asked at that
+  // moment: a re-key may have moved the record since the kill.
+  onStall: (session) => mainFaults.report('stop-stalled', null, { sessionId: sessionTransitions.keyOf(session) }),
+});
+
 // Shell profiles → shell-profiles.js
 const { resolveEffectiveSettings } = require('./resolve-effective-settings');
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgvForShell } = require('./shell-profiles');
@@ -815,7 +828,9 @@ ipcMain.handle('delete-track', guarded((id, options = {}) => {
     session.formerTrackName = track.name;
     if (archiveSessions && !session.exited) {
       session.stopRequested = true;
-      try { session.pty.kill(); } catch (error) { log.error('[delete-track] stop failed', error); }
+      const sent = ptyGuard.kill(session, '[delete-track]', { sessionId: sid });
+      // A kill that threw is news like a failed Stop: the notice and "Did not stop" show for it.
+      if (!sent.ok) mainFaults.report('stop-failed', sent.cause, { sessionId: sid });
     }
   }
   return result;
@@ -1936,6 +1951,19 @@ ipcMain.handle('get-active-sessions', () => {
   return active;
 });
 
+// --- IPC: get-stop-states ---
+// The ids of live sessions whose Stop stalled or failed. The windows ask it in
+// the same 3 s check that asks get-active-sessions, and show "Did not stop".
+ipcMain.handle('get-stop-states', () => {
+  const ids = [];
+  for (const [sessionId, session] of activeSessions) {
+    if (session.exited) continue;
+    const state = ptyGuard.stopState(session);
+    if (state === 'stalled' || state === 'failed') ids.push(sessionId);
+  }
+  return ids;
+});
+
 // --- IPC: get-session-owners --- sessionId → windowId (null = displayed nowhere)
 ipcMain.handle('get-session-owners', () => {
   const out = {};
@@ -1963,11 +1991,26 @@ ipcMain.handle('get-active-terminals', () => {
 });
 
 // --- IPC: stop-session ---
-ipcMain.handle('stop-session', (_event, sessionId) => {
+// The exact key only, no owner rule, and never the 5 s follow of typing: the
+// Archive paths send ids from a list up to 3 s old, and following an old id
+// would kill the live terminal that moved on. An old id is answered with
+// where it went. The kill itself, "once", the 8 s watch: pty-guard.js.
+ipcMain.handle('stop-session', async (_event, sessionId, options) => {
   const session = activeSessions.get(sessionId);
-  if (!session || session.exited) return { ok: false, error: 'not running' };
+  if (!session || session.exited) {
+    const moved = resolveLiveSession(sessionId);
+    if (moved.session && !moved.session.exited && moved.id !== sessionId) {
+      return { ok: false, error: 'not running', rekeyedTo: moved.id };
+    }
+    return { ok: false, error: 'not running' };
+  }
   session.stopRequested = true;
-  session.pty.kill();
+  const sent = ptyGuard.kill(session, '[stop]', { sessionId });
+  if (!sent.ok) {
+    mainFaults.report('stop-failed', sent.cause, { sessionId });
+    return { ok: false, error: 'stop failed' };
+  }
+  if (options && options.wait === true) return { ok: true, ended: await ptyGuard.whenStopped(session) };
   return { ok: true };
 });
 
@@ -2249,6 +2292,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
   }
 
   let ptyProcess;
+  let startupLine = null;
   let mcpServer = null;
   try {
     if (isPlainTerminal) {
@@ -2269,14 +2313,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
           BASH_ENV: claudeShim,
         },
       });
-      // For zsh, ENV/BASH_ENV don't apply — write the function after shell starts
-      setTimeout(() => {
-        if (!ptyProcess._isDisposed) {
-          try {
-            ptyProcess.write(claudeShim + ' clear\n');
-          } catch {}
-        }
-      }, 300);
+      startupLine = claudeShim + ' clear\n';
     } else {
       // Argv is built by the harness and quoted here, so a value can never be
       // spliced into the command line as shell syntax.
@@ -2352,7 +2389,17 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
     isPlainTerminal, forkFrom: sessionOptions?.forkFrom || null,
     mcpServer, _openedAt: Date.now(),
   };
+  // A terminal starts under this id: from now on the id means this terminal.
+  // A terminal that once had the id and has moved on (a fork, a plan-accept,
+  // a /clear) forgets it here, so a late Stop under the id cannot reach it.
+  sessionTransitions.forgetPriorId(sessionId);
   activeSessions.set(sessionId, session);
+  // For zsh, ENV/BASH_ENV don't apply — write the function after shell starts.
+  // Through the guard like every other write, and so below the record: nothing
+  // is typed into a terminal that is stopping or has ended.
+  if (startupLine) {
+    setTimeout(() => { ptyGuard.write(session, startupLine); }, 300);
+  }
 
   // A session launched from a project is filed there. `session.projectId` is
   // not decoration: projects.js reads it off activeSessions to decide which
@@ -2398,6 +2445,8 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
 
   ptyProcess.onData(data => {
     const currentId = session.realSessionId || sessionId;
+    // The first output lets the guard apply a size it was holding (pty-guard.js).
+    ptyGuard.markOutput(session);
 
     // Parse OSC sequences (title changes, progress, notifications, etc.)
     if (data.includes('\x1b]')) {
@@ -2508,7 +2557,12 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
     registry.sendToOwner(currentId, 'terminal-data', currentId, data);
   });
 
+  // A terminal's own connection can report an error. After a Stop or an exit
+  // that is teardown noise; on a live terminal it goes on the fault list.
+  ptyGuard.watchPtyErrors(session, ptyProcess, (err) => mainFaults.report('pty', err, { sessionId: session.realSessionId || sessionId }));
+
   ptyProcess.onExit(({ exitCode, signal }) => {
+    ptyGuard.noteExit(session);
     session.exited = true;
     // Clean up MCP server
     const mcpId = session.realSessionId || sessionId;
@@ -2516,6 +2570,9 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
     session.mcpServer = null;
 
     const realId = session.realSessionId || sessionId;
+    // The id this terminal started with is touched only while it still points
+    // at THIS record. After a re-key another terminal can live under it.
+    const startIdIsOurs = sessionTransitions.keyOf(session, sessionId) === sessionId;
     // The renderer needs to tell "the user ended this" from "this died" to
     // decide whether to tear the terminal down or leave it up with a banner.
     // A signal kill reports exitCode 0, so pass the signal and the
@@ -2528,14 +2585,14 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
     // If a fork/plan-accept transition re-keyed this session under realId
     // but the PTY exited before transition detection ran, also notify the
     // renderer for the original sessionId so it doesn't stay stuck as "Running".
-    if (realId !== sessionId && activeSessions.has(sessionId)) {
+    if (realId !== sessionId && startIdIsOurs) {
       registry.broadcast('process-exited', sessionId, exitCode, signal, stopRequested);
     }
     activeSessions.delete(realId);
     // Clean up the original key too in case transition detection hasn't run yet
-    activeSessions.delete(sessionId);
+    if (startIdIsOurs) activeSessions.delete(sessionId);
     registry.clearOwner(realId);
-    registry.clearOwner(sessionId);
+    if (startIdIsOurs) registry.clearOwner(sessionId);
   });
 
   if (sessionOptions?.forkFrom) {
@@ -2620,46 +2677,48 @@ ipcMain.handle('session-drag-cancel', () => sessionMove.dragCancel());
 
 // --- IPC: terminal-input (fire-and-forget) ---
 ipcMain.on('terminal-input', (event, sessionId, data) => {
-  const session = activeSessions.get(sessionId);
-  if (!session || session.exited) return;
-  // Only the owning window may drive the PTY. A window that has just handed a
+  // The same three steps as terminal-resize, in the same order.
+  // (1) Find the live session.
+  const found = activeSessions.has(sessionId) ? { id: sessionId, session: activeSessions.get(sessionId) } : null;
+  if (!found || found.session.exited) return;
+  const { id: liveId, session } = found;
+  // (2) Only the owning window may drive the PTY. A window that has just handed a
   // session over can still have in-flight keystrokes; accepting them would type
   // into a session the user is now looking at somewhere else.
   const windowId = registry.windowIdOf(event);
-  if (registry.ownerId(sessionId) != null && !registry.isOwner(sessionId, windowId)) return;
-  session.pty.write(data);
+  if (registry.ownerId(liveId) != null && !registry.isOwner(liveId, windowId)) return;
+  // (3) The gate: nothing is typed into a terminal that is stopping, closed or ended.
+  ptyGuard.write(session, data);
 });
 
 // --- IPC: terminal-resize (fire-and-forget) ---
 ipcMain.on('terminal-resize', (event, sessionId, cols, rows) => {
-  const session = activeSessions.get(sessionId);
-  // A PTY has exactly one size. Letting a non-owner resize it is how two
+  // The same three steps as terminal-input, in the same order.
+  // (1) Find the live session.
+  const found = activeSessions.has(sessionId) ? { id: sessionId, session: activeSessions.get(sessionId) } : null;
+  if (!found || found.session.exited) return;
+  const { id: liveId, session } = found;
+  // (2) A PTY has exactly one size. Letting a non-owner resize it is how two
   // windows corrupt each other's rendering, so non-owners are ignored outright.
   const windowId = registry.windowIdOf(event);
-  if (registry.ownerId(sessionId) != null && !registry.isOwner(sessionId, windowId)) return;
-  if (session && !session.exited) {
-    // For plain terminals, suppress buffering during resize to avoid
-    // accumulating prompt redraws that pollute reattach replay
-    if (session.isPlainTerminal) session._suppressBuffer = true;
+  if (registry.ownerId(liveId) != null && !registry.isOwner(liveId, windowId)) return;
+  // (3) The gate. One rule stays in this file on purpose: a plain terminal's
+  // 200 ms buffer hold. It is set before the resize and cleared 200 ms later
+  // whatever the guard answers, so prompt redraws do not pile up in the
+  // reattach replay.
+  if (session.isPlainTerminal) session._suppressBuffer = true;
+  ptyGuard.resize(session, cols, rows);
+  if (session.isPlainTerminal) {
+    setTimeout(() => { session._suppressBuffer = false; }, 200);
+  }
 
-    session.pty.resize(cols, rows);
-
-    if (session.isPlainTerminal) {
-      setTimeout(() => { session._suppressBuffer = false; }, 200);
-    }
-
-    // First resize: nudge to force TUI redraw on reattach (skip for plain terminals — causes duplicate prompts)
-    if (session.firstResize && !session.isPlainTerminal) {
-      session.firstResize = false;
-      setTimeout(() => {
-        try {
-          session.pty.resize(cols + 1, rows);
-          setTimeout(() => {
-            try { session.pty.resize(cols, rows); } catch {}
-          }, 50);
-        } catch {}
-      }, 50);
-    }
+  // First resize: nudge to force TUI redraw on reattach (skip for plain terminals — causes duplicate prompts)
+  if (session.firstResize && !session.isPlainTerminal) {
+    session.firstResize = false;
+    setTimeout(() => {
+      ptyGuard.resize(session, cols + 1, rows);
+      setTimeout(() => { ptyGuard.resize(session, cols, rows); }, 50);
+    }, 50);
   }
 });
 
@@ -3240,10 +3299,8 @@ app.on('before-quit', () => {
   }
 
   // Kill all PTY processes on quit
-  for (const [, session] of activeSessions) {
-    if (!session.exited) {
-      try { session.pty.kill(); } catch {}
-    }
+  for (const [sessionId, session] of activeSessions) {
+    if (!session.exited) ptyGuard.kill(session, '[quit]', { force: true, sessionId });
   }
 
   // The plan-tracker watchers are projects.js's, not projectsWatcher's.

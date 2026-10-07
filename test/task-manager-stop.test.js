@@ -468,3 +468,100 @@ test('task-manager-stop (pin): Stop kills each running process once, also throug
     assert.equal(manager.getRun(PROJECT, 'a').stopRequested, true);
   });
 });
+
+/** boot() with a log that keeps its warn lines. */
+function bootLogged() {
+  const pty = fakePty();
+  const warns = [];
+  const manager = createTaskManager({
+    pty,
+    loadProjectTasks: () => TASKS,
+    baseEnv: { PATH: 'C:\\fake\\bin' },
+    log: { info() {}, warn: (line) => { warns.push(String(line)); }, error() {}, debug() {} },
+    send: () => {},
+    getShellProfile: () => ({ path: '/bin/sh', args: [] }),
+  });
+  return { manager, pty, warns, procsOf: (label) => pty.procs.filter((p) => p.command === 'run-' + label) };
+}
+
+test('task-manager-stop: stop twice gives one kill; input and resize after a stop make no call; a throwing write does not escape', async (t) => {
+  await t.test('stop twice gives one kill, and the second Stop still answers ok', async () => {
+    const { manager, procsOf } = boot();
+    await start(manager, 'solo');
+    const proc = procsOf('solo')[0];
+    assert.equal(manager.stopTask(PROJECT, 'solo').ok, true);
+    assert.equal(manager.stopTask(PROJECT, 'solo').ok, true);
+    assert.equal(proc.kills, 1);
+    assert.equal(stateOf(manager, 'solo'), 'running', 'still running until the process ends');
+    proc.end(null);
+    assert.equal(stateOf(manager, 'solo'), 'stopped');
+  });
+
+  await t.test('input and resize after a stop make no call', async () => {
+    const { manager, procsOf } = boot();
+    await start(manager, 'solo');
+    const proc = procsOf('solo')[0];
+    manager.sendInput(PROJECT, 'solo', 'before');
+    manager.resize(PROJECT, 'solo', 100, 40);
+    manager.stopTask(PROJECT, 'solo');
+    manager.sendInput(PROJECT, 'solo', 'after');
+    manager.resize(PROJECT, 'solo', 110, 50);
+    assert.deepEqual(proc.writes, ['before']);
+    assert.deepEqual(proc.resizes, [[100, 40]]);
+  });
+
+  await t.test('a kill that throws is not counted as sent: the next Stop tries again, and then no more', async () => {
+    const { manager, procsOf } = boot();
+    await start(manager, 'solo');
+    const proc = procsOf('solo')[0];
+    proc.kill = () => { proc.kills++; if (proc.kills === 1) throw new Error('the pty has gone'); };
+    assert.equal(manager.stopTask(PROJECT, 'solo').ok, true);
+    assert.equal(proc.kills, 1);
+    assert.equal(manager.stopTask(PROJECT, 'solo').ok, true);
+    assert.equal(proc.kills, 2, 'the kill that threw was not counted as sent');
+    manager.stopTask(PROJECT, 'solo');
+    assert.equal(proc.kills, 2);
+  });
+
+  await t.test('a throwing write does not escape, and is logged once for the run', async () => {
+    const { manager, warns, procsOf } = bootLogged();
+    await start(manager, 'solo');
+    const proc = procsOf('solo')[0];
+    proc.write = () => { throw new Error('the pty has gone'); };
+    assert.doesNotThrow(() => manager.sendInput(PROJECT, 'solo', 'x'));
+    assert.doesNotThrow(() => manager.sendInput(PROJECT, 'solo', 'y'));
+    assert.deepEqual(warns, ['[task] input solo: the pty has gone']);
+  });
+});
+
+test('task-manager-stop: a restarted task accepts input, resize and Stop again', async () => {
+  const { manager, procsOf } = boot();
+  await start(manager, 'solo');
+  manager.stopTask(PROJECT, 'solo');
+  procsOf('solo')[0].end(null);
+  await start(manager, 'solo');
+  const [first, second] = procsOf('solo');
+  assert.ok(second, 'a second process');
+  manager.sendInput(PROJECT, 'solo', 'x');
+  manager.resize(PROJECT, 'solo', 100, 40);
+  assert.deepEqual(second.writes, ['x']);
+  assert.deepEqual(second.resizes, [[100, 40]]);
+  assert.equal(manager.stopTask(PROJECT, 'solo').ok, true);
+  assert.equal(second.kills, 1);
+  assert.equal(first.kills, 1, 'the old process is not killed again');
+});
+
+test('task-manager-stop: a compound task stops each child exactly once, also when stopAllTasks visits the children', async () => {
+  const { manager, kills, procsOf } = boot();
+  await start(manager, 'both');
+  manager.stopTask(PROJECT, 'both');
+  assert.deepEqual(kills('a', 'b'), [[1], [1]]);
+  manager.stopAllTasks(PROJECT);
+  manager.stopTask(PROJECT, 'both');
+  manager.stopTask(PROJECT, 'a');
+  assert.deepEqual(kills('a', 'b'), [[1], [1]], 'no second kill: not from stop-all, not from the compound again, not from the child');
+  manager.sendInput(PROJECT, 'both', 'x');
+  manager.resize(PROJECT, 'both', 100, 40);
+  assert.deepEqual([procsOf('a')[0].writes, procsOf('b')[0].writes], [[], []]);
+  assert.deepEqual([procsOf('a')[0].resizes, procsOf('b')[0].resizes], [[], []]);
+});

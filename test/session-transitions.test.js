@@ -909,3 +909,36 @@ test('session-transitions (pin, last assertion changed on purpose by /clear): fo
     }
   });
 });
+
+test('session-transitions: keyOf gives the key a record is stored under, by identity: the start id first, then realSessionId, then the whole list', () => {
+  const st = require('../session-transitions');
+  const list = new Map();
+  st.init({ activeSessions: list });
+  const a = {};
+  const b = { realSessionId: 'id-b2' };
+  const c = {};
+  const twin = { realSessionId: 'id-b2' }; // same ids as b, another object, in no list
+  const moved = { realSessionId: 'id-stale' };
+  list.set('id-a', a);
+  list.set('id-b2', b);
+  list.set('id-b1', c);       // id-b1 was b's first id; another terminal lives there now
+  list.set('id-now', moved);  // its realSessionId points at nothing
+  assert.equal(st.keyOf(a, 'id-a'), 'id-a');
+  assert.equal(st.keyOf(a), 'id-a', 'no start id, no realSessionId: found by looking through the list');
+  assert.equal(st.keyOf(b, 'id-b1'), 'id-b2', 'the start id points at another record');
+  assert.equal(st.keyOf(b), 'id-b2');
+  assert.equal(st.keyOf(c, 'id-b1'), 'id-b1');
+  assert.equal(st.keyOf(c, 'id-nobody'), 'id-b1');
+  assert.equal(st.keyOf(moved, 'id-first'), 'id-now');
+  assert.equal(st.keyOf(twin, 'id-b1'), null, 'same ids, another object');
+  assert.equal(st.keyOf(twin), null);
+  assert.equal(st.keyOf(null, 'id-a'), null);
+  assert.equal(st.keyOf(undefined), null);
+  list.delete('id-a');
+  assert.equal(st.keyOf(a, 'id-a'), null, 'a record that left the list has no key');
+  // Before init there is no list: no key, and nothing is thrown.
+  const file = require.resolve('../session-transitions');
+  const kept = require.cache[file];
+  delete require.cache[file];
+  try { assert.equal(require(file).keyOf({}, 'x'), null); } finally { require.cache[file] = kept; }
+});

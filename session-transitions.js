@@ -19,6 +19,41 @@ function init(ctx) {
   rekeyMcpServer = ctx.rekeyMcpServer;
 }
 
+/**
+ * The key under which the live list holds THIS record (the same object), or
+ * null. Two callers ask, both in main.js: the exit code, before it touches the
+ * id a terminal started with, and the stall report, for the id the record
+ * lives under at that moment. It tries startId when one is given, then
+ * session.realSessionId, then looks through the list.
+ */
+function keyOf(session, startId) {
+  if (!session || !activeSessions) return null;
+  if (startId != null && activeSessions.get(startId) === session) return startId;
+  if (session.realSessionId != null && activeSessions.get(session.realSessionId) === session) return session.realSessionId;
+  for (const [key, held] of activeSessions) {
+    if (held === session) return key;
+  }
+  return null;
+}
+
+/**
+ * An old id stops pointing at the terminal that moved on as soon as another
+ * terminal is started under that id. main.js calls this when open-terminal
+ * starts a terminal under `id`. From then on resolveLiveSession (main.js)
+ * follows the id to no other terminal, so once the new terminal has ended a
+ * Stop under the id is answered 'not running', without rekeyedTo.
+ * Every record of the live list that has `id` among its priorIds gets a NEW
+ * array without it; the array is never changed in place.
+ */
+function forgetPriorId(id) {
+  if (!activeSessions || typeof id !== 'string' || id === '') return;
+  for (const session of activeSessions.values()) {
+    if (session && Array.isArray(session.priorIds) && session.priorIds.includes(id)) {
+      session.priorIds = session.priorIds.filter((prior) => prior !== id);
+    }
+  }
+}
+
 // --- Fork / plan-accept detection ---
 
 /** Read first few lines of a new .jsonl to extract signals.
@@ -206,4 +241,4 @@ function detectSessionTransitions(folder) {
 }
 
 
-module.exports = { init, detectSessionTransitions };
+module.exports = { init, detectSessionTransitions, keyOf, forgetPriorId };

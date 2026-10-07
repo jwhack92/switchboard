@@ -160,6 +160,8 @@ function createTaskManager(options = {}) {
     run.signal = null;
     run.error = null;
     run.stopRequested = false;
+    run.killSent = false;
+    run.inputWarned = false;
     run.outputBuffer = [];
     run.outputBufferSize = 0;
     run.children = new Set();
@@ -391,6 +393,9 @@ function createTaskManager(options = {}) {
     }
   }
 
+  // killSent is the Tasks runner's own copy of the "kill once" rule of
+  // pty-guard.js: a run whose kill went through is not killed again, and takes
+  // no input and no resize, until it is started again (resetRun).
   function stopTask(projectPath, label) {
     const run = runs.get(taskKey(projectPath, label));
     if (!run || run.state !== 'running') return { ok: false, error: 'Task is not running' };
@@ -399,7 +404,11 @@ function createTaskManager(options = {}) {
     for (const target of targets) {
       if (target?.state !== 'running') continue;
       target.stopRequested = true;
-      try { target.process?.kill(); } catch (error) { logger.warn(`[task] stop ${target.label}: ${error.message}`); }
+      if (target.killSent === true) continue;
+      try {
+        target.process?.kill();
+        if (target.process) target.killSent = true;
+      } catch (error) { logger.warn(`[task] stop ${target.label}: ${error.message}`); }
     }
     if (!run.virtual && !run.process) {
       run.state = 'stopped';
@@ -449,7 +458,13 @@ function createTaskManager(options = {}) {
     const run = runs.get(taskKey(projectPath, label));
     const targets = run?.virtual ? [...run.children].map(key => runs.get(key)) : [run];
     for (const target of targets) {
-      if (target?.state === 'running') target.process?.write(data);
+      if (target?.state !== 'running' || target.killSent === true) continue;
+      try { target.process?.write(data); } catch (error) {
+        if (!target.inputWarned) {
+          target.inputWarned = true;
+          logger.warn('[task] input ' + target.label + ': ' + error.message);
+        }
+      }
     }
   }
 
@@ -457,7 +472,7 @@ function createTaskManager(options = {}) {
     const run = runs.get(taskKey(projectPath, label));
     const targets = run?.virtual ? [...run.children].map(key => runs.get(key)) : [run];
     for (const target of targets) {
-      if (target?.state !== 'running') continue;
+      if (target?.state !== 'running' || target.killSent === true) continue;
       try { target.process?.resize(Math.max(2, cols), Math.max(1, rows)); } catch {}
     }
   }

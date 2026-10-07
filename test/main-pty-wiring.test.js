@@ -54,6 +54,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { cut, load } = require('../test-support/source-cut');
+const { peek } = require('../test-support/source-cut');
 
 /** The blocks, each cut by two marker strings that are in the file once. No line numbers. */
 const BLOCKS = {
@@ -66,6 +67,11 @@ const BLOCKS = {
   resize: { file: 'main.js', start: '// --- IPC: terminal-resize (fire-and-forget) ---', end: '// --- IPC: close-terminal ---' },
   close: { file: 'main.js', start: '// --- IPC: close-terminal ---', end: "const sessionTransitions = require('./session-transitions');" },
 };
+// Added by the crash guard (commit C). 'guard' is main.js's own lines that
+// make the pty guard; boot() loads it in every boot. 'stopStates' is the
+// handler the 3 s running check asks.
+BLOCKS.guard = { file: 'main.js', start: '// The pty guard: the one gate for every terminal write, resize and kill', end: '// Shell profiles \u2192 shell-profiles.js' };
+BLOCKS.stopStates = { file: 'main.js', start: '// --- IPC: get-stop-states ---', end: '// --- IPC: get-session-owners ---' };
 
 // A block is cut when a test first asks for it, so a marker that no longer
 // fits fails the tests of that block and not the whole file.
@@ -175,6 +181,11 @@ function boot({ blocks = [], globals = {}, modules = {} } = {}) {
     report(...args) { mainFaultCalls.push(['report', ...args]); },
   };
 
+  // The real session-transitions.js, on this boot's list of sessions: the
+  // exit code and the stall report ask its keyOf. It is one module for the
+  // whole file, so a test finishes with one boot before it makes the next.
+  const sessionTransitions = require('../session-transitions');
+  sessionTransitions.init({ activeSessions });
   // Everything a block of main.js may name. A fix that makes the handlers
   // name something new (the crash guard's ptyGuard, say) adds it HERE, once.
   const shared = {
@@ -185,8 +196,19 @@ function boot({ blocks = [], globals = {}, modules = {} } = {}) {
     setMcpWindow: (id, win) => { mcpWindows.push([id, win]); },
     panelPaths: { watchWindow: (win) => win },
     mainFaults,
+    sessionTransitions,
     ...globals,
   };
+  // From the crash guard on, two blocks of main.js are loaded in every boot,
+  // before the named ones. 'resolve' (unless the test names it): stop-session
+  // asks resolveLiveSession. 'guard': main.js's own lines make the REAL
+  // pty-guard.js on this boot's fake timers, with main.js's own stall report.
+  if (!blocks.includes('resolve')) {
+    contexts.resolve = load(block('resolve'), { file: BLOCKS.resolve.file, globals: shared, modules });
+    shared.resolveLiveSession = contexts.resolve.resolveLiveSession;
+  }
+  contexts.guard = load(block('guard'), { file: BLOCKS.guard.file, globals: shared, modules: { './pty-guard': null, ...modules } });
+  shared.ptyGuard = peek(contexts.guard, 'ptyGuard');
   for (const name of blocks) {
     assert.notEqual(name, 'registry', 'the registry is always loaded; name only blocks of main.js');
     const context = load(block(name), { file: BLOCKS[name].file, globals: shared, modules });
@@ -871,8 +893,8 @@ test('main pty wiring (pin): terminal-resize keeps the owner rule, the 200 ms bu
 
 // --- Pin 4: terminal-resize, for a session that has printed nothing yet ---
 
-// PIN, changed on purpose by the crash guard: nothing reaches the pty until the first output, then the last size once; the buffer hold is unchanged and is not set again when the held size is applied.
-test("main pty wiring (pin, changed on purpose by the crash guard): a resize before the first output is passed to the pty at once, and a plain terminal's buffer hold runs 200 ms from the call", async (t) => {
+// PIN 4, changed on purpose by the crash guard. Formerly: "main pty wiring (pin, changed on purpose by the crash guard): a resize before the first output is passed to the pty at once, and a plain terminal's buffer hold runs 200 ms from the call". Nothing reaches the pty until the first output, then the last size once; the buffer hold is unchanged and is not set again when the held size is applied.
+test("main pty wiring (pin, changed by the crash guard): a resize before the first output is held and reaches the pty once after it, with the last size, and a plain terminal's buffer hold runs 200 ms from the call", async (t) => {
   // Two shapes of "has printed nothing yet": the record as main.js makes it
   // today, which has no ptyGate at all, and one that says so in ptyGate.
   const NOT_YET = [
@@ -888,36 +910,37 @@ test("main pty wiring (pin, changed on purpose by the crash guard): a resize bef
       return session;
     };
 
-    await t.test(`${shape}: a Claude session's resize reaches the pty inside the call`, () => {
+    await t.test(`${shape}: a Claude session's resize does not reach the pty before the first output`, () => {
       const h = boot({ blocks: ['resize'] });
       const a = h.window();
       const s = silent(h, 's1', { owner: a });
       h.emit('terminal-resize', a, 's1', 120, 30);
-      assert.deepEqual(resizes(s), [[120, 30, 0]], 'before any timer ran and before any output');
+      assert.deepEqual(s.pty.calls, [], 'held by the guard');
     });
 
-    await t.test(`${shape}: a Claude session's two nudge resizes reach the pty too, at 50 and 100 ms, with still no output`, () => {
+    await t.test(`${shape}: a Claude session's two nudge resizes do not reach the pty either, with still no output`, () => {
       const h = boot({ blocks: ['resize'] });
       const a = h.window();
       const s = silent(h, 's1', { owner: a });
       h.emit('terminal-resize', a, 's1', 120, 30);
       h.timers.advance(1000);
-      assert.deepEqual(resizes(s), [[120, 30, 0], [121, 30, 50], [120, 30, 100]]);
+      assert.deepEqual(s.pty.calls, []);
+      assert.equal(s.firstResize, false, 'the nudge is used up as today');
     });
 
-    await t.test(`${shape}: a plain terminal's resize reaches the pty inside the call, and the buffer hold runs 200 ms from the call`, () => {
+    await t.test(`${shape}: a plain terminal's resize does not reach the pty before the first output, and the buffer hold still runs 200 ms from the call`, () => {
       const h = boot({ blocks: ['resize'] });
       const a = h.window();
       const s = silent(h, 't1', { owner: a, isPlainTerminal: true });
       h.emit('terminal-resize', a, 't1', 100, 40);
-      assert.deepEqual(resizes(s), [[100, 40, 0]], 'before any timer ran and before any output');
-      assert.equal(ptyCalls(s, 'resize')[0].bufferHeld, true);
+      assert.deepEqual(s.pty.calls, [], 'held by the guard');
+      assert.equal(s._suppressBuffer, true, 'the hold is set at the call, whatever the guard answers');
       h.timers.advance(199);
       assert.equal(s._suppressBuffer, true, 'still held at 199 ms');
       h.timers.advance(1);
       assert.equal(s._suppressBuffer, false, 'released 200 ms after the call, with no output in between');
       h.timers.advance(1000);
-      assert.equal(s.pty.calls.length, 1);
+      assert.deepEqual(s.pty.calls, []);
     });
   }
 
@@ -970,6 +993,50 @@ test("main pty wiring (pin, changed on purpose by the crash guard): a resize bef
     h.timers.advance(1000);
     proc.emitData('more');
     assert.deepEqual([...session.outputBuffer], ['$ ', 'ls', 'more']);
+  });
+
+  // Added by the crash guard (commit C): what happens AFTER the first output.
+  // The terminals are started through the handler, so the output callback
+  // that tells the guard is main.js's own (design acceptance, "new test").
+  await t.test('a plain terminal started through the handler: three sizes before its first output reach the pty as one resize with the last size, one 0 ms step after the first output, and the buffer hold is not set at that moment', async () => {
+    const env = spawnFakes();
+    const h = boot({ blocks: ['resolve', 'open', 'resize'], globals: env.globals });
+    const a = h.window();
+    const { session, proc } = await start(h, env, a, 't1', { options: { type: 'terminal' } });
+    const heldAtResize = [];
+    const record = proc.resize;
+    proc.resize = (cols, rows) => { heldAtResize.push(session._suppressBuffer === true); record(cols, rows); };
+    for (const [cols, rows] of [[90, 20], [100, 30], [110, 40]]) h.emit('terminal-resize', a, 't1', cols, rows);
+    h.timers.advance(250);
+    assert.deepEqual(ptyCalls(session, 'resize'), [], 'nothing reached the pty before the first output');
+    assert.equal(session._suppressBuffer, false, 'the hold of the calls is over');
+    proc.emitData('$ ');
+    assert.deepEqual(ptyCalls(session, 'resize'), [], 'the first output alone applies nothing');
+    h.timers.advance(0);
+    assert.deepEqual(ptyCalls(session, 'resize'), [{ op: 'resize', cols: 110, rows: 40 }], 'the last size, once');
+    assert.deepEqual(heldAtResize, [false], 'no buffer hold when the held size is applied');
+    assert.notEqual(session._suppressBuffer, true);
+    assert.deepEqual([...session.outputBuffer], ['$ ']);
+    proc.emitData('more');
+    h.timers.advance(1000);
+    assert.equal(ptyCalls(session, 'resize').length, 1, 'later output applies nothing');
+    h.emit('terminal-resize', a, 't1', 120, 50);
+    assert.deepEqual(ptyCalls(session, 'resize')[1], { op: 'resize', cols: 120, rows: 50 }, 'from then on a size reaches the pty inside the call');
+    assert.deepEqual(heldAtResize, [false, true], 'under the hold of its own call, as today');
+  });
+
+  await t.test('a Claude session started through the handler: the size and both nudge steps are held, and the first output applies one resize with the size of the call', async () => {
+    const env = spawnFakes();
+    const h = boot({ blocks: ['resolve', 'open', 'resize'], globals: env.globals });
+    const a = h.window();
+    const { proc } = await start(h, env, a, 's1');
+    h.emit('terminal-resize', a, 's1', 120, 30);
+    h.timers.advance(1000);
+    assert.deepEqual(proc.calls, [], 'the size and both nudge steps were held');
+    proc.emitData('frame');
+    assert.deepEqual(proc.calls, []);
+    h.timers.advance(0);
+    assert.deepEqual(proc.calls, [{ op: 'resize', cols: 120, rows: 30 }]);
   });
 });
 
@@ -1274,8 +1341,8 @@ function rekeyByHand(h, oldId, newId) {
 
 // --- Pin 6: the exit report ---
 
-// PIN, changed on purpose by the crash guard: another live terminal stored under the first id will stay in the list with its owner and get no exit report; the first id is reported and cleared only while it still points at the terminal that ended.
-test('main pty wiring (pin, second case changed on purpose by the crash guard): the exit report goes to every window with the stop flag under the live id and the record and owner are cleared; today, when another live terminal is stored under the first id, it is reported ended, removed and un-owned as well', async (t) => {
+// PIN 6, changed on purpose by the crash guard. Formerly: "main pty wiring (pin, second case changed on purpose by the crash guard): the exit report goes to every window with the stop flag under the live id and the record and owner are cleared; today, when another live terminal is stored under the first id, it is reported ended, removed and un-owned as well". Its second case changed: another live terminal stored under the first id now stays in the list with its owner and gets no exit report; the first id is reported and cleared only while it still points at the terminal that ended.
+test('main pty wiring (pin, second case changed by the crash guard): the exit report goes to every window with the stop flag under the live id and the record and owner are cleared; another live terminal stored under the first id stays in the list with its owner and gets no exit report', async (t) => {
   // FIRST CASE. It holds before and after the crash guard. Only the
   // process-exited messages are compared, so a fix may send something else at
   // an exit; how many reports there are, and what each carries, is exact.
@@ -1397,11 +1464,12 @@ test('main pty wiring (pin, second case changed on purpose by the crash guard): 
     assert.deepEqual(env.mcpShutdowns, ['id-2'], 'the MCP server is shut down under the live id');
   });
 
-  // SECOND CASE: TODAY'S FAULT, pinned as the code behaves. The first
+  // SECOND CASE, changed on purpose by the crash guard (commit C). The first
   // terminal starts under id-1 and is re-keyed to id-2. Then the row of id-1
   // is opened again: no adopt, nothing stored under id-1, so a second
-  // terminal starts under it. When the first one ends, the exit code acts on
-  // whatever is stored under the id it started with, and that is the second.
+  // terminal starts under it. Before the fix, the first one's exit acted on
+  // whatever was stored under the id it started with, and that was the
+  // second. Now it acts on that id only while it still points at itself.
   async function twoTerminalsOneFirstId() {
     const env = spawnFakes();
     const h = boot({ blocks: ['resolve', 'open', 'stop'], globals: env.globals });
@@ -1418,51 +1486,41 @@ test('main pty wiring (pin, second case changed on purpose by the crash guard): 
     return { env, h, a, b, first, second };
   }
 
-  await t.test('today: another live terminal stored under the first id is reported ended with the first one\'s code, signal and stop flag, is removed from the list and loses its owner', async () => {
+  await t.test('after the fix: another live terminal stored under the first id stays in the list with its owner and gets no exit report when the first one ends', async () => {
     const { env, h, a, b, first, second } = await twoTerminalsOneFirstId();
     const from = [a.sent.length, b.sent.length];
     assert.equal((await h.invoke('stop-session', a, 'id-2')).ok, true);
     first.proc.emitExit({ exitCode: 1, signal: 15 });
-
-    // Two reports to every window: the terminal that ended under its live
-    // id, then the one that did not end, under the id it is stored under.
     for (const [win, start] of [[a, from[0]], [b, from[1]]]) {
-      assert.deepEqual(got(win, 'process-exited', start), [
-        ['process-exited', 'id-2', 1, 15, true],
-        ['process-exited', 'id-1', 1, 15, true],
-      ]);
+      assert.deepEqual(got(win, 'process-exited', start), [['process-exited', 'id-2', 1, 15, true]], 'one report, for the terminal that ended');
     }
     assert.equal(h.activeSessions.has('id-2'), false);
-    assert.equal(h.activeSessions.has('id-1'), false, 'the second terminal is off the list');
-    assert.equal(h.activeSessions.size, 0);
+    assert.equal(h.activeSessions.get('id-1'), second.session, 'the second terminal is still on the list');
+    assert.equal(h.activeSessions.size, 1);
     assert.equal(h.registry.ownerId('id-2'), null);
-    assert.equal(h.registry.ownerId('id-1'), null, 'and no window owns it');
-
-    // It did not end, was not stopped, and nothing of its own was cleaned up.
+    assert.equal(h.registry.ownerId('id-1'), b.id, 'and its window still owns it');
     assert.equal(first.session.exited, true);
     assert.equal(second.session.exited, false);
     assert.notEqual(second.session.stopRequested, true);
     assert.deepEqual(second.proc.calls, [], 'its process was not killed');
-    assert.deepEqual(env.mcpShutdowns, ['id-2'], 'only the first terminal\'s MCP server was shut down');
+    assert.deepEqual(env.mcpShutdowns, ['id-2'], "only the first terminal's MCP server was shut down");
     assert.ok(second.session.mcpServer);
   });
 
-  await t.test('today: that second terminal runs on where nothing reaches it: its output goes to no window and stop-session answers not running', async () => {
+  await t.test('after the fix: that second terminal still reaches its window, and stop-session stops it', async () => {
     const { h, a, b, first, second } = await twoTerminalsOneFirstId();
-    second.proc.emitData('before');
-    assert.deepEqual(got(b, 'terminal-data'), [['terminal-data', 'id-1', 'before']], 'until then its window gets its output');
-
     first.proc.emitExit({ exitCode: 0, signal: undefined });
     const from = [a.sent.length, b.sent.length];
     second.proc.emitData('after');
     assert.deepEqual(a.sent.slice(from[0]), []);
-    assert.deepEqual(b.sent.slice(from[1]), [], 'its output reaches no window');
-    assert.deepEqual([...second.session.outputBuffer], ['before', 'after'], 'though the process still prints');
-
+    assert.deepEqual(b.sent.slice(from[1]), [['terminal-data', 'id-1', 'after']], 'its output still reaches its window');
     const answer = await h.invoke('stop-session', b, 'id-1');
-    assert.equal(answer.ok, false);
-    assert.equal(answer.error, 'not running');
-    assert.deepEqual(second.proc.calls, [], 'so it cannot be stopped from the app');
+    assert.equal(answer.ok, true);
+    assert.deepEqual(second.proc.calls.map((c) => c.op), ['kill']);
+    second.proc.emitExit({ exitCode: 0 });
+    assert.deepEqual(got(b, 'process-exited', from[1]), [['process-exited', 'id-1', 0, undefined, true]]);
+    assert.equal(h.activeSessions.size, 0);
+    assert.equal(h.registry.ownerId('id-1'), null);
   });
 
   // FIRST CASE again: two subtests added after the verifier's attack. They
@@ -2310,4 +2368,536 @@ test('main pty wiring: before-quit writes the pending fault counts first (mainFa
   assert.deepEqual(h.globals.mainFaults.calls, [['flush']], 'once, with no argument');
   assert.deepEqual(q.steps, [...BEFORE_THE_KILLS, 'kill s1', ...AFTER_THE_KILLS]);
   assert.equal(session.pty.calls.length, 1);
+});
+
+// =====================================================================
+// The crash guard, commit C: tests on top of the pins
+// =====================================================================
+
+/** The text of a file of the repository. */
+const sourceOf = (file) => require('fs').readFileSync(require('path').join(__dirname, '..', file), 'utf8');
+
+test('main-pty-wiring: main.js makes the one guard after the pty-env lines, on its own timers, with the stall report under the id keyOf gives', () => {
+  const src = sourceOf('main.js');
+  const line = "const { createPtyGuard } = require('./pty-guard');";
+  const at = src.indexOf(line);
+  assert.notEqual(at, -1, 'a plain require, on one line');
+  assert.equal(src.split("require('./pty-guard')").length - 1, 1, 'required once');
+  assert.equal(src.split('createPtyGuard(').length - 1, 1, 'one guard');
+  assert.ok(src.indexOf("require('electron-reloader')") < at, 'after the reloader line');
+  assert.ok(src.indexOf("require('./pty-env')") < at && at < src.indexOf("require('./harnesses')"), 'between pty-env and harnesses');
+  const made = block('guard');
+  assert.match(made, /const ptyGuard = createPtyGuard\(\{/);
+  assert.match(made, /\blog,/);
+  assert.match(made, /setTimer: setTimeout,/);
+  assert.match(made, /clearTimer: clearTimeout,/);
+  assert.match(made, /onStall: \(session\) => mainFaults\.report\('stop-stalled', null, \{ sessionId: sessionTransitions\.keyOf\(session\) \}\),/);
+  assert.match(made, /a change in pty-guard\.js needs an app restart/);
+  // Every boot gets that guard, the real module behind it.
+  const h = boot();
+  assert.deepEqual(Object.keys(h.globals.ptyGuard).sort(), ['kill', 'markOutput', 'noteExit', 'resize', 'stopState', 'watchPtyErrors', 'whenStopped', 'write']);
+  assert.equal(typeof h.globals.resolveLiveSession, 'function');
+  assert.equal(h.globals.sessionTransitions, require('../session-transitions'));
+});
+
+test("main-pty-wiring: the real 'terminal-resize' handler survives a pty whose resize throws and leaves _suppressBuffer false", () => {
+  const h = boot({ blocks: ['resize'] });
+  const a = h.window();
+  const s = h.session('t1', { owner: a, isPlainTerminal: true });
+  let tries = 0;
+  s.pty.resize = () => { tries++; throw new Error('Cannot resize a pty that has already exited'); };
+  assert.doesNotThrow(() => h.emit('terminal-resize', a, 't1', 100, 40));
+  assert.equal(tries, 1);
+  assert.equal(s._suppressBuffer, true, 'the hold is set whatever the guard answers');
+  h.timers.advance(200);
+  assert.equal(s._suppressBuffer, false, 'and comes off 200 ms later');
+  assert.doesNotThrow(() => h.emit('terminal-resize', a, 't1', 110, 40));
+  assert.equal(tries, 1, 'a pty found closed is not tried again');
+  h.timers.advance(200);
+  assert.equal(s._suppressBuffer, false);
+});
+
+test('main-pty-wiring: stopping either of two terminals that share a first id leaves the other one alone', async () => {
+  const two = async () => {
+    const env = spawnFakes();
+    const h = boot({ blocks: ['resolve', 'open', 'stop'], globals: env.globals });
+    const a = h.window();
+    const b = h.window();
+    const first = await start(h, env, a, 'id-1');
+    rekeyByHand(h, 'id-1', 'id-2');
+    const second = await start(h, env, b, 'id-1', { isNew: false });
+    return { h, a, b, first, second };
+  };
+  // Stop the one that is stored under id-1 now. The other one started under id-1 too.
+  {
+    const { h, a, b, first, second } = await two();
+    assert.deepEqual(plain(await h.invoke('stop-session', b, 'id-1')), { ok: true });
+    assert.deepEqual(second.proc.calls.map((c) => c.op), ['kill']);
+    assert.deepEqual(first.proc.calls, [], 'the exact key is stopped, not the terminal that once had the id');
+    assert.notEqual(first.session.stopRequested, true);
+    second.proc.emitExit({ exitCode: 0 });
+    assert.equal(h.activeSessions.get('id-2'), first.session);
+    assert.equal(h.activeSessions.size, 1);
+    assert.equal(h.registry.ownerId('id-2'), a.id);
+    assert.deepEqual(got(a, 'process-exited').map((m) => m[1]), ['id-1']);
+  }
+  // Stop the one that moved on to id-2.
+  {
+    const { h, a, b, first, second } = await two();
+    assert.deepEqual(plain(await h.invoke('stop-session', a, 'id-2')), { ok: true });
+    assert.deepEqual(first.proc.calls.map((c) => c.op), ['kill']);
+    assert.deepEqual(second.proc.calls, []);
+    first.proc.emitExit({ exitCode: 0 });
+    assert.equal(h.activeSessions.get('id-1'), second.session, 'the other terminal is still on the list');
+    assert.equal(h.registry.ownerId('id-1'), b.id);
+    assert.deepEqual(got(b, 'process-exited').map((m) => m[1]), ['id-2'], 'and is not reported ended');
+    assert.notEqual(second.session.stopRequested, true);
+  }
+});
+
+/** The answer of get-stop-states as an array of this realm. plain() does not do that for an array a block made: its own map() gives an array of the block's realm again, and deepEqual is strict about that. */
+const stopStates = async (h, from) => [...await h.invoke('get-stop-states', from)];
+
+test('main-pty-wiring: a stop between the first resize and the 50 ms nudge leaves exactly one resize call', async () => {
+  const h = boot({ blocks: ['resize', 'stop'] });
+  const a = h.window();
+  const s = h.session('s1', { owner: a });
+  h.emit('terminal-resize', a, 's1', 120, 30);
+  h.timers.advance(10);
+  assert.equal((await h.invoke('stop-session', a, 's1')).ok, true);
+  h.timers.advance(1000);
+  assert.deepEqual(resizes(s), [[120, 30, 0]]);
+  assert.deepEqual(s.pty.calls.map((c) => c.op), ['resize', 'kill']);
+  h.emit('terminal-resize', a, 's1', 90, 20);
+  h.timers.advance(1000);
+  assert.equal(ptyCalls(s, 'resize').length, 1, 'no later resize reaches a stopping terminal');
+});
+
+test("main-pty-wiring: the real 'stop-session' handler called twice kills once and answers ok both times", async () => {
+  const h = boot({ blocks: ['stop'] });
+  const a = h.window();
+  const s = h.session('s1', { owner: a });
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 's1')), { ok: true });
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 's1')), { ok: true }, 'no "already" in the answer');
+  assert.equal(ptyCalls(s, 'kill').length, 1);
+  h.timers.advance(7999);
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 's1')), { ok: true });
+  assert.equal(ptyCalls(s, 'kill').length, 1, 'a third Stop inside the 8 s kills nothing');
+  h.timers.advance(1);
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 's1')), { ok: true });
+  assert.equal(ptyCalls(s, 'kill').length, 2, 'after the stall, one more kill goes out');
+  for (const options of [{}, { wait: false }, 'wait', null]) {
+    const other = h.session('s-' + JSON.stringify(options), { owner: a });
+    assert.deepEqual(plain(await h.invoke('stop-session', a, 's-' + JSON.stringify(options), options)), { ok: true }, 'only wait: true waits');
+    assert.equal(ptyCalls(other, 'kill').length, 1);
+  }
+});
+
+test("main-pty-wiring: 'terminal-input' from a non-owner makes no write; from the owner, none for a stopping session and exactly one for a live one", async () => {
+  const h = boot({ blocks: ['input', 'stop'] });
+  const a = h.window();
+  const b = h.window();
+  const live = h.session('s-live', { owner: a });
+  const stopping = h.session('s-stopping', { owner: a });
+  h.emit('terminal-input', b, 's-live', 'from b');
+  assert.deepEqual(writes(live), []);
+  await h.invoke('stop-session', a, 's-stopping');
+  h.emit('terminal-input', a, 's-stopping', 'x');
+  assert.deepEqual(writes(stopping), []);
+  h.emit('terminal-input', a, 's-live', 'ls\r');
+  assert.deepEqual(writes(live), ['ls\r']);
+  live.pty.write = () => { throw new Error('EPIPE'); };
+  assert.doesNotThrow(() => h.emit('terminal-input', a, 's-live', 'y'), 'a write that throws stays inside the guard');
+});
+
+test("main-pty-wiring: stop-session under an id that is a prior id of a live session answers 'not running' with rekeyedTo and kills nothing", async () => {
+  const h = boot({ blocks: ['stop'] });
+  const a = h.window();
+  const live = h.session('s-new', { owner: a, realSessionId: 's-new', priorIds: ['s-older', 's-old'] });
+  h.session('s-ended-new', { exited: true, realSessionId: 's-ended-new', priorIds: ['s-ended-old'] });
+  for (const old of ['s-older', 's-old']) {
+    assert.deepEqual(plain(await h.invoke('stop-session', a, old)), { ok: false, error: 'not running', rekeyedTo: 's-new' }, old);
+  }
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 's-old', { wait: true })), { ok: false, error: 'not running', rekeyedTo: 's-new' }, 'the same with wait, at once');
+  for (const id of ['s-nobody', 's-ended-old', 's-ended-new', '', undefined]) {
+    assert.deepEqual(plain(await h.invoke('stop-session', a, id)), { ok: false, error: 'not running' }, 'no rekeyedTo: ' + id);
+  }
+  h.timers.advance(60000);
+  assert.deepEqual(live.pty.calls, [], 'the terminal that moved on is not killed, then or later');
+  assert.notEqual(live.stopRequested, true);
+  assert.deepEqual(plain(h.globals.mainFaults.calls).filter((c) => c[0] === 'report'), []);
+});
+
+test("main-pty-wiring: stop-session answers 'stop failed' and reports stop-failed when the kill throws; the gate stays closed and every later Stop tries again", async () => {
+  const h = boot({ blocks: ['stop', 'input', 'resize', 'stopStates'] });
+  const a = h.window();
+  const s = h.session('s1', { owner: a });
+  const note = s.pty.kill;
+  let fail = true;
+  s.pty.kill = () => { note(); if (fail) throw new Error('the pty is closed'); };
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 's1')), { ok: false, error: 'stop failed' });
+  assert.equal(s.stopRequested, true);
+  assert.equal(ptyCalls(s, 'kill')[0].stopRequested, true, 'marked before the kill');
+  const reports = () => h.globals.mainFaults.calls.filter((c) => c[0] === 'report');
+  assert.equal(reports().length, 1);
+  assert.deepEqual([reports()[0][1], reports()[0][2].message, plain(reports()[0][3])], ['stop-failed', 'the pty is closed', { sessionId: 's1' }]);
+  const tagged = h.log.lines.filter((l) => l.includes('[stop]'));
+  assert.equal(tagged.length, 1);
+  assert.match(tagged[0], /^error \[stop\] session=s1 kill failed: the pty is closed/);
+  h.emit('terminal-input', a, 's1', 'x');
+  h.emit('terminal-resize', a, 's1', 100, 40);
+  h.timers.advance(1000);
+  assert.deepEqual(s.pty.calls.map((c) => c.op), ['kill'], 'the gate stays closed after a failed kill');
+  assert.deepEqual(await stopStates(h, a), ['s1']);
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 's1', { wait: true })), { ok: false, error: 'stop failed' }, 'with wait a failed stop answers at once');
+  fail = false;
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 's1')), { ok: true });
+  assert.equal(ptyCalls(s, 'kill').length, 3, 'every later Stop tried again');
+  assert.equal(reports().length, 2, 'one report for each kill that failed');
+});
+
+test('main-pty-wiring: stop-session with { wait: true } answers ended true once the terminal has ended and ended false once 8 s have passed', async () => {
+  const env = spawnFakes();
+  const h = boot({ blocks: ['resolve', 'open', 'stop'], globals: env.globals });
+  const a = h.window();
+  const turn = () => new Promise((resolve) => setImmediate(resolve));
+  const ends = await start(h, env, a, 's-ends');
+  let first = 'no answer yet';
+  let again = 'no answer yet';
+  // Promise.resolve: before the handler is async its answer is a plain object, and the test must fail on its own assertion.
+  const one = Promise.resolve(h.invoke('stop-session', a, 's-ends', { wait: true })).then((answer) => { first = plain(answer); });
+  const two = Promise.resolve(h.invoke('stop-session', a, 's-ends', { wait: true })).then((answer) => { again = plain(answer); });
+  h.timers.advance(3000);
+  await turn();
+  assert.equal(first, 'no answer yet', 'the answer waits for the end');
+  assert.deepEqual(ends.proc.calls.map((c) => c.op), ['kill'], 'two waiting Stops, one kill');
+  ends.proc.emitExit({ exitCode: 0 });
+  await one;
+  await two;
+  assert.deepEqual(first, { ok: true, ended: true });
+  assert.deepEqual(again, { ok: true, ended: true });
+
+  await start(h, env, a, 's-stalls');
+  let late = 'no answer yet';
+  const three = Promise.resolve(h.invoke('stop-session', a, 's-stalls', { wait: true })).then((answer) => { late = plain(answer); });
+  h.timers.advance(7999);
+  await turn();
+  assert.equal(late, 'no answer yet');
+  h.timers.advance(1);
+  await three;
+  assert.deepEqual(late, { ok: true, ended: false });
+});
+
+test('main-pty-wiring: a stop that has not ended the terminal after 8 s is reported once as stop-stalled, under the id the record lives under at that moment', async () => {
+  const env = spawnFakes();
+  const h = boot({ blocks: ['resolve', 'open', 'stop'], globals: env.globals });
+  const a = h.window();
+  const reports = () => plain(h.globals.mainFaults.calls.filter((c) => c[0] === 'report'));
+  const s = h.session('s1', { owner: a });
+  await h.invoke('stop-session', a, 's1');
+  h.timers.advance(7999);
+  assert.deepEqual(reports(), []);
+  rekeyByHand(h, 's1', 's1-new'); // a /clear inside the 8 s
+  h.timers.advance(1);
+  assert.deepEqual(reports(), [['report', 'stop-stalled', null, { sessionId: 's1-new' }]]);
+  assert.equal(h.log.lines.filter((l) => l.startsWith('warn [stop] session=s1 has not ended 8000 ms after the kill')).length, 1, 'the line names the id the kill was sent under: the known limit of the id in the guard\'s lines');
+  h.timers.advance(60000);
+  assert.equal(reports().length, 1, 'reported once');
+  assert.equal(ptyCalls(s, 'kill').length, 1, 'the stall kills nothing by itself');
+  // A terminal that ends inside the 8 s is not reported.
+  const quick = await start(h, env, a, 's-quick');
+  await h.invoke('stop-session', a, 's-quick');
+  h.timers.advance(3000);
+  quick.proc.emitExit({ exitCode: 0 });
+  h.timers.advance(60000);
+  assert.equal(reports().length, 1);
+});
+
+test('main-pty-wiring: get-stop-states lists the live sessions whose stop stalled or failed, and nothing else', async () => {
+  const h = boot({ blocks: ['stop', 'stopStates'] });
+  const a = h.window();
+  h.session('s-running', { owner: a });
+  h.session('s-stopping', { owner: a });
+  h.session('s-stalled', { owner: a });
+  killThrows(h.session('s-failed', { owner: a }));
+  const gone = h.session('s-stalled-then-ended', { owner: a });
+  assert.deepEqual(await stopStates(h, a), []);
+  await h.invoke('stop-session', a, 's-stalled');
+  await h.invoke('stop-session', a, 's-stalled-then-ended');
+  h.timers.advance(8000);
+  await h.invoke('stop-session', a, 's-stopping');
+  await h.invoke('stop-session', a, 's-failed');
+  const answer = await h.invoke('get-stop-states', NO_WINDOW);
+  assert.equal(Array.isArray(answer), true, 'an array of ids, like get-active-sessions');
+  assert.deepEqual([...answer], ['s-stalled', 's-failed', 's-stalled-then-ended']);
+  gone.exited = true;
+  assert.deepEqual(await stopStates(h, a), ['s-stalled', 's-failed'], 'it goes when the session ends');
+  await h.invoke('stop-session', a, 's-stalled');
+  assert.deepEqual(await stopStates(h, a), ['s-stalled', 's-failed'], 'one more Stop does not take it off: that needs the end');
+});
+
+test('main-pty-wiring: a size held for a terminal that is stopped before its first output is never applied', async () => {
+  const env = spawnFakes();
+  const h = boot({ blocks: ['resolve', 'open', 'resize', 'stop'], globals: env.globals });
+  const a = h.window();
+  const { proc } = await start(h, env, a, 's1');
+  h.emit('terminal-resize', a, 's1', 120, 30);
+  await h.invoke('stop-session', a, 's1');
+  proc.emitData('late');
+  h.timers.advance(1000);
+  assert.deepEqual(proc.calls.map((c) => c.op), ['kill']);
+});
+
+test("main-pty-wiring: preload forwards stopSession's second argument and has getStopStates", () => {
+  const src = sourceOf('preload.js');
+  assert.ok(src.includes("  stopSession: (id, options) => ipcRenderer.invoke('stop-session', id, options),"));
+  assert.ok(src.includes("  getStopStates: () => ipcRenderer.invoke('get-stop-states'),"));
+  assert.equal(src.split("'stop-session'").length - 1, 1);
+  assert.equal(src.split("'get-stop-states'").length - 1, 1);
+});
+
+test('main-pty-wiring: a window that opens a session again while its Stop is pending or has stalled reaches no pty, and the session stays listed as not stopped', async () => {
+  const env = spawnFakes();
+  const h = boot({ blocks: ['resolve', 'open', 'resize', 'input', 'stop', 'stopStates'], globals: env.globals });
+  const a = h.window();
+  const b = h.window();
+  const s = h.session('s1', { owner: a, outputBuffer: ['shown'] });
+  h.emit('terminal-resize', a, 's1', 120, 30);
+  h.timers.advance(1000);
+  const BEFORE_THE_STOP = ['resize', 'resize', 'resize']; // the size and its two nudge steps
+  assert.deepEqual(s.pty.calls.map((c) => c.op), BEFORE_THE_STOP);
+  assert.equal(s.firstResize, false, 'the nudge is used up');
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 's1')), { ok: true });
+  // Window b opens it: a reattach. The same happens when window a reloads.
+  const answer = await h.invoke('open-terminal', b, 's1', PROJECT, false);
+  assert.equal(answer.ok, true);
+  assert.equal(answer.reattached, true, 'the reattach answers as today');
+  assert.equal(h.registry.ownerId('s1'), b.id);
+  assert.equal(s.firstResize, true, 'and re-arms the nudge as today');
+  h.emit('terminal-resize', b, 's1', 100, 40);
+  h.emit('terminal-input', b, 's1', 'x');
+  h.timers.advance(1000);
+  assert.deepEqual(s.pty.calls.map((c) => c.op), [...BEFORE_THE_STOP, 'kill'], "the new owner's size, both nudge steps and its typing reach no pty");
+  assert.deepEqual(await stopStates(h, b), [], 'a Stop that is still pending is not listed');
+  h.timers.advance(7000);
+  assert.deepEqual(await stopStates(h, b), ['s1'], 'listed from the 8 s mark on');
+  // Opened once more after the stall: still nothing reaches the pty, still listed.
+  assert.equal((await h.invoke('open-terminal', a, 's1', PROJECT, false)).reattached, true);
+  h.emit('terminal-resize', a, 's1', 90, 30);
+  h.emit('terminal-input', a, 's1', 'y');
+  h.timers.advance(1000);
+  assert.deepEqual(s.pty.calls.map((c) => c.op), [...BEFORE_THE_STOP, 'kill']);
+  assert.deepEqual(await stopStates(h, a), ['s1']);
+  assert.equal(env.spawned.length, 0, 'no process was started');
+});
+
+test('main-pty-wiring: a stop that stalled, then one more Stop with wait, then a late end: listed from the 8 s mark until the exit, the waiting Stop answers ended true, and the stall is reported once', async () => {
+  const env = spawnFakes();
+  const h = boot({ blocks: ['resolve', 'open', 'stop', 'stopStates'], globals: env.globals });
+  const a = h.window();
+  const reports = () => plain(h.globals.mainFaults.calls.filter((c) => c[0] === 'report'));
+  const { proc } = await start(h, env, a, 's1');
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 's1')), { ok: true });
+  h.timers.advance(8000);
+  assert.deepEqual(await stopStates(h, a), ['s1']);
+  assert.deepEqual(reports(), [['report', 'stop-stalled', null, { sessionId: 's1' }]]);
+  let late = 'no answer yet';
+  const waiting = Promise.resolve(h.invoke('stop-session', a, 's1', { wait: true })).then((answer) => { late = plain(answer); });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(late, 'no answer yet', 'the second Stop waits for its own kill');
+  assert.deepEqual(proc.calls.map((c) => c.op), ['kill', 'kill'], 'after the stall one more kill went out');
+  h.timers.advance(5000);
+  assert.deepEqual(await stopStates(h, a), ['s1'], 'still listed until the terminal ends');
+  const from = a.sent.length;
+  proc.emitExit({ exitCode: 0 });
+  await waiting;
+  assert.deepEqual(late, { ok: true, ended: true });
+  assert.deepEqual(got(a, 'process-exited', from), [['process-exited', 's1', 0, undefined, true]], 'the exit report carries the stop flag');
+  assert.deepEqual(await stopStates(h, a), [], 'not listed once it has ended');
+  h.timers.advance(60000);
+  assert.equal(reports().length, 1, 'one stop-stalled report, not two: the second kill ended the terminal inside its own 8 s');
+});
+
+test('main-pty-wiring: a Stop from one window and, inside the 8 s, a Stop and an Archive from another window send no second kill; the Archive is answered by the first kill, and after the stall one more Stop sends one more', async () => {
+  const h = boot({ blocks: ['stop'] });
+  const a = h.window();
+  const b = h.window();
+  const s = h.session('s1', { owner: a });
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 's1')), { ok: true });
+  h.timers.advance(2000);
+  let archive = 'no answer yet';
+  const waiting = Promise.resolve(h.invoke('stop-session', b, 's1', { wait: true })).then((answer) => { archive = plain(answer); });
+  h.timers.advance(5999);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(archive, 'no answer yet', "the other window's Archive waits on the first kill");
+  assert.deepEqual(plain(await h.invoke('stop-session', b, 's1')), { ok: true }, "the other window's plain Stop answers ok");
+  assert.equal(ptyCalls(s, 'kill').length, 1, 'one kill for the three calls');
+  h.timers.advance(1);
+  await waiting;
+  assert.deepEqual(archive, { ok: true, ended: false }, 'answered at the 8 s mark of the FIRST kill, not 8 s after its own call');
+  assert.equal(ptyCalls(s, 'kill').length, 1);
+  assert.deepEqual(plain(await h.invoke('stop-session', b, 's1')), { ok: true });
+  assert.equal(ptyCalls(s, 'kill').length, 2, 'after the stall one more Stop sends one more kill');
+});
+
+test('main-pty-wiring: a re-key between a Stop with wait and the end: the waiting answer still comes, the exit is reported once under the new id, and a Stop under either id in between sends no second kill', async () => {
+  const env = spawnFakes();
+  const h = boot({ blocks: ['resolve', 'open', 'stop'], globals: env.globals });
+  const a = h.window();
+  const b = h.window();
+  const { proc } = await start(h, env, a, 'id-1');
+  let first = 'no answer yet';
+  const waiting = Promise.resolve(h.invoke('stop-session', a, 'id-1', { wait: true })).then((answer) => { first = plain(answer); });
+  h.timers.advance(2000);
+  rekeyByHand(h, 'id-1', 'id-2'); // a fork, a plan-accept or a /clear inside the 8 s
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 'id-1')), { ok: false, error: 'not running', rekeyedTo: 'id-2' });
+  assert.deepEqual(plain(await h.invoke('stop-session', a, 'id-2')), { ok: true }, 'what the page then sends under the new id');
+  assert.deepEqual(proc.calls.map((c) => c.op), ['kill'], 'neither sends a second kill');
+  assert.equal(first, 'no answer yet');
+  const from = [a.sent.length, b.sent.length];
+  proc.emitExit({ exitCode: 0 });
+  await waiting;
+  assert.deepEqual(first, { ok: true, ended: true }, 'the wait is on the record, not on the id');
+  for (const [win, start] of [[a, from[0]], [b, from[1]]]) {
+    assert.deepEqual(got(win, 'process-exited', start), [['process-exited', 'id-2', 0, undefined, true]], 'one report, under the new id');
+  }
+  assert.equal(h.activeSessions.size, 0);
+});
+
+test("main-pty-wiring: once another terminal is started under an id, that id no longer leads to the terminal that moved on: a Stop under it stops the second terminal while it runs, and after its end answers 'not running' with no rekeyedTo and stops nothing else", async () => {
+  const two = async () => {
+    const env = spawnFakes();
+    const h = boot({ blocks: ['resolve', 'open', 'stop'], globals: env.globals });
+    const a = h.window();
+    const b = h.window();
+    const first = await start(h, env, a, 'id-1');
+    rekeyByHand(h, 'id-1', 'id-2');
+    // Until another terminal is started under it, the old id is answered with where it went.
+    assert.deepEqual(plain(await h.invoke('stop-session', a, 'id-1')), { ok: false, error: 'not running', rekeyedTo: 'id-2' });
+    const second = await start(h, env, b, 'id-1', { isNew: false });
+    return { h, a, b, first, second };
+  };
+  // The Stop comes BEFORE the second terminal has ended: the terminal stored under the id is stopped.
+  {
+    const { h, b, first, second } = await two();
+    assert.equal((first.session.priorIds || []).includes('id-1'), false, 'from the start of the second terminal on, id-1 is no earlier id of the first');
+    assert.deepEqual(plain(await h.invoke('stop-session', b, 'id-1')), { ok: true });
+    assert.deepEqual(second.proc.calls.map((c) => c.op), ['kill']);
+    second.proc.emitExit({ exitCode: 0 });
+    // One more Stop under the same id, sent late: a second click on the row, confirmed after the end.
+    assert.deepEqual(plain(await h.invoke('stop-session', b, 'id-1')), { ok: false, error: 'not running' }, 'no rekeyedTo');
+    assert.deepEqual(first.proc.calls, [], 'the terminal that moved on is not stopped');
+    assert.notEqual(first.session.stopRequested, true);
+  }
+  // The Stop comes only AFTER the second terminal has ended by itself.
+  {
+    const { h, a, b, first, second } = await two();
+    second.proc.emitExit({ exitCode: 0 });
+    for (const win of [a, b]) {
+      assert.deepEqual(plain(await h.invoke('stop-session', win, 'id-1')), { ok: false, error: 'not running' }, 'no rekeyedTo');
+      assert.deepEqual(plain(await h.invoke('stop-session', win, 'id-1', { wait: true })), { ok: false, error: 'not running' }, 'the same with wait');
+    }
+    h.timers.advance(60000);
+    assert.deepEqual(first.proc.calls, [], 'nothing else is stopped, then or later');
+    assert.notEqual(first.session.stopRequested, true);
+    assert.equal(h.activeSessions.get('id-2'), first.session, 'the terminal that moved on is still on the list');
+    assert.deepEqual(plain(await h.invoke('stop-session', a, 'id-2')), { ok: true }, 'under its own id it is stopped as ever');
+    assert.deepEqual(first.proc.calls.map((c) => c.op), ['kill']);
+  }
+});
+
+test("main-pty-wiring: a pty error on a live terminal is reported as 'pty' under the id it has now; after a Stop or an exit it is not reported", async () => {
+  const env = spawnFakes();
+  const spawn = env.globals.pty.spawn;
+  // The fake process of spawnFakes, with the 'error' event a real terminal has.
+  const pty = {
+    spawn(...args) {
+      const proc = spawn(...args);
+      const listeners = [];
+      proc.on = (name, fn) => { if (name === 'error') listeners.push(fn); };
+      proc.emitError = (error) => { for (const fn of listeners) fn(error); };
+      return proc;
+    },
+  };
+  const h = boot({ blocks: ['resolve', 'open', 'stop'], globals: { ...env.globals, pty } });
+  const a = h.window();
+  const reports = () => h.globals.mainFaults.calls.filter((c) => c[0] === 'report');
+  const { proc } = await start(h, env, a, 's1');
+  proc.emitError(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+  assert.equal(reports().length, 0, 'a broken pipe on a live terminal is not news');
+  const fault = Object.assign(new Error('read EIO'), { code: 'EIO' });
+  proc.emitError(fault);
+  rekeyByHand(h, 's1', 's1-new');
+  proc.emitError(fault);
+  assert.deepEqual(reports().map((c) => [c[1], c[2], plain(c[3])]), [['pty', fault, { sessionId: 's1' }], ['pty', fault, { sessionId: 's1-new' }]]);
+  await h.invoke('stop-session', a, 's1-new');
+  proc.emitError(fault);
+  proc.emitExit({ exitCode: 0 });
+  proc.emitError(fault);
+  assert.equal(reports().length, 2, 'after a Stop or an exit a socket error is a debug line');
+});
+
+test("main-pty-wiring: a plain terminal's start-up line goes through the guard: once at 300 ms for a live terminal, never for one that was stopped or has ended", async () => {
+  const env = spawnFakes();
+  const h = boot({ blocks: ['resolve', 'open', 'stop'], globals: env.globals });
+  const a = h.window();
+  const live = await start(h, env, a, 't-live', { options: { type: 'terminal' } });
+  const stopped = await start(h, env, a, 't-stopped', { options: { type: 'terminal' } });
+  const ended = await start(h, env, a, 't-ended', { options: { type: 'terminal' } });
+  const claude = await start(h, env, a, 's1');
+  h.timers.advance(100);
+  await h.invoke('stop-session', a, 't-stopped');
+  ended.proc.emitExit({ exitCode: 0 });
+  h.timers.advance(199);
+  assert.deepEqual(live.proc.calls, [], 'nothing at 299 ms');
+  h.timers.advance(1);
+  assert.equal(live.proc.calls.length, 1);
+  assert.equal(live.proc.calls[0].op, 'write');
+  assert.ok(live.proc.calls[0].data.startsWith('claude() {'), 'the shell function');
+  assert.ok(live.proc.calls[0].data.endsWith(' clear\n'), 'then clear');
+  h.timers.advance(60000);
+  assert.equal(live.proc.calls.length, 1, 'once');
+  assert.deepEqual(stopped.proc.calls.map((c) => c.op), ['kill'], 'nothing is typed into a stopping terminal');
+  assert.deepEqual(ended.proc.calls, [], 'nor into one that has ended');
+  assert.deepEqual(claude.proc.calls, [], 'a Claude session gets no start-up line');
+});
+
+test('main-pty-wiring: delete-track and before-quit kill through the guard: no second kill from delete-track for a session whose Stop was sent, and a failed kill is logged under its tag with the session id', async () => {
+  const fakes = trackFakes();
+  const h = boot({ blocks: ['stop', 'guarded', 'deleteTrack'], globals: fakes.globals });
+  const a = h.window();
+  const stopping = h.session('s-stopping', { owner: a, trackId: 'track-1' });
+  const failing = killThrows(h.session('s-throws', { trackId: 'track-1' }));
+  await h.invoke('stop-session', a, 's-stopping');
+  assert.equal((await h.invoke('delete-track', a, 'track-1', { archiveSessions: true })).ok, true);
+  assert.equal(ptyCalls(stopping, 'kill').length, 1, 'its Stop was sent: delete-track sends no second kill');
+  assert.equal(ptyCalls(failing, 'kill').length, 1);
+  assert.equal(failing.stopRequested, true);
+  const tagged = h.log.lines.filter((l) => l.includes('[delete-track]'));
+  assert.equal(tagged.length, 1, 'one line, for the kill that failed');
+  assert.match(tagged[0], /^error \[delete-track\] session=s-throws kill failed: the pty is closed/);
+  // A kill that throws inside delete-track is reported like a failed Stop (Jason's answer CK-B).
+  assert.deepEqual(h.globals.mainFaults.calls.filter((c) => c[0] === 'report').map((c) => [c[1], c[2].message, plain(c[3])]), [['stop-failed', 'the pty is closed', { sessionId: 's-throws' }]], 'one stop-failed report, with the session id, for the kill that threw; none for the session whose Stop went through');
+
+  const q = quitFakes();
+  const atQuit = boot({ blocks: ['resize', 'beforeQuit'], globals: q.globals });
+  const b = atQuit.window();
+  q.session(atQuit, 's-bad', { killFails: true });
+  const ok = q.session(atQuit, 's-ok', { owner: b });
+  q.quit();
+  const quitLines = atQuit.log.lines.filter((l) => l.includes('[quit]'));
+  assert.equal(quitLines.length, 1);
+  assert.match(quitLines[0], /^error \[quit\] session=s-bad kill failed: the pty is closed/);
+  atQuit.emit('terminal-resize', b, 's-ok', 100, 40);
+  atQuit.timers.advance(1000);
+  assert.deepEqual(ok.pty.calls.map((c) => c.op), ['kill'], "after quit's kill a late resize reaches no pty");
+});
+
+test("main-pty-wiring: main.js has no direct '.pty.resize(', '.pty.write(' or '.pty.kill(' left", () => {
+  const src = sourceOf('main.js');
+  // Also the start-up line's old form, ptyProcess.write(: there is no exception.
+  const direct = src.match(/\b(?:pty|ptyProcess)\s*\.\s*(?:write|resize|kill)\s*\(/g) || [];
+  assert.deepEqual(direct, [], 'every terminal write, resize and kill goes through ptyGuard, in comments too');
+  for (const call of ['ptyGuard.write(', 'ptyGuard.resize(', 'ptyGuard.kill(']) assert.ok(src.includes(call), call);
+  assert.equal(src.includes('_isDisposed'), false, "the start-up line asks the guard, not a field the terminal object does not have");
 });
