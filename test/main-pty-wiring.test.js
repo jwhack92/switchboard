@@ -166,6 +166,15 @@ function boot({ blocks = [], globals = {}, modules = {} } = {}) {
   const registry = registryModule.exports;
   registry.init({ log }); // as main.js does right after resolveLiveSession
 
+  // The crash guard's fault list, as a fake that only notes its calls: the real
+  // module writes a file and has its own tests (test/main-faults.test.js).
+  const mainFaultCalls = [];
+  const mainFaults = {
+    calls: mainFaultCalls,
+    flush(...args) { mainFaultCalls.push(['flush', ...args]); },
+    report(...args) { mainFaultCalls.push(['report', ...args]); },
+  };
+
   // Everything a block of main.js may name. A fix that makes the handlers
   // name something new (the crash guard's ptyGuard, say) adds it HERE, once.
   const shared = {
@@ -175,6 +184,7 @@ function boot({ blocks = [], globals = {}, modules = {} } = {}) {
     // open-terminal's reattach path
     setMcpWindow: (id, win) => { mcpWindows.push([id, win]); },
     panelPaths: { watchWindow: (win) => win },
+    mainFaults,
     ...globals,
   };
   for (const name of blocks) {
@@ -2285,4 +2295,19 @@ test('main pty wiring (pin): an adopt of a session that is gone answers exited, 
     }
     nothingStarted(env);
   });
+});
+
+test('main pty wiring: before-quit writes the pending fault counts first (mainFaults.flush), before any other step', () => {
+  const q = quitFakes();
+  const seen = [];
+  const first = q.globals.shutdownAllMcp;
+  let h = null;
+  q.globals.shutdownAllMcp = () => { seen.push(h.globals.mainFaults.calls.map((c) => c[0])); return first(); };
+  h = boot({ blocks: ['beforeQuit'], globals: q.globals });
+  const session = q.session(h, 's1', { owner: h.window() });
+  q.quit();
+  assert.deepEqual(seen, [['flush']], 'flushed before the first shutdown step');
+  assert.deepEqual(h.globals.mainFaults.calls, [['flush']], 'once, with no argument');
+  assert.deepEqual(q.steps, [...BEFORE_THE_KILLS, 'kill s1', ...AFTER_THE_KILLS]);
+  assert.equal(session.pty.calls.length, 1);
 });

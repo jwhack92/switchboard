@@ -56,6 +56,28 @@ for (const stream of [process.stdout, process.stderr]) {
 
 try { require('electron-reloader')(module, { watchRenderer: true }); } catch {};
 
+// The crash guard's fault list (main-faults.js): what the main process does
+// with an error nobody caught, the fault file beside the log, and a line for
+// every way the app can exit. Loaded on this side of the reloader line on
+// purpose, so a change to it needs an app restart. The app can run without it:
+// hence the guarded require and a stand-in with the same method names. `clear`
+// is not asked of the module until the commit that adds the notice.
+const MAIN_FAULTS_METHODS = ['report', 'list', 'dismiss', 'clear', 'noteWindow', 'noteMainLoaded', 'noteExitPath', 'flush',
+  'installBreadcrumbs', 'installListeners', 'logFile'];
+let mainFaults;
+try {
+  mainFaults = require('./main-faults').createMainFaults({ log, app, dialog, broadcast: registry.broadcast });
+  for (const name of MAIN_FAULTS_METHODS) {
+    if (name !== 'clear' && typeof mainFaults[name] !== 'function') throw new Error('main-faults.js has no ' + name + '()');
+  }
+} catch (err) {
+  try { log.error('[main-fault] load failed', err); } catch {}
+  mainFaults = {};
+  for (const name of MAIN_FAULTS_METHODS) mainFaults[name] = () => undefined;
+  mainFaults.list = () => [];
+}
+mainFaults.installBreadcrumbs(process, app);
+
 // Environment for PTY children — Electron internals stripped, inherited Claude
 // Code session markers stripped, and a UTF-8 LC_CTYPE guaranteed when the
 // parent handed us no locale. See pty-env.js for why each of those matters;
@@ -367,6 +389,8 @@ function createWindow(opts = {}) {
       if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch(() => {});
     }
   });
+  // The crash guard needs to know when a window has finished loading, and when Windows ends the session.
+  mainFaults.noteWindow(win);
   // Override window.open so xterm WebLinksAddon's default handler (which does
   // window.open() then sets location.href) routes through our IPC instead of
   // creating a child BrowserWindow.
@@ -970,6 +994,25 @@ ipcMain.handle('diag-open-folder', async () => {
 });
 
 ipcMain.handle('diag-dir', () => DIAG_DIR);
+
+// --- IPC: main faults ---
+// The list lives in the main process, so a window that is reloaded gets it
+// again by asking.
+ipcMain.handle('get-main-faults', () => mainFaults.list());
+ipcMain.handle('dismiss-main-fault', (_event, id) => {
+  mainFaults.dismiss(id);
+  return { ok: true };
+});
+ipcMain.handle('open-main-log', () => {
+  try {
+    const file = mainFaults.logFile();
+    if (!file) return { ok: false, error: 'no fault file' };
+    shell.showItemInFolder(file);
+    return { ok: true, dir: path.dirname(file) };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message) };
+  }
+});
 
 // --- IPC: MCP bridge ---
 ipcMain.on('mcp-diff-response', (_event, sessionId, diffId, action, editedContent) => {
@@ -2752,6 +2795,8 @@ ipcMain.handle('updater-download', () => {
 });
 ipcMain.handle('updater-install', () => {
   if (!autoUpdater) return;
+  // A line in the fault file, so an exit that follows is known to be the updater's.
+  mainFaults.noteExitPath('updater-install');
   autoUpdater.quitAndInstall();
 });
 
@@ -2928,6 +2973,9 @@ function startScheduleTicker() {
 // launch quits immediately; the first brings its window to the front.
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
+  // This process is a second app instance that lost the single-instance lock and quits at once. The mark keeps
+  // the next start from taking its few lines in the fault file for the previous run.
+  mainFaults.noteExitPath('second-instance');
   app.quit();
 } else {
   // Focus the existing window when a second launch is attempted.
@@ -3155,6 +3203,8 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  // The pending fault counts are written first. No try: no entry point of main-faults throws.
+  mainFaults.flush();
   // Shut down all MCP servers
   shutdownAllMcp();
 
@@ -3218,3 +3268,6 @@ app.on('will-quit', () => {
   closeDb();
   try { tokenUsage.close(); } catch {}
 });
+
+// The last statement of the file: from here on a fault no longer means the start failed while main.js was loading.
+mainFaults.noteMainLoaded();
