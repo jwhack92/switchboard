@@ -8,7 +8,7 @@
 // showSession (terminal-manager.js), confirmAndStopSession, pollActiveSessions,
 // showNewSessionPopover, openSettingsViewer, showResumeSessionDialog,
 // showJsonlViewer, forkSession, openSession, loadProjects, markUnread,
-// clearUnread, refreshSidebar (app.js/dialogs.js)
+// clearUnread, refreshSidebar, stopSessionForArchive (app.js/dialogs.js)
 
 // A session counts as running while its PTY is alive, or while it's pending —
 // a just-launched session has no PTY in activePtyIds until the next poll. A
@@ -562,15 +562,7 @@ function rebindSidebarEvents(projects) {
         const shortName = shortProjectPath(project.projectPath);
         const question = archiveQuestion(sessions, `Archive all ${sessions.length} session${sessions.length > 1 ? 's' : ''} in ${shortName}?`);
         if (!await confirmDialog(question.message, { confirm: 'Archive', danger: question.danger })) return;
-        for (const s of sessions) {
-          if (activePtyIds.has(s.sessionId)) {
-            await window.api.stopSession(s.sessionId);
-          }
-          await window.api.archiveSession(s.sessionId, 1);
-          s.archived = 1;
-        }
-        pollActiveSessions();
-        loadProjects();
+        await archiveSessionList(sessions);
       };
     }
     header.onclick = (e) => {
@@ -616,16 +608,7 @@ function rebindSidebarEvents(projects) {
         e.stopPropagation();
         const group = header.parentElement;
         const sessionItems = group.querySelectorAll('.session-item');
-        for (const item of sessionItems) {
-          const sid = item.dataset.sessionId;
-          const session = sessionMap.get(sid);
-          if (!session || session.archived) continue;
-          if (activePtyIds.has(sid)) await window.api.stopSession(sid);
-          await window.api.archiveSession(sid, 1);
-          session.archived = 1;
-        }
-        pollActiveSessions();
-        loadProjects();
+        await archiveSessionList([...sessionItems].map((item) => sessionMap.get(item.dataset.sessionId)));
       };
     }
     header.onclick = (e) => {
@@ -668,15 +651,7 @@ function rebindSidebarEvents(projects) {
         if (sessions.length === 0) return;
         const question = archiveQuestion(sessions, `Archive all ${sessions.length} older session${sessions.length > 1 ? 's' : ''}?`);
         if (!await confirmDialog(question.message, { confirm: 'Archive', danger: question.danger })) return;
-        for (const session of sessions) {
-          if (activePtyIds.has(session.sessionId)) {
-            await window.api.stopSession(session.sessionId);
-          }
-          await window.api.archiveSession(session.sessionId, 1);
-          session.archived = 1;
-        }
-        pollActiveSessions();
-        loadProjects();
+        await archiveSessionList(sessions);
       };
     }
   });
@@ -799,8 +774,9 @@ function rebindSidebarEvents(projects) {
         e.stopPropagation();
         const newVal = session.archived ? 0 : 1;
         if (newVal && activePtyIds.has(session.sessionId)) {
-          await window.api.stopSession(session.sessionId);
+          const mayArchive = typeof stopSessionForArchive === 'function' && await stopSessionForArchive(session.sessionId);
           pollActiveSessions();
+          if (!mayArchive) return;
         }
         await window.api.archiveSession(session.sessionId, newVal);
         session.archived = newVal;
@@ -818,6 +794,25 @@ function rebindSidebarEvents(projects) {
       saveExpandedSlugs();
     }
   }
+}
+
+async function archiveSessionList(sessions) {
+  for (const session of sessions) {
+    if (!session || session.archived) continue;
+    if (activePtyIds.has(session.sessionId)) {
+      const mayArchive = typeof stopSessionForArchive === 'function' && await stopSessionForArchive(session.sessionId);
+      if (!mayArchive) continue;
+    }
+    try {
+      await window.api.archiveSession(session.sessionId, 1);
+    } catch (err) {
+      console.error('[archive] not archived:', session.sessionId, err);
+      continue;
+    }
+    session.archived = 1;
+  }
+  pollActiveSessions();
+  loadProjects();
 }
 
 function buildSessionItem(session) {

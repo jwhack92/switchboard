@@ -1,11 +1,14 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { cut, load } = require('../test-support/source-cut');
+const fs = require('node:fs');
+const path = require('node:path');
 
-// What the window does with the answer of a Stop: three pins, written before
-// the crash guard's page commit changes the callers of window.api.stopSession.
+// What the window does with the answer of a Stop.
 //
-// Today seven places in the window call stopSession and none reads its answer:
+// Since the crash guard's page commit seven places in the window go through
+// stopSessionPlain and stopSessionForArchive of public/app.js, the only code
+// that makes the stop call:
 //   public/app.js            confirmAndStopSession (the Stop button and its box)
 //   public/sidebar.js        four Archive handlers, bound by rebindSidebarEvents
 //   public/projects-view.js  toggleArchiveSession, and stopRunningWork ("stop
@@ -14,8 +17,9 @@ const { cut, load } = require('../test-support/source-cut');
 // and run against fakes. No line numbers: the markers are a function's first
 // line or a comment line.
 //
-// The first pin holds on both sides of the fix. The other two pin today's
-// behaviour, fault included, and say so in the line above them.
+// The first test is a pin that held on both sides of that commit. The second
+// and third were pins of the behaviour before it and were rewritten by it. The
+// tests after them were written with it.
 
 /** What a promise rejected with, or null when it resolved. */
 async function rejection(promise) {
@@ -99,6 +103,22 @@ function paneState(page) {
 }
 const PANE_CLEARED = { shown: [null], header: 'none', placeholder: '' };
 const PANE_UNTOUCHED = { shown: [], header: '', placeholder: 'none' };
+
+/**
+ * The two stop helpers alone. replies: what main answers, one function per call,
+ * in order (a function that throws rejects the call); a call with no reply left is
+ * answered with nothing. calls: every stop call as its arguments.
+ *   api   window.api, when the test wants one without the stop call
+ */
+function bootHelpers(replies, api) {
+  const calls = [];
+  const stopSession = async (...args) => {
+    calls.push(args.map((arg) => (arg && typeof arg === 'object' ? { ...arg } : arg)));
+    return replies.length ? replies.shift()() : undefined;
+  };
+  const ctx = load(STOP_FLOW, { file: 'public/app.js', globals: { window: { api: api || { stopSession } } } });
+  return { ctx, calls };
+}
 
 /**
  * The order of a Stop that main answered, whichever session is on screen:
@@ -190,12 +210,21 @@ test("stop answer (pin): after a yes the id leaves the running set, the pane cle
 const SIDEBAR_ARCHIVE = cut('public/sidebar.js', 'function archiveQuestion(sessions, lead) {', 'function buildSessionItem(session) {');
 const PROJECTS_ARCHIVE = cut('public/projects-view.js', 'async function toggleArchiveSession(session) {', '/** The J row:');
 
-/** The answers a stop call can come back with. Today no Archive path reads any of them. */
+/**
+ * What main can answer a stop, and what the two stop helpers of public/app.js make of it:
+ *   stopped      stopSessionPlain: the session counts as stopped
+ *   mayArchive   stopSessionForArchive: the session may be archived
+ * 'ok' alone is a main process that does not wait for the end (today's).
+ */
 const STOP_ANSWERS = [
-  ['ok', () => ({ ok: true })],
-  ["'not running'", () => ({ ok: false, error: 'not running' })],
-  ["'stop failed'", () => ({ ok: false, error: 'stop failed' })],
-  ['nothing', () => undefined],
+  ['ok', () => ({ ok: true }), { stopped: true, mayArchive: true }],
+  ['ok and ended', () => ({ ok: true, ended: true }), { stopped: true, mayArchive: true }],
+  ['ok and not ended', () => ({ ok: true, ended: false }), { stopped: true, mayArchive: false }],
+  ["'not running'", () => ({ ok: false, error: 'not running' }), { stopped: true, mayArchive: true }],
+  ["'stop failed'", () => ({ ok: false, error: 'stop failed' }), { stopped: false, mayArchive: false }],
+  ['an error the page does not know', () => ({ ok: false, error: 'busy' }), { stopped: false, mayArchive: false }],
+  ['nothing', () => undefined, { stopped: false, mayArchive: false }],
+  ['null', () => null, { stopped: false, mayArchive: false }],
 ];
 
 /** Five sessions in list order: two running, two not, one archived already. */
@@ -236,7 +265,10 @@ function archiveWorld({ running = ['run1', 'run2'], stop = () => ({ ok: true }),
     },
     pollActiveSessions: () => { log.push('poll'); },
     loadProjects: () => { log.push('reload'); },
+    console: { calls: [], error(...args) { this.calls.push(args); } },
   };
+  // The real helper, cut out of public/app.js, on this world's window; undefined until the helper exists.
+  globals.stopSessionForArchive = load(STOP_FLOW, { file: 'public/app.js', globals: { window: globals.window } }).stopSessionForArchive;
   return { log, stopCalls, activePtyIds, globals };
 }
 
@@ -369,42 +401,57 @@ function assertOtherListsUntouched(page) {
   assert.deepEqual(OUTSIDE.filter((id) => page.activePtyIds.has(id)), ['x-run', 'y-run'], 'the running sessions of the other lists are still in the running set');
 }
 
-// PIN, changed on purpose by the crash guard's page commit: a running session is archived only once it has ended or was not running, and is skipped (left unarchived) when it has not ended or the stop failed.
-test("stop answer (pin, changed on purpose by the crash guard's page commit): each of the five Archive paths stops a running session and then archives it at once; a stop call that rejects leaves it unarchived", async (t) => {
+// PIN 16, changed on purpose by the crash guard's page commit. Formerly: "stop answer (pin, changed on purpose by the crash guard's page commit): each of the five Archive paths stops a running session and then archives it at once; a stop call that rejects leaves it unarchived". A running session is archived only when stopSessionForArchive allows it; before, it was archived the moment its stop was sent.
+test('stop answer: each of the five Archive paths archives a running session only once it has ended or was not running, and skips it when it has not ended, the stop failed or the stop call rejected', async (t) => {
   for (const path of LIST_PATHS) {
-    for (const [said, answer] of STOP_ANSWERS) {
-      await t.test(`${path.name}, stop answers ${said}: each running session is stopped and archived at once, the others are archived without a stop`, async () => {
+    for (const [said, answer, { mayArchive }] of STOP_ANSWERS) {
+      await t.test(`${path.name}, stop answers ${said}: each running session is ${mayArchive ? 'archived after its stop' : 'left unarchived'}, the others are archived without a stop`, async () => {
         const page = bootSidebar({ list: path.list, stop: answer });
         await path.run(page);
-        // Only the clicked list: the two other lists hold x-run, x-idle, y-run and y-idle.
         assert.deepEqual(page.log, [
           ...(path.asks ? ['ask'] : []),
-          'stop run1', 'archive run1 1 (still in the running set)',
+          'stop run1', ...(mayArchive ? ['archive run1 1 (still in the running set)'] : []),
           'archive idle1 1',
-          // done1 is archived already: it is not in the list. Neither is the unknown row.
-          'stop run2', 'archive run2 1 (still in the running set)',
+          'stop run2', ...(mayArchive ? ['archive run2 1 (still in the running set)'] : []),
           'archive idle2 1',
           'poll', 'reload',
         ]);
-        // The id alone: no second argument asks main to wait for the end.
-        assert.deepEqual(page.stopCalls, [['run1'], ['run2']]);
-        assert.equal(archivedMarks(page), 'run1=1 idle1=1 done1=1 run2=1 idle2=1');
+        // Each stop asks main to wait for the end; the options object is made inside the cut block, so it is spread.
+        assert.deepEqual(page.stopCalls.map(([id, options]) => [id, { ...options }]), [['run1', { wait: true }], ['run2', { wait: true }]]);
+        assert.equal(archivedMarks(page), mayArchive ? 'run1=1 idle1=1 done1=1 run2=1 idle2=1' : 'run1=0 idle1=1 done1=1 run2=0 idle2=1');
         assertOtherListsUntouched(page);
       });
     }
 
-    await t.test(`${path.name}: a stop call that rejects leaves that session and every later one unarchived, and the list is not reloaded`, async () => {
+    await t.test(`${path.name}: a stop call that rejects leaves that session unarchived; the rest of the list is archived and the list is refreshed`, async () => {
       const refused = new Error('the kill threw');
       const page = bootSidebar({ list: path.list, stop: (id) => { if (id === 'run2') throw refused; return { ok: true }; } });
-      assert.equal(await rejection(path.run(page)), refused, 'the click handler rejects with what the stop call rejected with');
+      assert.equal(await rejection(path.run(page)), null, 'the click handler does not reject');
       assert.deepEqual(page.log, [
         ...(path.asks ? ['ask'] : []),
         'stop run1', 'archive run1 1 (still in the running set)',
         'archive idle1 1',
         'stop run2',
+        'archive idle2 1',
+        'poll', 'reload',
       ]);
-      assert.equal(archivedMarks(page), 'run1=1 idle1=1 done1=1 run2=0 idle2=0');
+      assert.equal(archivedMarks(page), 'run1=1 idle1=1 done1=1 run2=0 idle2=1');
       assertOtherListsUntouched(page);
+    });
+
+    await t.test(`${path.name}: a running session that main says moved to a new id is archived, and no stop goes to the new id`, async () => {
+      const page = bootSidebar({ list: path.list, stop: (id) => (id === 'run1' ? { ok: false, error: 'not running', rekeyedTo: 'run1-new' } : { ok: true, ended: true }) });
+      await path.run(page);
+      assert.deepEqual(page.log, [
+        ...(path.asks ? ['ask'] : []),
+        'stop run1', 'archive run1 1 (still in the running set)',
+        'archive idle1 1',
+        'stop run2', 'archive run2 1 (still in the running set)',
+        'archive idle2 1',
+        'poll', 'reload',
+      ]);
+      assert.deepEqual(page.stopCalls.map((args) => args[0]), ['run1', 'run2']);
+      assert.equal(archivedMarks(page), 'run1=1 idle1=1 done1=1 run2=1 idle2=1');
     });
 
     if (path.asks) {
@@ -419,13 +466,15 @@ test("stop answer (pin, changed on purpose by the crash guard's page commit): ea
   }
 
   for (const path of ONE_PATHS) {
-    for (const [said, answer] of STOP_ANSWERS) {
-      await t.test(`${path.name}, stop answers ${said}: a running session is stopped and archived at once`, async () => {
+    for (const [said, answer, { mayArchive }] of STOP_ANSWERS) {
+      await t.test(`${path.name}, stop answers ${said}: a running session is ${mayArchive ? 'archived after its stop' : 'left unarchived, and the list is not reloaded'}`, async () => {
         const page = path.boot({ stop: answer });
         await path.run(page, 'run1');
-        assert.deepEqual(page.log, ['stop run1', 'poll', 'archive run1 1 (still in the running set)', ...path.after('run1'), 'reload']);
-        assert.deepEqual(page.stopCalls, [['run1']]);
-        assert.equal(archivedMarks(page), 'run1=1 idle1=0 done1=1 run2=0 idle2=0');
+        assert.deepEqual(page.log, mayArchive
+          ? ['stop run1', 'poll', 'archive run1 1 (still in the running set)', ...path.after('run1'), 'reload']
+          : ['stop run1', 'poll']);
+        assert.deepEqual(page.stopCalls.map(([id, options]) => [id, { ...options }]), [['run1', { wait: true }]]);
+        assert.equal(archivedMarks(page), mayArchive ? 'run1=1 idle1=0 done1=1 run2=0 idle2=0' : 'run1=0 idle1=0 done1=1 run2=0 idle2=0');
       });
     }
 
@@ -443,12 +492,19 @@ test("stop answer (pin, changed on purpose by the crash guard's page commit): ea
       assert.equal(archivedMarks(page), 'run1=0 idle1=0 done1=0 run2=0 idle2=0');
     });
 
-    await t.test(`${path.name}: a stop call that rejects leaves the session unarchived, and the list is not reloaded`, async () => {
+    await t.test(`${path.name}: a stop call that rejects leaves the session unarchived, and the click does not fail`, async () => {
       const refused = new Error('the kill threw');
       const page = path.boot({ stop: () => { throw refused; } });
-      assert.equal(await rejection(path.run(page, 'run1')), refused);
-      assert.deepEqual(page.log, ['stop run1']);
+      assert.equal(await rejection(path.run(page, 'run1')), null);
+      assert.deepEqual(page.log, ['stop run1', 'poll']);
       assert.equal(archivedMarks(page), 'run1=0 idle1=0 done1=1 run2=0 idle2=0');
+    });
+
+    await t.test(`${path.name}: a running session that main says moved to a new id is archived, and no stop goes to the new id`, async () => {
+      const page = path.boot({ stop: () => ({ ok: false, error: 'not running', rekeyedTo: 'run1-new' }) });
+      await path.run(page, 'run1');
+      assert.deepEqual(page.log, ['stop run1', 'poll', 'archive run1 1 (still in the running set)', ...path.after('run1'), 'reload']);
+      assert.deepEqual(page.stopCalls.map((args) => args[0]), ['run1']);
     });
 
     await t.test(`${path.name}: an archive call that rejects leaves the session's own mark as it was, and the list is not reloaded`, async () => {
@@ -534,6 +590,8 @@ function bootStopWork({ running = [], busy = [], stop = () => ({ ok: true }), st
       sessionBusyState: new Map(busy.map((id) => [id, true])),
     },
   });
+  // The real helper, cut out of public/app.js, on this context's window; undefined until the helper exists.
+  ctx.stopSessionPlain = load(STOP_FLOW, { file: 'public/app.js', globals: { window: ctx.window } }).stopSessionPlain;
   return { ctx, log, asked, inSetAtStop, inSetAtAnswer, calls, activePtyIds };
 }
 
@@ -551,8 +609,8 @@ const WORK_PROJECT = () => ({
   ],
 });
 
-// PIN, changed on purpose by the crash guard's page commit: a session leaves the running set only when it was stopped (ok, or 'not running'); after a failed or rejected stop it stays in it.
-test("stop answer (pin, changed on purpose by the crash guard's page commit): 'stop all work' stops every session and task of a project and takes each session off the running set whatever the answer", async (t) => {
+// PIN 17, changed on purpose by the crash guard's page commit. Formerly: "stop answer (pin, changed on purpose by the crash guard's page commit): 'stop all work' stops every session and task of a project and takes each session off the running set whatever the answer". A session leaves the running set only when stopSessionPlain says it was stopped; before, it left the set whatever the answer.
+test("stop answer: 'stop all work' stops every session and task of a project and takes a session off the running set only when it was stopped", async (t) => {
   await t.test("'Stop all' stops every running session of the project, then every running task, and nothing else", async () => {
     // s2 and the lint task are not running; 'elsewhere' runs in another project.
     // s3 is in the middle of a turn; so is s2, which does not count because it is not running.
@@ -601,19 +659,19 @@ test("stop answer (pin, changed on purpose by the crash guard's page commit): 's
     assert.deepEqual([...page.activePtyIds], ['s1', 's3']);
   });
 
-  for (const [said, answer] of STOP_ANSWERS) {
-    await t.test(`a stop that answers ${said} takes the session off the running set, after the answer`, async () => {
+  for (const [said, answer, { stopped }] of STOP_ANSWERS) {
+    await t.test(`a stop that answers ${said} ${stopped ? 'takes the session off the running set, after the answer' : 'leaves the session in the running set'}`, async () => {
       const page = bootStopWork({ running: ['s1', 'elsewhere'], stop: answer });
       await page.ctx.stopRunningWork({ sessions: [{ sessionId: 's1' }], tasks: [] });
       assert.deepEqual(page.log, ['stop s1', 'poll']);
       assert.equal(page.inSetAtStop.s1, true, 'still in the running set while the stop call is out');
       assert.equal(page.inSetAtAnswer.s1, true, 'and still in it at the moment main answers');
       assert.deepEqual(page.calls, ONE_CALL_AT_A_TIME, 'the running set is asked for after main answered');
-      assert.deepEqual([...page.activePtyIds], ['elsewhere']);
+      assert.deepEqual([...page.activePtyIds], stopped ? ['elsewhere'] : ['s1', 'elsewhere']);
     });
   }
 
-  await t.test('a stop call that rejects takes the session off the running set too, and the rest is still stopped', async () => {
+  await t.test('a stop call that rejects leaves that session in the running set, and the rest is still stopped', async () => {
     const page = bootStopWork({
       running: ['s1', 's2', 's3'],
       stop: (id) => { if (id === 's1') throw new Error('the kill threw'); return { ok: true }; },
@@ -621,9 +679,20 @@ test("stop answer (pin, changed on purpose by the crash guard's page commit): 's
     const work = WORK_PROJECT();
     assert.equal(await rejection(page.ctx.stopRunningWork({ sessions: work.sessions, tasks: work.tasks })), null, 'the rejection is swallowed');
     assert.deepEqual(page.log, ['stop s1', 'stop s2', 'stop s3', 'task C:\\work\\api build', 'task C:\\work\\api lint', 'task C:\\work\\web serve', 'poll']);
-    assert.deepEqual([...page.activePtyIds], []);
+    assert.deepEqual([...page.activePtyIds], ['s1']);
     assert.deepEqual(page.inSetAtAnswer, { s1: true, s2: true, s3: true }, 'each id leaves the running set only after its own call came back, the rejected one included');
     assert.deepEqual(page.calls, ONE_CALL_AT_A_TIME, 'each call is waited for, the rejected one included');
+  });
+
+  await t.test('a session that main says moved to a new id is stopped once under the new id, and its old id leaves the running set', async () => {
+    const page = bootStopWork({
+      running: ['s1', 's1-new', 'elsewhere'],
+      stop: (id) => (id === 's1' ? { ok: false, error: 'not running', rekeyedTo: 's1-new' } : { ok: true }),
+    });
+    await page.ctx.stopRunningWork({ sessions: [{ sessionId: 's1' }], tasks: [] });
+    assert.deepEqual(page.log, ['stop s1', 'stop s1-new', 'poll']);
+    assert.deepEqual([...page.activePtyIds], ['s1-new', 'elsewhere'], 'the old id left; the new one is the running check\'s to drop');
+    assert.deepEqual(page.calls, ONE_CALL_AT_A_TIME);
   });
 
   await t.test('a task stop that rejects does not keep the next task from being stopped', async () => {
@@ -633,4 +702,245 @@ test("stop answer (pin, changed on purpose by the crash guard's page commit): 's
     assert.deepEqual(page.log, ['task C:\\work\\api build', 'task C:\\work\\api lint', 'task C:\\work\\web serve', 'poll']);
     assert.deepEqual(page.calls, ONE_CALL_AT_A_TIME, 'each task stop is waited for, the rejected one included');
   });
+});
+
+// Jason's answer D-E (a), 2026-10-06: written before the fix and shown to fail on the code before it.
+test("stop answer: after 'stop failed', no answer or a rejected stop call the Stop button leaves the running set and the pane as they are and redraws the sidebar once", async (t) => {
+  const NOT_STOPPED = [
+    ["'stop failed'", () => ({ ok: false, error: 'stop failed' })],
+    // bootStop resolves its promise with the answer, and its parameter default turns a plain
+    // undefined into { ok: true }. So 'nothing' is a thenable that resolves with undefined, and
+    // a thenable that rejects makes the stop call reject, as it does when the kill throws in
+    // today's main process.
+    ['nothing', () => ({ then(resolve) { resolve(undefined); } })],
+    ['a rejected call', () => ({ then(resolve, reject) { reject(new Error('the kill threw')); } })],
+  ];
+  for (const [said, answer] of NOT_STOPPED) {
+    await t.test(`main answers ${said}`, async () => {
+      const page = bootStop({ answer: answer() });
+      assert.equal(await rejection(page.ctx.confirmAndStopSession('sess1')), null, 'the click does not fail');
+      assert.deepEqual(page.seen.stops.map((args) => args[0]), ['sess1'], 'one stop call, and no second try');
+      assert.deepEqual(page.seen.atAnswer, { inSet: true, shown: [], redraws: 0 }, 'nothing changed before main answered');
+      assert.equal(page.activePtyIds.has('sess1'), true, 'the id stays in the running set');
+      assert.deepEqual(paneState(page), PANE_UNTOUCHED, 'the terminal stays on screen');
+      assert.equal(page.seen.redraws, 1, 'the sidebar is redrawn once');
+      assert.deepEqual(page.seen.atRedraw, [{ inSet: true, shown: [] }], 'that redraw sees the session still running and still on screen');
+    });
+  }
+});
+
+// Jason's answer D-E (b), 2026-10-06: written before the fix and shown to fail on the code before it.
+test('stop answer: a list Archive loop whose archive call rejects leaves that session unarchived, goes on to the next session and still refreshes the list', async (t) => {
+  for (const path of LIST_PATHS) {
+    await t.test(`${path.name}: the archive call of one session rejects`, async () => {
+      const refused = new Error('the database is locked');
+      const page = bootSidebar({ list: path.list, archive: (id) => { if (id === 'idle1') throw refused; } });
+      assert.equal(await rejection(path.run(page)), null, 'the click handler does not reject');
+      assert.deepEqual(page.log, [
+        ...(path.asks ? ['ask'] : []),
+        'stop run1', 'archive run1 1 (still in the running set)',
+        'archive idle1 1',
+        'stop run2', 'archive run2 1 (still in the running set)',
+        'archive idle2 1',
+        'poll', 'reload',
+      ]);
+      assert.equal(archivedMarks(page), 'run1=1 idle1=0 done1=1 run2=1 idle2=1');
+      assert.deepEqual(page.globals.console.calls, [['[archive] not archived:', 'idle1', refused]], 'the rejection is written to the console, once, with the full id');
+      assertOtherListsUntouched(page);
+    });
+
+    await t.test(`${path.name}: the archive call of a stopped session rejects and a later session has not ended: neither is archived, the rest is`, async () => {
+      const refused = new Error('the database is locked');
+      const page = bootSidebar({
+        list: path.list,
+        stop: (id) => ({ ok: true, ended: id === 'run1' }),
+        archive: (id) => { if (id === 'run1') throw refused; },
+      });
+      assert.equal(await rejection(path.run(page)), null, 'the click handler does not reject');
+      assert.deepEqual(page.log, [
+        ...(path.asks ? ['ask'] : []),
+        'stop run1', 'archive run1 1 (still in the running set)',
+        'archive idle1 1',
+        'stop run2',
+        'archive idle2 1',
+        'poll', 'reload',
+      ]);
+      assert.equal(archivedMarks(page), 'run1=0 idle1=1 done1=1 run2=0 idle2=1', 'no session is marked archived while it still runs or after its archive call failed');
+      assertOtherListsUntouched(page);
+    });
+  }
+});
+
+test('stop answer: the two stop helpers read every answer of a stop, and a rejected call counts as not stopped', async (t) => {
+  for (const [said, answer, { stopped, mayArchive }] of STOP_ANSWERS) {
+    await t.test(`main answers ${said}`, async () => {
+      const plain = bootHelpers([answer]);
+      assert.equal(await plain.ctx.stopSessionPlain('sess1'), stopped);
+      assert.deepEqual(plain.calls, [['sess1']], 'the plain helper sends the id alone, once');
+      const waiting = bootHelpers([answer]);
+      assert.equal(await waiting.ctx.stopSessionForArchive('sess1'), mayArchive);
+      assert.deepEqual(waiting.calls, [['sess1', { wait: true }]], 'the waiting helper asks main to wait, once');
+    });
+  }
+
+  const thrown = () => { throw new Error('the kill threw'); };
+  await t.test('the stop call rejects: not stopped, not to be archived, and neither helper rejects', async () => {
+    const plain = bootHelpers([thrown]);
+    assert.equal(await plain.ctx.stopSessionPlain('sess1'), false);
+    assert.deepEqual(plain.calls, [['sess1']], 'no second try after a rejection');
+    const waiting = bootHelpers([thrown]);
+    assert.equal(await waiting.ctx.stopSessionForArchive('sess1'), false);
+    assert.deepEqual(waiting.calls, [['sess1', { wait: true }]]);
+  });
+
+  await t.test('window.api has no stop call: both helpers answer false and neither rejects', async () => {
+    assert.equal(await bootHelpers([], {}).ctx.stopSessionPlain('sess1'), false);
+    assert.equal(await bootHelpers([], {}).ctx.stopSessionForArchive('sess1'), false);
+  });
+
+  const moved = (to) => () => ({ ok: false, error: 'not running', rekeyedTo: to });
+  const SECOND_TRIES = [
+    ['ok', () => ({ ok: true }), true],
+    ["'not running'", () => ({ ok: false, error: 'not running' }), true],
+    ["'stop failed'", () => ({ ok: false, error: 'stop failed' }), false],
+    ['that it moved again', moved('sess1-newer'), false],
+    ['nothing', () => undefined, false],
+    ['a rejection', thrown, false],
+  ];
+  for (const [said, second, stopped] of SECOND_TRIES) {
+    await t.test(`main says the id moved and answers the second try with ${said}: the plain helper tries once under the new id and never a third time`, async () => {
+      const h = bootHelpers([moved('sess1-new'), second]);
+      assert.equal(await h.ctx.stopSessionPlain('sess1'), stopped);
+      assert.deepEqual(h.calls, [['sess1'], ['sess1-new']]);
+    });
+  }
+
+  await t.test('main says the id moved: the waiting helper says it may be archived and sends no second stop', async () => {
+    const h = bootHelpers([moved('sess1-new')]);
+    assert.equal(await h.ctx.stopSessionForArchive('sess1'), true);
+    assert.deepEqual(h.calls, [['sess1', { wait: true }]]);
+  });
+});
+
+test('stop answer: no file under public/ names stopSession outside the two stop helpers, and a call of a helper from another file is guarded', () => {
+  const PUBLIC = path.join(__dirname, '..', 'public');
+  const read = (file) => fs.readFileSync(path.join(PUBLIC, file), 'utf8');
+  const count = (text, re) => (text.match(re) || []).length;
+  // The word alone: stopSessionPlain and stopSessionForArchive do not match.
+  const WORD = /(?<![\w$])stopSession(?![\w$])/g;
+
+  // The helpers stand inside the cut, plain first, and nothing but them names the word.
+  const helpers = cut('public/app.js', 'async function stopSessionPlain(sessionId) {', '// --- Terminal header controls ---');
+  assert.ok(STOP_FLOW.endsWith(helpers), 'both helpers stand between confirmAndStopSession and the header-controls comment');
+  assert.ok(helpers.includes('async function stopSessionForArchive(sessionId) {'), 'the waiting helper comes after the plain one');
+  assert.ok(count(helpers, WORD) >= 2, 'the scan sees the two calls at all');
+  const named = {};
+  for (const file of fs.readdirSync(PUBLIC).filter((f) => /\.(js|html)$/.test(f))) {
+    const n = count(read(file), WORD);
+    if (n) named[file] = n;
+  }
+  assert.deepEqual(named, { 'app.js': count(helpers, WORD) }, 'comments count too: outside the helpers write "the stop call"');
+
+  // Another file reaches a helper only behind a typeof guard, where a missing helper counts as not stopped.
+  const CALLS = [
+    ['sidebar.js', 'stopSessionForArchive', 2],
+    ['projects-view.js', 'stopSessionForArchive', 1],
+    ['projects-view.js', 'stopSessionPlain', 1],
+  ];
+  for (const [file, name, calls] of CALLS) {
+    const src = read(file);
+    assert.equal(count(src, new RegExp(`(?<![\\w$])${name}\\(`, 'g')), calls, `${file}: calls of ${name}`);
+    assert.equal(count(src, new RegExp(`typeof ${name} === 'function' && await ${name}\\(`, 'g')), calls, `${file}: each call of ${name} is guarded, spelled just so`);
+  }
+});
+
+test('stop answer: the Stop button stops the id its session has when the box is answered, tries once more under the id main says it moved to, and closes the view of the id the session has after the answer', async (t) => {
+  /** What the re-key listener of public/app.js does to the page: the same record under the new id. */
+  const rekeyPage = (page, oldId, newId) => {
+    const entry = page.ctx.openSessions.get(oldId);
+    entry.session.sessionId = newId;
+    page.ctx.openSessions.delete(oldId);
+    page.ctx.openSessions.set(newId, entry);
+    if (page.ctx.activeSessionId === oldId) page.ctx.activeSessionId = newId;
+    page.activePtyIds.add(newId);
+  };
+  const MOVED = () => ({ ok: false, error: 'not running', rekeyedTo: 'sess1-new' });
+  /** Main answers the stop calls in order; the returned list holds the ids they were sent under. */
+  const answerInOrder = (page, replies) => {
+    const sent = [];
+    page.ctx.window.api.stopSession = async (...args) => { sent.push(args[0]); return replies.shift()(); };
+    return sent;
+  };
+
+  await t.test('the session moved to a new id while the box was open: the stop goes to the new id, and that id leaves the running set and the pane', async () => {
+    const page = bootStop();
+    page.ctx.confirmDialog = async () => { rekeyPage(page, 'sess1', 'sess1-new'); return true; };
+    await page.ctx.confirmAndStopSession('sess1');
+    assert.deepEqual(page.seen.stops.map((args) => args[0]), ['sess1-new']);
+    assert.equal(page.activePtyIds.has('sess1-new'), false, 'the id the session has now left the running set');
+    assert.equal(page.activePtyIds.has('sess1'), true, 'the old id is left to the running check');
+    assert.deepEqual(paneState(page), PANE_CLEARED);
+    assert.equal(page.seen.redraws, 1);
+  });
+
+  await t.test('main says the id moved: one more stop under the new id, and the view closes', async () => {
+    const page = bootStop();
+    const sent = answerInOrder(page, [MOVED, () => ({ ok: true })]);
+    await page.ctx.confirmAndStopSession('sess1');
+    assert.deepEqual(sent, ['sess1', 'sess1-new']);
+    assert.equal(page.activePtyIds.has('sess1'), false, 'the id the session has on this page left the running set');
+    assert.deepEqual(paneState(page), PANE_CLEARED);
+    assert.equal(page.seen.redraws, 1);
+  });
+
+  await t.test('the move reaches the page while the stop call is out: the id the session has after the answer leaves the running set and the pane', async () => {
+    const page = bootStop();
+    const sent = answerInOrder(page, [() => { rekeyPage(page, 'sess1', 'sess1-new'); return MOVED(); }, () => ({ ok: true })]);
+    await page.ctx.confirmAndStopSession('sess1');
+    assert.deepEqual(sent, ['sess1', 'sess1-new']);
+    assert.equal(page.activePtyIds.has('sess1-new'), false);
+    assert.deepEqual(paneState(page), PANE_CLEARED);
+    assert.equal(page.seen.redraws, 1);
+  });
+
+  await t.test('main says the id moved and the second try fails: nothing changes but one redraw', async () => {
+    const page = bootStop();
+    const sent = answerInOrder(page, [MOVED, () => ({ ok: false, error: 'stop failed' })]);
+    await page.ctx.confirmAndStopSession('sess1');
+    assert.deepEqual(sent, ['sess1', 'sess1-new']);
+    assert.equal(page.activePtyIds.has('sess1'), true);
+    assert.deepEqual(paneState(page), PANE_UNTOUCHED);
+    assert.equal(page.seen.redraws, 1);
+  });
+
+  await t.test('the page holds no open record for the id: the id that was asked for is used throughout', async () => {
+    const page = bootStop();
+    page.ctx.openSessions.clear();
+    await page.ctx.confirmAndStopSession('sess1');
+    assert.deepEqual(page.seen.stops.map((args) => args[0]), ['sess1']);
+    assert.equal(page.activePtyIds.has('sess1'), false);
+    assert.deepEqual(paneState(page), PANE_CLEARED);
+    assert.equal(page.seen.redraws, 1);
+  });
+});
+
+// An empty list: every row of the group is archived already or unknown to the page.
+test("stop answer: a group's archive button on a group whose sessions are all archived or unknown to the page stops nothing, archives nothing, and still polls and reloads once", async () => {
+  const page = bootSidebar({ list: 'group' });
+  // run1 and run2 stay in the running set: an archived session is skipped before any stop.
+  for (const id of ['run1', 'idle1', 'run2', 'idle2']) page.session(id).archived = 1;
+  assert.equal(await rejection(page.click(page.buttons.group, 'the group archive button')), null, 'the click does not fail');
+  assert.deepEqual(page.log, ['poll', 'reload'], 'no stop call and no archive call; one poll and one reload');
+  assert.deepEqual(page.stopCalls, []);
+  assert.equal(archivedMarks(page), 'run1=1 idle1=1 done1=1 run2=1 idle2=1');
+  assertOtherListsUntouched(page);
+});
+
+test("stop answer: with the stop helper missing, 'stop all work' stops no session, takes none off the running set and still stops the tasks", async () => {
+  const page = bootStopWork({ running: ['s1', 'elsewhere'] });
+  page.ctx.stopSessionPlain = undefined;
+  const work = WORK_PROJECT();
+  assert.equal(await rejection(page.ctx.stopRunningWork({ sessions: [{ sessionId: 's1' }], tasks: work.tasks })), null);
+  assert.deepEqual(page.log, ['task C:\\work\\api build', 'task C:\\work\\api lint', 'task C:\\work\\web serve', 'poll']);
+  assert.deepEqual([...page.activePtyIds], ['s1', 'elsewhere']);
 });

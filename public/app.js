@@ -1043,15 +1043,66 @@ function dismissSession(sessionId) {
 }
 
 async function confirmAndStopSession(sessionId) {
+  // The open session's record, held across the box: a re-key rewrites its id
+  // (the session-forked listener), so the stop goes to the id it has then.
+  const held = typeof openSessions !== 'undefined' ? openSessions.get(sessionId) : undefined;
+  const currentId = () => (held && held.session && held.session.sessionId) || sessionId;
   if (!await confirmDialog('Stop this session?', { confirm: 'Stop', danger: true })) return;
-  await window.api.stopSession(sessionId);
-  activePtyIds.delete(sessionId);
-  if (!gridViewActive && activeSessionId === sessionId) {
+  if (!await stopSessionPlain(currentId())) {
+    // Not stopped: the terminal stays on screen and in the running set.
+    refreshSidebar();
+    return;
+  }
+  const id = currentId();
+  activePtyIds.delete(id);
+  if (!gridViewActive && activeSessionId === id) {
     setActiveSession(null);
     terminalHeader.style.display = 'none';
     placeholder.style.display = '';
   }
   refreshSidebar();
+}
+
+// The two functions below are the only code under public/ that makes the stop
+// call. Every other place asks one of them and gets a boolean; neither rejects.
+// What main can answer, and what each makes of it:
+//   { ok: true }                          the kill was sent: stopped. With
+//                                         { wait: true } main adds ended, true
+//                                         once the session has ended and false
+//                                         when it has not after its wait; a main
+//                                         that does not wait sends no ended,
+//                                         which counts as ended.
+//   { ok: false, error: 'not running' }   no terminal under that id: stopped,
+//                                         and it may be archived. With rekeyedTo
+//                                         the terminal lives on under that id.
+//   { ok: false, error: 'stop failed' }   the kill threw: not stopped.
+//   anything else, or no answer           not stopped.
+// A call that rejects counts as not stopped too: an older main rejects when the
+// kill throws.
+// On rekeyedTo the plain one tries once more under the new id: a Stop button
+// exists only on a row believed to be running, so the click meant that
+// terminal. It never tries a third time: a second move counts as not stopped.
+// The waiting one never tries again: it is for Archive, and an Archive of a
+// conversation that moved on must not kill the live terminal; the conversation
+// under the old id has none, so it may be archived.
+async function stopSessionPlain(sessionId) {
+  const ask = async (id) => {
+    try { return await window.api.stopSession(id); } catch { return null; }
+  };
+  const movedTo = (answer) => (answer && answer.error === 'not running' && typeof answer.rekeyedTo === 'string' && answer.rekeyedTo) || null;
+  const stopped = (answer) => !!answer && (answer.ok === true || (answer.error === 'not running' && !movedTo(answer)));
+  const first = await ask(sessionId);
+  const newId = movedTo(first);
+  if (!newId) return stopped(first);
+  return stopped(await ask(newId));
+}
+
+async function stopSessionForArchive(sessionId) {
+  let answer;
+  try { answer = await window.api.stopSession(sessionId, { wait: true }); } catch { return false; }
+  if (!answer) return false;
+  if (answer.ok === true) return answer.ended !== false;
+  return answer.error === 'not running';
 }
 
 // --- Terminal header controls ---

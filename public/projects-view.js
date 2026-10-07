@@ -36,7 +36,8 @@
 //   launchNewSession, openSession, showSession, setActiveSession,
 //   pollActiveSessions, hideAllViewers, fitAndScroll, sessionEventTime,
 //   isDismissibleSession, dismissSession, clearUnread, markUnread,
-//   confirmAndStopSession, showJsonlViewer, showResumeSessionDialog
+//   confirmAndStopSession, showJsonlViewer, showResumeSessionDialog,
+//   stopSessionForArchive, stopSessionPlain
 // utils.js: escapeHtml, formatDate, cleanDisplayName, shortProjectPath
 // icons.js: ICONS.claude, ICONS.terminal, ICONS.archive, ICONS.gear,
 //   ICONS.launchConfig, ICONS.markRead, ICONS.markUnread
@@ -572,10 +573,17 @@ function sessionTitle(session) {
   return cleanDisplayName(session.name || session.aiTitle || session.summary) || 'New session';
 }
 
-/** Archive or unarchive a session. Archiving a live session stops it first. */
+/**
+ * Archive or unarchive a session. Archiving a live session stops it first; a
+ * session that has not ended, or whose stop failed, is left as it is.
+ */
 async function toggleArchiveSession(session) {
   const newVal = session.archived ? 0 : 1;
-  if (newVal && activePtyIds.has(session.sessionId)) { await window.api.stopSession(session.sessionId); pollActiveSessions(); }
+  if (newVal && activePtyIds.has(session.sessionId)) {
+    const mayArchive = typeof stopSessionForArchive === 'function' && await stopSessionForArchive(session.sessionId);
+    pollActiveSessions();
+    if (!mayArchive) return;
+  }
   await window.api.archiveSession(session.sessionId, newVal);
   if (newVal) forgetTerminalHistory(session.sessionId);
   session.archived = newVal;
@@ -3462,8 +3470,8 @@ function anyRunningWork(running) {
 /** Stop every running session and task in one project. */
 async function stopRunningWork(running) {
   for (const session of running.sessions) {
-    try { await window.api.stopSession(session.sessionId); } catch {}
-    activePtyIds.delete(session.sessionId);
+    const stopped = typeof stopSessionPlain === 'function' && await stopSessionPlain(session.sessionId);
+    if (stopped) activePtyIds.delete(session.sessionId);
   }
   for (const task of running.tasks) {
     try { await window.api.stopTask(task.projectPath, task.label); } catch {}
