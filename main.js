@@ -61,7 +61,10 @@ try { require('electron-reloader')(module, { watchRenderer: true }); } catch {};
 // every way the app can exit. Loaded on this side of the reloader line on
 // purpose, so a change to it needs an app restart. The app can run without it:
 // hence the guarded require and a stand-in with the same method names. `clear`
-// is not asked of the module until the commit that adds the notice.
+// is not asked of the module until the commit that adds the notice. From here
+// on an uncaught error and an unhandled rejection are handled by main-faults,
+// and Electron's own box no longer shows for them; errors raised by the
+// requires above the reloader line still get Electron's box.
 const MAIN_FAULTS_METHODS = ['report', 'list', 'dismiss', 'clear', 'noteWindow', 'noteMainLoaded', 'noteExitPath', 'flush',
   'installBreadcrumbs', 'installListeners', 'logFile'];
 let mainFaults;
@@ -77,6 +80,7 @@ try {
   mainFaults.list = () => [];
 }
 mainFaults.installBreadcrumbs(process, app);
+mainFaults.installListeners(process);
 
 // Environment for PTY children — Electron internals stripped, inherited Claude
 // Code session markers stripped, and a UTF-8 LC_CTYPE guaranteed when the

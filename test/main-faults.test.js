@@ -699,3 +699,51 @@ test('main-faults wiring (main.js): the app instance that loses the single-insta
   h.faults.noteExitPath('second-instance');
   assert.deepEqual(h.lines().filter((l) => l.ev === 'crumb').map((l) => l.name), ['second-instance']);
 });
+
+test('main-faults wiring (main.js): the two process listeners are installed directly after the breadcrumbs, and an uncaught error then reaches the list and no box', () => {
+  const TITLE = 'A JavaScript error occurred in the main process';
+
+  // main.js's own block installs them, once each, on the line after the breadcrumbs
+  let run = runRequireBlock();
+  assert.equal(run.h.proc.count('uncaughtException'), 1);
+  assert.equal(run.h.proc.count('unhandledRejection'), 1);
+  assert.equal(run.h.proc.count('exit'), 1);
+  assert.match(REQUIRE_BLOCK(), /\r?\nmainFaults\.installBreadcrumbs\(process, app\);\r?\nmainFaults\.installListeners\(process\);\r?\n/);
+  assert.equal(count('mainFaults.installListeners('), 1);
+
+  // after a window has loaded: logged with its stack, sent, listed, and no box and no exit
+  const win = run.h.win();
+  run.mainFaults.noteWindow(win);
+  win.webContents.emit('did-finish-load');
+  const err = new Error('thrown in the main process');
+  assert.doesNotThrow(() => run.h.proc.emit('uncaughtException', err, 'uncaughtException'));
+  let list = run.mainFaults.list();
+  assert.deepEqual(list.map((r) => [r.kind, r.firstLine, r.count, r.dismissed]), [['internal', 'Error: thrown in the main process', 1, false]]);
+  assert.deepEqual(run.h.sent, [['main-fault', list[0]]]);
+  assert.match(run.h.logged('error')[0][1], /^\[main-fault\] kind=internal id=\S+ origin=uncaughtException$/);
+  assert.equal(run.h.logged('error')[0][2], err.stack);
+  assert.deepEqual(run.h.dialog.boxes, []);
+  assert.deepEqual(run.h.app.calls, []);
+
+  // a promise that failed unhandled, with a reason that is no Error
+  run.h.proc.emit('unhandledRejection', 'rejected with a string', Promise.resolve());
+  list = run.mainFaults.list();
+  assert.deepEqual(list.map((r) => r.firstLine).sort(), ['Error: thrown in the main process', 'rejected with a string']);
+  assert.match(run.h.logged('error')[1][1], / origin=unhandledRejection$/);
+  assert.deepEqual(run.h.dialog.boxes, []);
+
+  // A8, live: before any window has loaded and before main.js has finished, one box and then the exit
+  run = runRequireBlock();
+  const early = new Error('thrown while main.js loads');
+  run.h.proc.emit('uncaughtException', early);
+  run.h.proc.emit('uncaughtException', new Error('and another'));
+  assert.deepEqual(run.h.dialog.boxes, [[TITLE, early.stack]]);   // this boot has no fault file, so no path under the text
+  assert.deepEqual(run.h.app.calls, [['exit', 1]]);
+  assert.equal(run.mainFaults.list().length, 2);
+
+  // a module that cannot be loaded: no listener of ours, so Electron's own box is what shows, as before
+  run = runRequireBlock({ require: () => { throw new Error('main-faults.js is gone'); } });
+  assert.equal(run.h.proc.count('uncaughtException'), 0);
+  assert.equal(run.h.proc.count('unhandledRejection'), 0);
+  assert.equal(run.h.logged('error').length, 1);
+});
