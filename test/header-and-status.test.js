@@ -824,8 +824,8 @@ test('header-and-status (pin): what the header title shows for a session started
     page.rows = () => realRow(id, { name: null, aiTitle: 'Login page fix' });
     await page.reload();
 
-    // Recorded, not asserted: a fix that makes the title follow the row
-    // changes this text on purpose. Today nothing redraws it.
+    // Recorded, not asserted. Since the small fix "the header title follows
+    // the row" the reload redraws it from the row: syncTerminalHeaderName.
     t.diagnostic(`recorded, reload with an unnamed row: header title ${JSON.stringify(page.headerName.textContent)} (the reload redraws it from the row: syncTerminalHeaderName); every write ${JSON.stringify(page.titles)}`);
 
     assert.equal(page.session(id).name, null, 'the record now says what the row says');
