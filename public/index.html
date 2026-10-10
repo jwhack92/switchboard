@@ -316,8 +316,12 @@
   <script src="tts.js"></script>
   <script src="speech.js"></script>
   <!-- Before ctx-handoff.js, whose Continue asks window.ContinueName what to
-       call the new session (and starts it unnamed if this is absent). -->
+       call the new session (and starts it unnamed if this is absent).
+       prompt-screen.js is loaded before ctx-handoff.js too, which reads the
+       session's screen through window.PromptScreen and asks first when it is
+       absent. -->
   <script src="continue-name.js"></script>
+  <script src="prompt-screen.js"></script>
   <script src="ctx-handoff.js"></script>
   <script src="app.js"></script>
 </body>

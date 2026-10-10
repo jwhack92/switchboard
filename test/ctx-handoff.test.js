@@ -18,7 +18,6 @@ const {
   REQUEST_LINE,
   WARN_AT,
   DUE_AT,
-  OVERRIDE_CONFIRM,
   OVERRIDE_TITLE,
   OVERRIDE_TITLE_UNSEEN,
   HANDOFF_NOT_LANDED,
@@ -126,6 +125,8 @@ function buttonArgs(over = {}) {
     handoffReadable: false,
     request: { phase: 'idle' },
     nowMs: 2000000,
+    // What the session's screen shows. Without it every click asks first.
+    screen: { state: 'empty', why: 'the fixture: an empty prompt' },
     ...over,
   };
 }
@@ -146,7 +147,7 @@ test('the module loads under plain Node with no window or document', () => {
 test('every name in the pure API is exported with the right type', () => {
   const mod = require(MODULE_PATH);
   for (const name of [
-    'REQUEST_LINE', 'OVERRIDE_CONFIRM', 'OVERRIDE_TITLE', 'OVERRIDE_TITLE_UNSEEN', 'HANDOFF_NOT_LANDED', 'HANDOFF_NOT_WRITTEN', 'HANDOFF_SESSION_ENDED',
+    'REQUEST_LINE', 'OVERRIDE_TITLE', 'OVERRIDE_TITLE_UNSEEN', 'HANDOFF_NOT_LANDED', 'HANDOFF_NOT_WRITTEN', 'HANDOFF_SESSION_ENDED',
   ]) {
     assert.equal(typeof mod[name], 'string', name);
   }
@@ -176,14 +177,6 @@ test('the request line carries no newline or carriage return (Enter is sent sepa
 
 test('the request line ends with the marker (the hook matches the end of the prompt only)', () => {
   assert.ok(REQUEST_LINE.endsWith('[ctx-handoff:request]'));
-});
-
-test('the override confirmation is the exact text Jason approved', () => {
-  assert.equal(
-    OVERRIDE_CONFIRM,
-    'Switchboard cannot confirm that this session is idle at its prompt. If a permission prompt or a question is open in the terminal, '
-      + 'the typed line and Enter could answer it. Type the handoff request anyway?'
-  );
 });
 
 // ── fmtTokens ───────────────────────────────────────────────────────────────
@@ -1925,6 +1918,49 @@ function emptyPromptScreen() {
   return rows;
 }
 
+// ── added with the screen check (ready state, commit 2) ────────────────────
+const { gateText, chooseHeaderNote } = require(MODULE_PATH);
+// The two asks-first reasons of today. Both carry the prefix REASON_: this file already has a top-level
+// `const NOT_ENDED` (a table of cases, further up), and a second declaration of that name stops the file from loading.
+const REASON_NOT_ENDED = 'This session has not reported the end of its turn';
+const REASON_NOT_TOLD = 'This window has seen no busy or idle event for this session since it loaded';
+const TEXT_IN_BOX = "There is text in this session's input box";
+const NO_PROMPT = "Switchboard cannot see an empty prompt on this session's screen";
+const ASKING = 'Session is asking you something';
+const ASKING_TIP = 'Session is asking you something. Answer it in the terminal first.';
+const DID_NOT_STOP_TIP = 'Session did not stop. It takes no typing. Press Stop to try once more.';
+const SWITCH_WAIT = 'Waiting for the session to confirm the Ultracode switch';
+const BOX_CANCEL_LINE = 'If the terminal is asking you something, cancel: the typed line could answer it.';
+const BOX_SENT_LINE = 'If your own text is there, it is sent together with this line.';            // T1
+const BOX_HELD_LINE = 'If your own text is there, the line is typed after it and is not sent.';    // B6, shown from task 08
+const NOT_TYPED_CHANGED = 'Not typed. The session changed while the box was open.';
+const scr = (state) => ({ state, why: 'test' });
+// The one box's text: the reason, the question, the last line.
+function boxText(reason, line, last = BOX_CANCEL_LINE) {
+  return (reason ? reason + '.\n\n' : '') + 'Type "' + line + '" into this session anyway?\n\n' + last;
+}
+// The empty prompt with these lines in the conversation above it.
+function promptScreenWith(lines) {
+  const rows = emptyPromptScreen();
+  lines.forEach((text, index) => { rows[12 + index] = text; });
+  return rows;
+}
+// The recorded question (auto mode's offer): a panel above the box, the cursor below it.
+function questionScreen() {
+  const rows = emptyPromptScreen();
+  rows[40] = PROMPT_RULE;
+  rows[41] = '  Teach auto mode about your environment?';
+  rows[43] = '  Auto mode works better when it knows your environment. Takes about a minute.';
+  rows[45] = '  ' + PROMPT_POINTER + ' 1. Yes';
+  rows[46] = '    2. Not now';
+  rows[47] = "    3. Don't show again";
+  rows[49] = '  Enter to confirm \u00b7 Esc to cancel';
+  return rows;
+}
+function showQuestion(h) { h.knobs.rows = questionScreen(); h.knobs.cursorY = 53; }
+function showEmptyPrompt(h) { h.knobs.rows = emptyPromptScreen(); h.knobs.cursorY = PROMPT_CURSOR_ROW; }
+const titleOf = (h, id) => h.byId[id].getAttribute('title');
+
 // opts: globals 'app' (default) | 'none' | 'tdz'; diagDir; storage (a Map
 // shared between two boots = a reload of one window); startMs; readCtxState
 // (true = window.api has the main-process call, answered by knobs.ctxReply);
@@ -2229,10 +2265,8 @@ test('browser: an override asks first, and "no" types nothing', async () => {
   h.knobs.confirmAnswer = false;
   await h.click('primary');
   await h.advance(5000);
-  assert.deepEqual(h.confirms, [OVERRIDE_CONFIRM]);
-  // The button says what a yes does, and is the red one: the typed line could
-  // answer a prompt that is open in the terminal.
-  assert.deepEqual(h.confirmOptions.map((o) => ({ ...o })), [{ confirm: 'Type it anyway', danger: true }]);
+  assert.deepEqual(h.confirms, [boxText(REASON_NOT_ENDED, REQUEST_LINE)]);
+  assert.deepEqual(h.confirmOptions.map((o) => ({ ...o })), [{ confirm: 'Type it anyway' }]);
   assert.deepEqual(h.sent, []);
   assert.equal(h.header().primary, 'Hand off');
 });
@@ -2319,7 +2353,7 @@ test('browser: after a reload, with no busy or idle event seen yet, the click as
   h.knobs.confirmAnswer = false;
   await h.click('primary');
   await h.advance(5000);
-  assert.deepEqual(h.confirms, [OVERRIDE_CONFIRM]);
+  assert.deepEqual(h.confirms, [boxText(REASON_NOT_TOLD, REQUEST_LINE)]);
   assert.deepEqual(h.sent, []);
 
   // OK: the same wait and re-read as any override, then the line.
@@ -3244,7 +3278,7 @@ test('browser: a sibling whose terminal did not open is not remembered', async (
 const {
   ULTRACODE_TEXT, ULTRACODE_UNKNOWN_TITLE, ULTRACODE_NOT_CONFIRMED, ULTRACODE_NO_WORKFLOWS, ULTRACODE_NO_MODEL,
   STALE_AFTER_MS,
-  typingGate, ultracodeValue, draftOpen, ultracodeModel, ultracodeQuestion, ultracodeScreen, ultracodeOutcome,
+  typingGate, ultracodeValue, draftOpen, ultracodeModel, ultracodeScreen, ultracodeOutcome,
   parseStoredUltracode, staleReading, staleTitle,
 } = require(MODULE_PATH);
 
@@ -3307,7 +3341,7 @@ test('typingGate: Hand off is exactly what the gate says, in every combination',
 });
 
 test('typingGate: no input at all is "not allowed"', () => {
-  assert.deepEqual(typingGate(), { allowed: false, override: false, why: 'Session is not running', overrideTitle: OVERRIDE_TITLE });
+  assert.deepEqual(typingGate(), { allowed: false, override: false, reason: 'Session is not running', advice: '', why: 'Session is not running', overrideTitle: OVERRIDE_TITLE });
   assert.equal(typingGate(buttonArgs()).overrideTitle, OVERRIDE_TITLE_UNSEEN, 'a turn that has ended leaves only "not told" to name');
 });
 
@@ -3398,7 +3432,9 @@ test('ultracodeModel: it asks first wherever the gate does, and the tooltip says
     assert.equal(model.enabled, true, JSON.stringify(over));
     assert.equal(model.override, true, JSON.stringify(over));
     assert.equal(model.target, 'off');
-    assert.equal(model.title, 'Ultracode is on. Click to switch it off (asks first).');
+    assert.equal(model.title, over.busyKnown === false
+      ? 'Ultracode is on. This window has seen no busy or idle event for this session since it loaded. Click to switch it off anyway (asks first).'
+      : 'Ultracode is on. This session has not reported the end of its turn. Click to switch it off anyway (asks first).');
   }
 });
 
@@ -3493,13 +3529,6 @@ test('ultracodeValue: a hook that has not looked never takes a confirmed switch 
 test('the typed texts are the exact commands, with no newline or carriage return (Enter is sent separately)', () => {
   assert.deepEqual({ ...ULTRACODE_TEXT }, { on: '/effort ultracode', off: '/effort ultracode off' });
   for (const text of Object.values(ULTRACODE_TEXT)) assert.equal(/[\r\n]/.test(text), false);
-});
-
-test('the question names the exact text and says when to cancel', () => {
-  assert.equal(ultracodeQuestion('off'),
-    'Type "/effort ultracode off" into this session?\n\n'
-    + 'Only when it is waiting at an empty prompt. If it is asking you something, or you have text typed there, cancel.');
-  assert.equal(ultracodeQuestion('on').split('\n')[0], 'Type "/effort ultracode" into this session?');
 });
 
 test('ultracodeScreen: counts the program\'s own lines, and never the typed command', () => {
@@ -3799,7 +3828,7 @@ test('browser: a plain click types the text, then Enter separately, and shows th
   await clickUltra(h);
   assert.equal(h.sent.length, 2);
 
-  h.knobs.rows = ['> /effort ultracode', '  ' + ON_LINE, ''];
+  h.knobs.rows = promptScreenWith(['> /effort ultracode', '  ' + ON_LINE]);
   await h.advance(749);
   assert.equal(ultraHeader(h).look, 'off', 'the first look is a second after the text');
   await h.advance(1);
@@ -3821,7 +3850,7 @@ test('browser: switching off types the off text and is confirmed by the off line
   const h = await bootUltra(true);
   await clickUltra(h);
   assert.deepEqual(h.sent, [[SID, '/effort ultracode off']]);
-  h.knobs.rows = ['> /effort ultracode off', '  ' + OFF_LINE];
+  h.knobs.rows = promptScreenWith(['> /effort ultracode off', '  ' + OFF_LINE]);
   // Seen at the second look, not the first: the line came late.
   await h.advance(1000);
   assert.equal(ultraHeader(h).look, 'off');
@@ -3843,7 +3872,7 @@ test('browser: a line that arrives late is still seen, up to the last look', asy
 test('browser: no confirmation after 5 s goes back to the look it had, with a note', async () => {
   const h = await bootUltra(false);
   // The line of an earlier switch is on screen already: it settles nothing.
-  h.knobs.rows = ['  ' + ON_LINE, '> something else'];
+  h.knobs.rows = promptScreenWith(['  ' + ON_LINE, '> something else']);
   await clickUltra(h);
   await h.advance(4999);
   assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
@@ -3872,7 +3901,7 @@ test('browser: after "No confirmation seen" the next click asks first, until an 
   h.knobs.confirmAnswer = false;
   await clickUltra(h);
   await h.advance(1000);
-  assert.deepEqual(h.confirms, [ultracodeQuestion('on')]);
+  assert.deepEqual(h.confirms, [boxText('', '/effort ultracode')]);
   assert.equal(h.sent.length, 2, 'not typed a second time onto the first');
   assert.equal(h.header().primaryOverride, false, 'Hand off is as it was');
   // He pressed Enter in the terminal: whatever was in the box has gone in.
@@ -3883,7 +3912,7 @@ test('browser: after "No confirmation seen" the next click asks first, until an 
   // A refusal is the program answering, so the text did go in: no draft.
   const refused = await bootUltra(false);
   await clickUltra(refused);
-  refused.knobs.rows = ['Ultracode isn\'t available on haiku'];
+  refused.knobs.rows = promptScreenWith(['Ultracode isn\'t available on haiku']);
   await refused.advance(5000);
   assert.equal(refused.header().note, ULTRACODE_NO_MODEL);
   assert.equal(ultraHeader(refused).asksFirst, false);
@@ -3893,6 +3922,8 @@ test('browser: a screen that cannot be read is never a confirmation', async () =
   const h = await bootUltra(false);
   h.run('window._openSessions = new Map()');
   await clickUltra(h);
+  assert.equal(h.confirms.length, 1, 'a screen that cannot be read asks first');
+  await h.advance(500);
   assert.deepEqual(h.sent, [[SID, '/effort ultracode']]);
   // Readable by the time of the looks, with the line on it: still nothing,
   // because nobody counted before the text was typed.
@@ -3913,6 +3944,7 @@ test('browser: a screen read as no rows, or one whose buffer throws, is not a co
     const h = await bootUltra(false);
     breakIt(h);
     await clickUltra(h);
+    await h.advance(500);
     // Readable again, with the line on it. Zero before would make this "more".
     h.run(`window._openSessions = new Map([['${SID}', { terminal: __knobs.terminal }]])`);
     h.knobs.rows = ['> /effort ultracode', ON_LINE];
@@ -3984,10 +4016,10 @@ test('browser: where Hand off asks first, so does this: the question names the t
   const h = await bootUltra(true, { reloaded: true });
   assert.equal(h.header().primaryOverride, true);
   assert.equal(ultraHeader(h).asksFirst, true);
-  assert.equal(ultraHeader(h).title, 'Ultracode is on. Click to switch it off (asks first).');
+  assert.equal(ultraHeader(h).title, 'Ultracode is on. This window has seen no busy or idle event for this session since it loaded. Click to switch it off anyway (asks first).');
   await clickUltra(h);
-  assert.deepEqual(h.confirms, [ultracodeQuestion('off')]);
-  assert.deepEqual(h.confirmOptions.map((o) => ({ ...o })), [{ confirm: 'Type it' }]);
+  assert.deepEqual(h.confirms, [boxText(REASON_NOT_TOLD, '/effort ultracode off')]);
+  assert.deepEqual(h.confirmOptions.map((o) => ({ ...o })), [{ confirm: 'Type it anyway' }]);
   assert.deepEqual(h.sent, [], 'nothing is typed in the same task as the yes');
   await h.advance(499);
   assert.deepEqual(h.sent, []);
@@ -4059,7 +4091,7 @@ test('browser: something typed by hand since the last turn, not ended with Enter
   h.knobs.confirmAnswer = false;
   await clickUltra(h);
   await h.advance(1000);
-  assert.deepEqual(h.confirms, [ultracodeQuestion('on')]);
+  assert.deepEqual(h.confirms, [boxText('', '/effort ultracode')]);
   assert.deepEqual(h.sent, []);
   // The last of it was Enter: no draft.
   h.run(`handoffNoteTyped('${SID}', true)`);
@@ -4423,11 +4455,11 @@ test('browser: a fork between the text and its Enter sends the Enter to the sess
 test('browser: once a switch is settled the later looks leave it alone', async () => {
   const h = await bootUltra(false);
   await clickUltra(h);
-  h.knobs.rows = ['> /effort ultracode', '  ' + ON_LINE];
+  h.knobs.rows = promptScreenWith(['> /effort ultracode', '  ' + ON_LINE]);
   await h.advance(1000);
   assert.equal(ultraHeader(h).look, 'on');
   // By the last look the line has gone off the top of the screen.
-  h.knobs.rows = ['a long answer', 'that pushed it off'];
+  h.knobs.rows = promptScreenWith(['a long answer', 'that pushed it off']);
   await h.advance(5000);
   assert.equal(ultraHeader(h).look, 'on');
   assert.equal(ultraHeader(h).asksFirst, false);
@@ -4462,7 +4494,7 @@ test('browser: Hand off types nothing while a switch is on its way in', async ()
   await h.click('primary');
   assert.equal(h.sent.length, 2);
   // Settled: Hand off types as it always did.
-  h.knobs.rows = ['  ' + ON_LINE];
+  h.knobs.rows = promptScreenWith(['  ' + ON_LINE]);
   await h.advance(600);
   assert.equal(ultraHeader(h).look, 'on');
   await h.click('primary');
@@ -4493,7 +4525,7 @@ test('browser: text typed ahead while the session worked is still there when the
   h.knobs.confirmAnswer = false;
   await clickUltra(h);
   await h.advance(6000);
-  assert.deepEqual(h.confirms, [ultracodeQuestion('on')]);
+  assert.deepEqual(h.confirms, [boxText('', '/effort ultracode')]);
   assert.deepEqual(h.sent, [], 'not typed onto the end of the half-written prompt');
 });
 
@@ -4841,4 +4873,637 @@ test('browser (pin): with a terminal showing an empty prompt, a plain Hand off c
     assert.equal(request.phase, 'requested');
     assert.ok(!request.unsent, 'a line whose Enter went is not on record as unsent');
   });
+});
+
+// ── the screen in the gate: pure rules ─────────────────────────────────────
+const gateFacts = (gate) => ({ allowed: gate.allowed, override: gate.override, reason: gate.reason, advice: gate.advice });
+
+test('ctx-handoff: the new pure names are exported, and the two old question texts are gone', () => {
+  const mod = require(MODULE_PATH);
+  assert.equal(typeof mod.gateText, 'function');
+  assert.equal(typeof mod.chooseHeaderNote, 'function');
+  assert.equal('OVERRIDE_CONFIRM' in mod, false);
+  assert.equal('ultracodeQuestion' in mod, false);
+});
+
+test('ctx-handoff: typingGate asks first unless the screen says empty', () => {
+  const gate = (screen) => typingGate(buttonArgs({ screen }));
+  assert.deepEqual(gateFacts(gate(scr('empty'))), { allowed: true, override: false, reason: '', advice: '' });
+  assert.deepEqual(gateFacts(gate(scr('draft'))), { allowed: true, override: true, reason: TEXT_IN_BOX, advice: '' });
+  for (const screen of [scr('unknown'), undefined, null, 'empty', {}, scr('a state of a later version')]) {
+    assert.deepEqual(gateFacts(gate(screen)), { allowed: true, override: true, reason: NO_PROMPT, advice: '' }, JSON.stringify(screen));
+  }
+  assert.deepEqual(gateFacts(gate(scr('question'))), { allowed: false, override: false, reason: ASKING, advice: 'Answer it in the terminal first.' });
+  // B3, B4 and B2 on Hand off, character for character.
+  assert.equal(buttonModel(buttonArgs({ screen: scr('draft') })).primary.title,
+    "There is text in this session's input box. Click to type the request anyway (asks first).");
+  assert.equal(buttonModel(buttonArgs({ screen: scr('unknown') })).primary.title,
+    "Switchboard cannot see an empty prompt on this session's screen. Click to type the request anyway (asks first).");
+  const asked = buttonModel(buttonArgs({ screen: scr('question') })).primary;
+  assert.deepEqual({ enabled: asked.enabled, override: asked.override, title: asked.title },
+    { enabled: false, override: false, title: 'Session is asking you something. Answer it in the terminal first.' });
+});
+
+test('ctx-handoff: typingGate names one reason, the stronger first', () => {
+  const all = { ownedElsewhere: true, didNotStop: true, pendingRow: true, busy: true, lineOnWay: true, screen: scr('question') };
+  const refusals = [
+    ['ownedElsewhere', 'Shown in another window', ''],
+    ['didNotStop', 'Session did not stop', 'It takes no typing. Press Stop to try once more.'],
+    ['pendingRow', 'Session is still starting', ''],
+    ['busy', 'Session is working', ''],
+    ['lineOnWay', 'Waiting for the session to confirm the Ultracode switch', ''],
+    ['screen', 'Session is asking you something', 'Answer it in the terminal first.'],
+  ];
+  const over = { ...all };
+  for (const [key, reason, advice] of refusals) {
+    const gate = typingGate(buttonArgs(over));
+    assert.deepEqual(gateFacts(gate), { allowed: false, override: false, reason, advice }, key);
+    assert.equal(gate.why, reason, 'the old field carries the same sentence');
+    delete over[key];
+  }
+  assert.deepEqual(gateFacts(typingGate(buttonArgs({ running: false }))), { allowed: false, override: false, reason: 'Session is not running', advice: '' });
+  // Only the boolean true counts for the two new flags.
+  for (const value of [false, undefined, null, 1, 'yes']) {
+    assert.equal(typingGate(buttonArgs({ didNotStop: value, lineOnWay: value })).allowed, true, String(value));
+  }
+  // Asks first: today's order (the turn not ended, then "not told"), then the two screen reasons.
+  const asks = [
+    [{ state: null, busyKnown: false, screen: scr('draft') }, REASON_NOT_ENDED],
+    [{ busyKnown: false, screen: scr('draft') }, REASON_NOT_TOLD],
+    [{ screen: scr('draft') }, TEXT_IN_BOX],
+    [{ screen: scr('unknown') }, NO_PROMPT],
+  ];
+  for (const [more, reason] of asks) {
+    const gate = typingGate(buttonArgs(more));
+    assert.deepEqual(gateFacts(gate), { allowed: true, override: true, reason, advice: '' }, reason);
+    assert.equal(gate.why, '');
+  }
+  // A refusal is never an asks-first.
+  assert.equal(typingGate(buttonArgs({ state: null, screen: scr('question') })).allowed, false);
+  // The two old fields keep today's values.
+  assert.equal(typingGate(buttonArgs({ state: null })).overrideTitle, OVERRIDE_TITLE);
+  assert.equal(typingGate(buttonArgs({ screen: scr('draft') })).overrideTitle, OVERRIDE_TITLE_UNSEEN);
+});
+
+test('ctx-handoff: gateText builds the tooltip, the asks-first title, the box and the note from the one reason', () => {
+  const asking = typingGate(buttonArgs({ screen: scr('question') }));
+  const working = typingGate(buttonArgs({ busy: true }));
+  const stuck = typingGate(buttonArgs({ didNotStop: true }));
+  const waiting = typingGate(buttonArgs({ lineOnWay: true }));
+  const draft = typingGate(buttonArgs({ screen: scr('draft') }));
+  const unseen = typingGate(buttonArgs({ screen: scr('unknown') }));
+  const plain = typingGate(buttonArgs());
+
+  assert.equal(gateText(asking, 'tooltip'), 'Session is asking you something. Answer it in the terminal first.');           // B2
+  assert.equal(gateText(stuck, 'tooltip'), 'Session did not stop. It takes no typing. Press Stop to try once more.');        // A12
+  assert.equal(gateText(waiting, 'tooltip'), 'Waiting for the session to confirm the Ultracode switch');                     // B12
+  assert.equal(gateText(working, 'tooltip'), 'Session is working');
+
+  const off = { prefix: 'Ultracode is off. ', action: 'Click to switch it on' };
+  const on = { prefix: 'Ultracode is on. ', action: 'Click to switch it off' };
+  assert.equal(gateText(draft, 'asks-first', off),
+    "Ultracode is off. There is text in this session's input box. Click to switch it on anyway (asks first).");             // B3
+  assert.equal(gateText(draft, 'asks-first', on),
+    "Ultracode is on. There is text in this session's input box. Click to switch it off anyway (asks first).");             // B3
+  assert.equal(gateText(unseen, 'asks-first', off),
+    "Ultracode is off. Switchboard cannot see an empty prompt on this session's screen. Click to switch it on anyway (asks first)."); // B4
+  // No reason (only the hand-typed rule asks): the title as it was built.
+  assert.equal(gateText(plain, 'asks-first', off), 'Ultracode is off. Click to switch it on (asks first).');
+
+  // B6: the reason, the question with the exact text, the last line.
+  assert.equal(gateText(draft, 'box', { line: REQUEST_LINE, hold: false }),
+    "There is text in this session's input box.\n\n"
+    + 'Type "Write the context handoff now. [ctx-handoff:request]" into this session anyway?\n\n'
+    + 'If your own text is there, it is sent together with this line.');                                                     // T1's last line
+  assert.equal(gateText(draft, 'box', { line: '/effort ultracode', hold: true }),
+    "There is text in this session's input box.\n\n"
+    + 'Type "/effort ultracode" into this session anyway?\n\n'
+    + 'If your own text is there, the line is typed after it and is not sent.');                                             // B6's last line
+  assert.equal(gateText(unseen, 'box', { line: '/effort ultracode off', hold: false }),
+    "Switchboard cannot see an empty prompt on this session's screen.\n\n"
+    + 'Type "/effort ultracode off" into this session anyway?\n\n'
+    + 'If the terminal is asking you something, cancel: the typed line could answer it.');
+  assert.equal(gateText(unseen, 'box', { line: '/effort ultracode off', hold: true }),
+    gateText(unseen, 'box', { line: '/effort ultracode off', hold: false }), 'the hold changes the text-in-the-box line only');
+  assert.equal(gateText(plain, 'box', { line: '/effort ultracode', hold: false }),
+    'Type "/effort ultracode" into this session anyway?\n\n'
+    + 'If the terminal is asking you something, cancel: the typed line could answer it.');
+
+  assert.equal(gateText(asking, 'note'), 'Not typed. Session is asking you something. Answer it in the terminal first.');    // B9
+  assert.equal(gateText(working, 'note'), 'Not typed. Session is working.');                                                 // B9
+});
+
+test("ctx-handoff: Hand off's two existing tooltips come out of the builder byte for byte", () => {
+  assert.equal(OVERRIDE_TITLE, 'This session has not reported the end of its turn. Click to type the request anyway (asks first).');
+  assert.equal(OVERRIDE_TITLE_UNSEEN, 'This window has seen no busy or idle event for this session since it loaded. Click to type the request anyway (asks first).');
+  const handOff = { prefix: '', action: 'Click to type the request' };
+  assert.equal(gateText(typingGate(buttonArgs({ state: null })), 'asks-first', handOff), OVERRIDE_TITLE);
+  assert.equal(gateText(typingGate(buttonArgs({ busyKnown: false })), 'asks-first', handOff), OVERRIDE_TITLE_UNSEEN);
+  assert.equal(buttonModel(buttonArgs({ state: null })).primary.title, OVERRIDE_TITLE);
+  assert.equal(buttonModel(buttonArgs({ busyKnown: false })).primary.title, OVERRIDE_TITLE_UNSEEN);
+  const update = buttonModel(buttonArgs({ state: writtenState(), handoffReadable: true, busyKnown: false })).update;
+  assert.equal(update.title, OVERRIDE_TITLE_UNSEEN);
+});
+
+test('ctx-handoff: Ultracode gives the reason in its asks-first title, for every reason the gate has', () => {
+  const title = (over) => ultracodeModel(ultraArgs(over)).title;
+  assert.equal(title({ state: null }),
+    'Ultracode is off. This session has not reported the end of its turn. Click to switch it on anyway (asks first).');                              // B5
+  assert.equal(title({ busyKnown: false }),
+    'Ultracode is off. This window has seen no busy or idle event for this session since it loaded. Click to switch it on anyway (asks first).');   // B5
+  assert.equal(title({ screen: scr('draft') }),
+    "Ultracode is off. There is text in this session's input box. Click to switch it on anyway (asks first).");                                     // B3
+  assert.equal(title({ screen: scr('unknown') }),
+    "Ultracode is off. Switchboard cannot see an empty prompt on this session's screen. Click to switch it on anyway (asks first).");               // B4
+  assert.equal(title({ ultracodeValue: true, screen: scr('draft') }),
+    "Ultracode is on. There is text in this session's input box. Click to switch it off anyway (asks first).");
+  assert.equal(title({}), 'Ultracode is off. Click to switch it on.');
+});
+
+test('ctx-handoff: a stop that did not finish, a question and a line on its way dim every button with one tooltip', () => {
+  const written = { state: writtenState(), handoffReadable: true };
+  for (const [over, tip] of [[{ didNotStop: true }, DID_NOT_STOP_TIP], [{ screen: scr('question') }, ASKING_TIP], [{ lineOnWay: true }, SWITCH_WAIT]]) {
+    const hand = buttonModel(buttonArgs(over)).primary;
+    const update = buttonModel(buttonArgs({ ...written, ...over })).update;
+    const ultra = ultracodeModel(ultraArgs({ ultracodeValue: true, ...over }));
+    for (const [name, part] of [['Hand off', hand], ['Update', update], ['Ultracode', ultra]]) {
+      assert.deepEqual({ enabled: part.enabled, override: part.override, title: part.title }, { enabled: false, override: false, title: tip }, name + ': ' + tip);
+    }
+    assert.equal(update.visible, true);
+  }
+});
+
+test('ctx-handoff: chooseHeaderNote shows the later of the live notes', () => {
+  const NOW = 5000000;
+  const note = (text, agoMs, open = false) => ({ text, atMs: NOW - agoMs, open });
+  assert.equal(chooseHeaderNote([], NOW), null);
+  assert.equal(chooseHeaderNote(undefined, NOW), null);
+  assert.equal(chooseHeaderNote([note('a', 1000)], NOW).text, 'a');
+  assert.equal(chooseHeaderNote([note('older', 5000), note('later', 1000)], NOW).text, 'later');
+  assert.equal(chooseHeaderNote([note('later', 1000), note('older', 5000)], NOW).text, 'later', 'whatever the order they are handed in');
+  // A note about a click lives 60 seconds.
+  assert.equal(chooseHeaderNote([note('a', 59999)], NOW).text, 'a');
+  assert.equal(chooseHeaderNote([note('a', 60000)], NOW), null);
+  // A note about a request that is still outstanding lives while it is passed in.
+  assert.equal(chooseHeaderNote([note('still out', 900000, true)], NOW).text, 'still out');
+  assert.equal(chooseHeaderNote([note('still out', 900000, true), note('click', 1000)], NOW).text, 'click');
+  assert.equal(chooseHeaderNote([note('still out', 900000, true), note('click', 60000)], NOW).text, 'still out');
+  // Nothing to show is not a note.
+  for (const bad of [note('', 10), note(null, 10), { text: 'x', open: false }, null, 'x']) {
+    assert.equal(chooseHeaderNote([bad], NOW), null, JSON.stringify(bad));
+  }
+});
+
+test('ctx-handoff: the header note of buttonModel is the chooser\'s: the later of the request note, the Continue error and the click note', () => {
+  const NOW = 2000000;
+  const timeout = { phase: 'timeout', atMs: NOW - 30000, reason: HANDOFF_NOT_LANDED };
+  const base = { nowMs: NOW, request: timeout };
+  assert.equal(buttonModel(buttonArgs(base)).note, HANDOFF_NOT_LANDED);
+  // A click note later than the request shows; one older than 60 s gives way again.
+  assert.equal(buttonModel(buttonArgs({ ...base, clickNote: 'Not typed. Session is working.', clickNoteAtMs: NOW - 1000 })).note, 'Not typed. Session is working.');
+  assert.equal(buttonModel(buttonArgs({ ...base, clickNote: 'Not typed. Session is working.', clickNoteAtMs: NOW - 60000 })).note, HANDOFF_NOT_LANDED);
+  // Of a Continue error and a click note, the later.
+  const both = (errorAgo, clickAgo) => buttonModel(buttonArgs({
+    nowMs: NOW, continueError: 'The new session could not be started.', continueErrorAtMs: NOW - errorAgo,
+    clickNote: 'No confirmation seen', clickNoteAtMs: NOW - clickAgo,
+  })).note;
+  assert.equal(both(1000, 5000), 'The new session could not be started.');
+  assert.equal(both(5000, 1000), 'No confirmation seen');
+  assert.equal(both(70000, 80000), null);
+  // A request that was typed after the Continue error is the later one.
+  assert.equal(buttonModel(buttonArgs({ nowMs: NOW, request: { phase: 'timeout', atMs: NOW - 30000, reason: HANDOFF_NOT_LANDED },
+    continueError: 'x', continueErrorAtMs: NOW - 50000 })).note, HANDOFF_NOT_LANDED);
+});
+
+test('ctx-handoff: the three buttons show the same of plain, asks first, cannot click, with the same reason (no hand-typed record in play)', () => {
+  const kind = (part) => (!part.enabled ? 'cannot' : part.override ? 'asks' : 'plain');
+  const screens = [scr('empty'), scr('draft'), scr('unknown'), scr('question'), undefined];
+  let seen = { plain: 0, asks: 0, cannot: 0 };
+  const check = (args, hand, plainTitle) => {
+    const gate = typingGate(args);
+    for (const value of [true, false]) {
+      const ultra = ultracodeModel({ ...args, ultracodeValue: value, switching: false, typed: null, headerOff: false });
+      assert.equal(kind(ultra), kind(hand));
+      const word = value ? { prefix: 'Ultracode is on. ', action: 'Click to switch it off' } : { prefix: 'Ultracode is off. ', action: 'Click to switch it on' };
+      if (kind(hand) === 'cannot') {
+        assert.equal(hand.title, gateText(gate, 'tooltip'));
+        assert.equal(ultra.title, hand.title);
+      } else if (kind(hand) === 'asks') {
+        assert.equal(hand.title, gateText(gate, 'asks-first', { prefix: '', action: 'Click to type the request' }));
+        assert.equal(ultra.title, gateText(gate, 'asks-first', word));
+        assert.ok(gate.reason.length > 0, 'an asks-first always has its reason');
+      } else {
+        assert.equal(hand.title, plainTitle);
+        assert.equal(ultra.title, word.prefix + word.action + '.');
+      }
+    }
+    seen[kind(hand)]++;
+  };
+  // Hand off and Ultracode, over every combination the gate looks at.
+  for (const base of gateCases()) {
+    if (!base.running) continue;   // Hand off is not shown for a session that is not running
+    for (const screen of screens) {
+      for (const didNotStop of [false, true]) {
+        const args = { ...base, screen, didNotStop, lineOnWay: false };
+        check(args, buttonModel(args).primary, 'Ask this session to write its context handoff');
+      }
+    }
+  }
+  // Update and Ultracode, on a session that has written a handoff.
+  for (const screen of screens) {
+    for (const over of [{}, { busy: true }, { ownedElsewhere: true }, { pendingRow: true }, { busyKnown: false }, { didNotStop: true }]) {
+      const args = buttonArgs({ state: writtenState(), handoffReadable: true, screen, lineOnWay: false, ...over });
+      const update = buttonModel(args).update;
+      assert.equal(update.visible, true);
+      check(args, update, 'Ask this session to write the handoff again');
+    }
+  }
+  assert.ok(seen.plain > 0 && seen.asks > 0 && seen.cannot > 0, 'the table reaches all three');
+
+  // The two states where they differ on purpose.
+  // (1) Ultracode's value is not known yet: Ultracode is dimmed, Hand off goes by the gate.
+  const unknown = ultracodeModel(ultraArgs({ ultracodeValue: null }));
+  assert.deepEqual({ enabled: unknown.enabled, title: unknown.title }, { enabled: false, title: ULTRACODE_UNKNOWN_TITLE });
+  assert.equal(buttonModel(buttonArgs()).primary.enabled, true);
+  // (2) Each button shows its own waiting label while its own line is on its way.
+  const requested = { request: { phase: 'requested', atMs: STOP_MS + 1 } };
+  assert.equal(buttonModel(buttonArgs(requested)).primary.label, 'Writing' + ELLIPSIS);
+  assert.equal(buttonModel(buttonArgs(requested)).primary.title, 'Waiting for the session to write the handoff');
+  assert.equal(ultracodeModel(ultraArgs({ ultracodeValue: true, ...requested })).title, 'Waiting for the session to write the handoff');
+  const switching = ultracodeModel(ultraArgs({ ultracodeValue: true, switching: true, lineOnWay: true }));
+  assert.equal(switching.label, 'Ultracode' + ELLIPSIS);
+  assert.equal(switching.title, 'Waiting for the session to confirm the switch');
+  assert.equal(buttonModel(buttonArgs({ lineOnWay: true })).primary.title, 'Waiting for the session to confirm the Ultracode switch');   // B12
+});
+
+// ── the screen in the gate: the page ───────────────────────────────────────
+const ULTRA_BTN = 'handoff-ultracode-btn';
+const PRIMARY_BTN = 'handoff-primary-btn';
+const UPDATE_BTN = 'handoff-update-btn';
+const confirmOptions = (h) => h.confirmOptions.map((o) => ({ ...o }));
+// A running session that has written a handoff: Continue, with Update beside it.
+async function bootUltraWritten() {
+  const h = await bootUltra(false);
+  h.setHandoffFile(true);
+  h.setState(writtenVmState(h, { ultracode: false }));
+  await h.refresh();
+  assert.equal(h.header().update, true);
+  return h;
+}
+
+test('browser: the page reads the live screen with its cursor row, and the rows alone for the Ultracode looks', async () => {
+  const h = await bootUltra(false);
+  const read = JSON.parse(h.run('JSON.stringify(handoffScreenRead("' + SID + '"))'));
+  assert.equal(read.rows.length, 55);
+  assert.equal(read.cursorY, PROMPT_CURSOR_ROW);
+  assert.equal(read.rows[PROMPT_CURSOR_ROW], PROMPT_BOX_EMPTY);
+  assert.deepEqual(JSON.parse(h.run('JSON.stringify(handoffScreenRows("' + SID + '"))')), read.rows);
+  assert.deepEqual(h.inputs().screen.state, 'empty');
+  // A cursor row that is not a number is "no cursor", not a throw.
+  h.knobs.cursorY = undefined;
+  assert.equal(JSON.parse(h.run('JSON.stringify(handoffScreenRead("' + SID + '"))')).cursorY, null);
+  assert.equal(h.inputs().screen.state, 'unknown');
+  // No terminal in this window, and an id that is not open: null, and no throw.
+  h.run('window._openSessions = new Map()');
+  assert.equal(h.run('handoffScreenRead("' + SID + '")'), null);
+  assert.equal(h.run('handoffScreenRows("' + SID + '")'), null);
+  assert.equal(h.inputs().screen.state, 'unknown');
+  assert.deepEqual(h.errors, []);
+});
+
+test('browser: with the recorded question on screen, Hand off, the update button and the Ultracode button send nothing', async () => {
+  const h = await bootUltra(false);
+  showQuestion(h);
+  await h.tick();   // the buttons follow the screen at the next tick, a second at most
+  assert.equal(h.header().primaryEnabled, false);
+  assert.equal(titleOf(h, PRIMARY_BTN), ASKING_TIP);
+  assert.deepEqual({ enabled: ultraHeader(h).enabled, asksFirst: ultraHeader(h).asksFirst, title: ultraHeader(h).title },
+    { enabled: false, asksFirst: false, title: ASKING_TIP });
+  await h.click('primary');
+  await clickUltra(h);
+  await h.advance(6000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.confirms.length, 0);
+  assert.equal(h.header().note, null, 'a click on a dimmed button leaves no note');
+
+  const w = await bootUltraWritten();
+  showQuestion(w);
+  await w.tick();
+  assert.equal(w.byId[UPDATE_BTN].getAttribute('aria-disabled'), 'true');
+  assert.equal(titleOf(w, UPDATE_BTN), ASKING_TIP);
+  await w.click('update');
+  await w.advance(6000);
+  assert.deepEqual(w.sent, []);
+  assert.equal(w.confirms.length, 0);
+
+  // The question is answered: a plain click again at the next tick.
+  showEmptyPrompt(h);
+  await h.tick();
+  assert.equal(h.header().primaryEnabled, true);
+  assert.equal(h.header().primaryOverride, false);
+  assert.equal(ultraHeader(h).title, 'Ultracode is off. Click to switch it on.');
+});
+
+test('browser: Hand off asks first over text in the input box', async () => {
+  const h = await bootUltra(false);
+  h.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + 'half a thought';
+  await h.tick();
+  assert.equal(h.header().primaryEnabled, true);
+  assert.equal(h.header().primaryOverride, true);
+  assert.equal(titleOf(h, PRIMARY_BTN), "There is text in this session's input box. Click to type the request anyway (asks first).");
+  assert.equal(ultraHeader(h).asksFirst, true);
+  assert.equal(ultraHeader(h).title, "Ultracode is off. There is text in this session's input box. Click to switch it on anyway (asks first).");
+
+  h.knobs.confirmAnswer = false;   // Cancel
+  await h.click('primary');
+  await h.advance(1000);
+  // The one box. Its last line is T1's in this commit; task 08 changes it to "... is not sent".
+  assert.deepEqual(h.confirms, [
+    "There is text in this session's input box.\n\n"
+    + 'Type "Write the context handoff now. [ctx-handoff:request]" into this session anyway?\n\n'
+    + 'If your own text is there, it is sent together with this line.',
+  ]);
+  assert.deepEqual(confirmOptions(h), [{ confirm: 'Type it anyway' }], 'a plain button: no danger flag');
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.header().note, null, 'Cancel leaves no note');
+
+  h.knobs.confirmAnswer = true;    // Type it anyway
+  await h.click('primary');
+  await h.advance(499);
+  assert.deepEqual(h.sent, []);
+  await h.advance(1);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+  await h.advance(250);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+
+  // Ultracode over the same text: the same box with its own line.
+  const u = await bootUltra(false);
+  u.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + 'half a thought';
+  u.knobs.confirmAnswer = false;
+  await clickUltra(u);   // no tick: the click decides afresh
+  assert.deepEqual(u.confirms, [boxText(TEXT_IN_BOX, '/effort ultracode', BOX_SENT_LINE)]);
+  assert.deepEqual(confirmOptions(u), [{ confirm: 'Type it anyway' }]);
+  assert.deepEqual(u.sent, []);
+});
+
+test('browser: a screen that cannot be read asks first, and still types after a yes', async () => {
+  const B4 = "Switchboard cannot see an empty prompt on this session's screen. Click to type the request anyway (asks first).";
+  const h = await bootUltra(false);
+  h.run('window._openSessions = new Map()');   // no terminal for the session in this window
+  await h.tick();
+  assert.equal(h.header().primaryOverride, true);
+  assert.equal(titleOf(h, PRIMARY_BTN), B4);
+  assert.equal(ultraHeader(h).title, "Ultracode is off. Switchboard cannot see an empty prompt on this session's screen. Click to switch it on anyway (asks first).");
+  h.knobs.confirmAnswer = false;
+  await h.click('primary');
+  await h.advance(2000);
+  assert.deepEqual(h.confirms, [boxText(NO_PROMPT, REQUEST_LINE)]);
+  assert.deepEqual(h.sent, []);
+  h.knobs.confirmAnswer = true;
+  await h.click('primary');
+  await h.advance(750);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']], 'the text, and Enter 250 ms after it');
+
+  // A working line above the box is "not recognised" too.
+  const working = await bootUltra(false);
+  working.knobs.rows[47] = '\u273b Transmogrifying\u2026 (running UserPromptSubmit hook \u00b7 4s)';
+  await working.tick();
+  assert.equal(titleOf(working, PRIMARY_BTN), B4);
+});
+
+test('browser: without prompt-screen.js every click asks first', async () => {
+  const h = await bootEnded({ promptScreen: false });
+  assert.equal(h.inputs().screen.state, 'unknown');
+  assert.equal(h.header().primaryOverride, true);
+  assert.equal(titleOf(h, PRIMARY_BTN), "Switchboard cannot see an empty prompt on this session's screen. Click to type the request anyway (asks first).");
+  await h.click('primary');
+  assert.equal(h.confirms.length, 1);
+  await h.advance(750);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+  assert.deepEqual(h.errors, []);
+});
+
+test('browser: a question that opens while the in-page box is up stops the typing', async () => {
+  const NOTE = 'Not typed. Session is asking you something. Answer it in the terminal first.';
+  for (const press of ['primary', 'ultracode']) {
+    const h = await bootUltra(false);
+    h.knobs.cursorY = 53;   // the cursor is not in the box: the screen is not recognised
+    await h.tick();
+    assert.equal(h.header().primaryOverride, true, press);
+    h.knobs.duringQuestion = () => showQuestion(h);
+    h.run('confirmDialog = async () => { __knobs.duringQuestion(); return true; }');
+    if (press === 'primary') await h.click('primary'); else await clickUltra(h);
+    await h.advance(6000);
+    assert.deepEqual(h.sent, [], press);
+    assert.equal(h.header().note, NOTE, press);
+    assert.equal(titleOf(h, 'handoff-note'), NOTE, 'the tooltip has all of it');
+    assert.equal(ultraHeader(h).label, 'Ultracode', 'not left saying it is switching');
+    // 60 seconds, then it goes.
+    await h.ticks(61);
+    assert.equal(h.header().note, null, press);
+  }
+});
+
+test('browser: a yes that types nothing says why in the header note', async () => {
+  // The session started working.
+  const busy = await bootReloaded();
+  busy.run('confirmDialog = async () => { sessionBusyState.set("' + SID + '", true); return true; }');
+  await busy.click('primary');
+  await busy.advance(1000);
+  assert.deepEqual(busy.sent, []);
+  assert.equal(busy.header().note, 'Not typed. Session is working.');
+
+  // Ultracode changed by itself meanwhile, in each direction.
+  for (const [was, word] of [[true, 'off'], [false, 'on']]) {
+    const h = await bootUltra(was, { reloaded: true });
+    h.run('confirmDialog = async () => { __knobs.duringQuestion(); return true; }');
+    h.knobs.duringQuestion = () => h.setState(endedState(h, { ultracode: !was }));
+    await clickUltra(h);
+    await h.advance(1000);
+    assert.deepEqual(h.sent, []);
+    assert.equal(h.header().note, 'Not typed. Ultracode is already ' + word + '.');
+  }
+
+  // Another session took the pane, or the header went off: the note waits on the session that was clicked.
+  for (const [leave, back] of [['activeSessionId = "' + NEW_SID + '"', 'activeSessionId = "' + SID + '"'], ['gridViewActive = true', 'gridViewActive = false']]) {
+    for (const press of ['primary', 'ultracode']) {
+      const h = await bootUltra(true, { reloaded: true });
+      h.knobs.duringQuestion = () => h.run(leave);
+      h.run('confirmDialog = async () => { __knobs.duringQuestion(); return true; }');
+      if (press === 'primary') await h.click('primary'); else await clickUltra(h);
+      await h.advance(1000);
+      assert.deepEqual(h.sent, [], leave);
+      h.run(back);
+      await h.tick();
+      assert.equal(h.header().note, NOT_TYPED_CHANGED, leave + ' / ' + press);
+    }
+  }
+
+  // The session ended (it left the running set) while the box was open. That is neither "started working"
+  // nor "opened a question": B9's "every other case", although the gate has a reason of its own for it.
+  for (const press of ['primary', 'ultracode']) {
+    const h = await bootUltra(true, { reloaded: true });
+    h.knobs.duringQuestion = () => h.run('activePtyIds = new Set()');
+    h.run('confirmDialog = async () => { __knobs.duringQuestion(); return true; }');
+    if (press === 'primary') await h.click('primary'); else await clickUltra(h);
+    await h.advance(6000);
+    assert.deepEqual(h.sent, [], 'ended / ' + press);
+    assert.equal(h.header().note, NOT_TYPED_CHANGED, 'ended / ' + press);
+  }
+
+  // A click that then types clears the note of the click before it.
+  const again = await bootReloaded();
+  again.run('window.__askBusy = true; confirmDialog = async () => { if (window.__askBusy) sessionBusyState.set("' + SID + '", true); return true; }');
+  await again.click('primary');
+  await again.advance(1000);
+  assert.equal(again.header().note, 'Not typed. Session is working.');
+  again.run('window.__askBusy = false');
+  again.setBusy(false);
+  await again.tick();
+  await again.click('primary');
+  await again.advance(500);
+  assert.deepEqual(again.sent, [[SID, REQUEST_LINE]]);
+  assert.equal(again.header().note, null);
+  // "Writing…" shows no note in any case, so the record itself is asked too.
+  assert.equal(again.run('handoffRt.cache.get("' + SID + '").ultraNote'), '');
+});
+
+test('browser: the session gets a new id while the box is open: the yes still types, under the new id', async () => {
+  const hand = await bootReloaded();
+  hand.knobs.duringQuestion = () => { forkEvent(hand, SID, NEW_SID); };
+  hand.run('confirmDialog = async () => { __knobs.duringQuestion(); return true; }');
+  await hand.click('primary');
+  await hand.advance(750);
+  assert.deepEqual(hand.sent, [[NEW_SID, REQUEST_LINE], [NEW_SID, '\r']]);
+
+  const ultra = await bootUltra(true, { reloaded: true });
+  ultra.files.set(VM_DIR + '\\' + NEW_SID + '.state.json', JSON.stringify(endedState(ultra, { ultracode: true })));
+  ultra.knobs.duringQuestion = () => { forkEvent(ultra, SID, NEW_SID); };
+  ultra.run('confirmDialog = async () => { __knobs.duringQuestion(); return true; }');
+  await clickUltra(ultra);
+  await ultra.advance(750);
+  assert.deepEqual(ultra.sent, [[NEW_SID, '/effort ultracode off'], [NEW_SID, '\r']]);
+});
+
+test('browser: of two live header notes the later one shows', async () => {
+  const h = await bootUltraWritten();
+  await clickUltra(h);
+  await h.advance(5000);
+  assert.equal(h.header().note, ULTRACODE_NOT_CONFIRMED);
+  // Ten seconds later a Continue comes to nothing: that is the later news.
+  await h.advance(10000);
+  h.knobs.resolveOptions = async () => { throw new Error('settings unreadable'); };
+  await h.click('primary');
+  assert.equal(h.header().primary, 'Continue in new session');
+  assert.equal(h.header().note, 'The new session could not be started.');
+  // Each goes after its own 60 seconds.
+  await h.ticks(61);
+  assert.equal(h.header().note, null);
+});
+
+test('browser: Hand off and Update are dimmed while an Ultracode switch is on its way', async () => {
+  const h = await bootUltra(false);
+  assert.equal(h.header().primaryEnabled, true);
+  await clickUltra(h);
+  assert.equal(h.header().primaryEnabled, false);
+  assert.equal(h.header().primaryOverride, false);
+  assert.equal(titleOf(h, PRIMARY_BTN), 'Waiting for the session to confirm the Ultracode switch');
+  assert.equal(ultraHeader(h).title, 'Waiting for the session to confirm the switch', 'Ultracode keeps its own waiting label');
+  await h.click('primary');
+  await h.advance(400);
+  assert.deepEqual(h.sent, [[SID, '/effort ultracode'], [SID, '\r']]);
+  assert.equal(h.header().note, null, 'a click on a dimmed button leaves no note');
+  // Confirmed: Hand off is back.
+  h.knobs.rows = promptScreenWith(['  ' + ON_LINE]);
+  await h.advance(600);
+  assert.equal(h.header().primaryEnabled, true);
+  assert.equal(titleOf(h, PRIMARY_BTN), 'Ask this session to write its context handoff');
+
+  const w = await bootUltraWritten();
+  await clickUltra(w);
+  assert.equal(w.byId[UPDATE_BTN].getAttribute('aria-disabled'), 'true');
+  assert.equal(titleOf(w, UPDATE_BTN), 'Waiting for the session to confirm the Ultracode switch');
+  // Given up after the last look: back as well.
+  await w.advance(5000);
+  assert.equal(w.byId[UPDATE_BTN].getAttribute('aria-disabled'), 'false');
+});
+
+test('browser: a session that did not stop takes no typing from the three buttons', async () => {
+  const h = await bootUltraWritten();
+  // `var`, not `let`, on purpose (app.js itself declares the set with `let`). By now the page has drawn its header
+  // several times and so has already asked `typeof didNotStopIds`; in a vm context of Node 24, code that has asked
+  // that does not see a `let` which a LATER script declares, but it does see a `var`. Seen in a scratch run: with
+  // `let` here this test failed, at this boot or at the next one. In the app the set is declared when app.js loads.
+  h.run('var didNotStopIds = new Set(["' + SID + '"])');
+  await h.tick();
+  for (const id of [ULTRA_BTN, UPDATE_BTN]) {
+    assert.equal(h.byId[id].getAttribute('aria-disabled'), 'true', id);
+    assert.equal(titleOf(h, id), 'Session did not stop. It takes no typing. Press Stop to try once more.', id);
+  }
+  await clickUltra(h);
+  await h.click('update');
+  await h.advance(6000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.confirms.length, 0);
+  // Hand off, on a session with no handoff yet.
+  const plain = await bootUltra(false);
+  plain.run('var didNotStopIds = new Set(["' + SID + '"])');
+  await plain.tick();
+  assert.equal(plain.header().primaryEnabled, false);
+  assert.equal(titleOf(plain, PRIMARY_BTN), 'Session did not stop. It takes no typing. Press Stop to try once more.');
+  // The set is replaced on every answer: an empty one brings the buttons back.
+  plain.run('didNotStopIds = new Set()');
+  await plain.tick();
+  assert.equal(plain.header().primaryEnabled, true);
+  // A window whose app.js has no such set (an older page) is not dimmed: see every other test of this file.
+});
+
+test('browser: Update asks first like Hand off, with the one box and the request line', async () => {
+  const B4 = "Switchboard cannot see an empty prompt on this session's screen. Click to type the request anyway (asks first).";
+  const w = await bootUltraWritten();
+  assert.equal(w.byId[UPDATE_BTN].className.includes('handoff-btn-override'), false, 'plain on an empty prompt');
+  // Text in the input box: B3's reason on Update, and the amber outline.
+  w.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + 'half a thought';
+  await w.tick();
+  assert.equal(w.byId[UPDATE_BTN].className.includes('handoff-btn-override'), true);
+  assert.equal(w.byId[UPDATE_BTN].getAttribute('aria-disabled'), 'false');
+  assert.equal(titleOf(w, UPDATE_BTN), "There is text in this session's input box. Click to type the request anyway (asks first).");
+  // A screen that is not recognised (the cursor is not in the box): B4's reason, and the one box with the request line.
+  showEmptyPrompt(w);
+  w.knobs.cursorY = 53;
+  await w.tick();
+  assert.equal(titleOf(w, UPDATE_BTN), B4);
+  w.knobs.confirmAnswer = false;   // Cancel
+  await w.click('update');
+  await w.advance(2000);
+  assert.deepEqual(w.confirms, [boxText(NO_PROMPT, REQUEST_LINE)]);
+  assert.deepEqual(confirmOptions(w), [{ confirm: 'Type it anyway' }]);
+  assert.deepEqual(w.sent, []);
+  assert.equal(w.header().note, null, 'Cancel leaves no note');
+  w.knobs.confirmAnswer = true;    // Type it anyway
+  await w.click('update');
+  await w.advance(499);
+  assert.deepEqual(w.sent, []);
+  await w.advance(1);
+  // Only the text is asked for here. The Enter that follows is the typing path's, which task 08 rewrites;
+  // 'browser: a screen that cannot be read asks first, and still types after a yes' holds it for this click path.
+  assert.deepEqual(w.sent, [[SID, REQUEST_LINE]], 'the request line, 500 ms after the yes');
+  assert.deepEqual(w.errors, []);
+});
+
+test('browser: a screen check that throws reads as "not recognised": the click asks first, and nothing is logged', async () => {
+  const h = await bootEnded();
+  assert.equal(h.header().primaryOverride, false, 'a plain Hand off on an empty prompt');
+  h.run('window.PromptScreen = { promptScreen: () => { throw new Error("the marks broke"); } }');
+  await h.tick();
+  assert.equal(h.inputs().screen.state, 'unknown');
+  assert.equal(h.header().primaryEnabled, true);
+  assert.equal(h.header().primaryOverride, true);
+  assert.equal(titleOf(h, PRIMARY_BTN), "Switchboard cannot see an empty prompt on this session's screen. Click to type the request anyway (asks first).");
+  h.knobs.confirmAnswer = false;
+  await h.click('primary');
+  await h.advance(1000);
+  assert.deepEqual(h.confirms, [boxText(NO_PROMPT, REQUEST_LINE)]);
+  assert.deepEqual(h.sent, []);
+  assert.deepEqual(h.errors, [], 'the reader answers "unknown" itself; nothing reaches the console');
 });

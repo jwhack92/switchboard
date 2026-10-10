@@ -9,10 +9,10 @@
 // sidebar row, a meter in the terminal header) and offers two actions in the
 // header: ask the session to write its handoff, and start a sibling session
 // that reads it. Nothing launches by itself, and the only thing that pops up is
-// the question a click gets (OVERRIDE_CONFIRM) when the session has not
-// reported the end of its turn, or when this window has not yet been told
-// whether the session is busy (after a reload). A session that is busy is
-// never typed into.
+// the one box a click gets (handoffConfirmTyping) when the gate asks first: the
+// session has not reported the end of its turn, this window has not yet been
+// told whether the session is busy (after a reload), or the session's screen
+// does not show an empty prompt. A session that is busy is never typed into.
 //
 // The same files say whether a session has ultracode on. The header has a
 // button that switches it by typing the /effort command, through the same
@@ -37,11 +37,12 @@
 //   app.js: sessionMap, sessionBusyState, activePtyIds, activeSessionId,
 //           pendingSessions, gridViewActive, cachedProjectTree,
 //           cachedProjectTreeAll, launchNewSession, window._isOwnedElsewhere,
-//           window._openSessions
+//           window._openSessions, didNotStopIds
 //   dialogs.js: resolveDefaultSessionOptions
 //   task-runner.js: activeTaskView
 //   utils.js: cleanDisplayName
 //   continue-name.js: window.ContinueName
+//   prompt-screen.js: window.PromptScreen
 //   xterm.js: the buffer of a window._openSessions entry's terminal
 //   icons.js: window.ICONS.bolt
 //   the browser: sessionStorage (per window; survives a reload of that window),
@@ -63,8 +64,6 @@ const REQUEST_LINE = 'Write the context handoff now. [ctx-handoff:request]';
 // from DUE_AT.
 const WARN_AT = 300000;
 const DUE_AT = 400000;
-// Asked before typing into a session whose turn marker does not say "ended".
-const OVERRIDE_CONFIRM = 'Switchboard cannot confirm that this session is idle at its prompt. If a permission prompt or a question is open in the terminal, the typed line and Enter could answer it. Type the handoff request anyway?';
 const OVERRIDE_TITLE = 'This session has not reported the end of its turn. Click to type the request anyway (asks first).';
 // The turn marker says "ended", but this window has not been told whether the
 // session is busy: the same question, a tooltip that gives the real reason.
@@ -287,10 +286,25 @@ function staleTitle(clock) {
  * Whether a line may be typed into the session, and plainly or only after
  * asking. One computation for every control that types (Hand off, Update, the
  * ultracode button), so no two of them can disagree. Takes what buttonModel
- * takes; the three states and `busyKnown` are described there.
- * → { allowed, override, why, overrideTitle }
- *   allowed   false = never typed into, and `why` says which reason
- *   override  allowed, but a click asks first; `overrideTitle` says why
+ * takes; the three states and `busyKnown` are described there. Three more
+ * inputs:
+ *   screen      what promptScreen (prompt-screen.js) read on the session's
+ *               screen; anything but a state of 'empty', 'draft' or
+ *               'question', a missing one included, counts as 'unknown'
+ *   lineOnWay   true while an Ultracode switch of ours waits for the terminal
+ *   didNotStop  true while a Stop of this session did not finish
+ * Only the boolean true counts for the last two.
+ * → { allowed, override, reason, advice, why, overrideTitle }
+ *   allowed   false = never typed into, and `reason` says why
+ *   override  allowed, but a click asks first, and `reason` says why
+ *   reason    one bare sentence without a full stop, the stronger first; ''
+ *             when a click types plainly
+ *   advice    '' or one sentence that says what to do
+ * gateText turns the reason and the advice into every text the user sees.
+ * `why` (the reason when not allowed, else '') and `overrideTitle` keep their
+ * old values; no code in this file reads them, and they stay because the tests
+ * 'typingGate: Hand off is exactly what the gate says, in every combination'
+ * and 'typingGate: no input at all is "not allowed"' read them.
  */
 function typingGate(input) {
   const o = input || {};
@@ -306,37 +320,121 @@ function typingGate(input) {
   const sentAtMs = typeof request.atMs === 'number' && request.atMs > 0 ? request.atMs : null;
   const stopAfterSent = sentAtMs === null || (lastStopMs !== null && lastStopMs > sentAtMs);
   const ended = turnEnded(state) && !busyAfterStop && stopAfterSent;
-  const allowed = !!o.running && !o.ownedElsewhere && !o.pendingRow && o.busy !== true;
-  const override = allowed && (!ended || o.busyKnown !== true);
+  const screenState = o.screen && typeof o.screen === 'object'
+    && ['empty', 'draft', 'question'].includes(o.screen.state) ? o.screen.state : 'unknown';
 
-  let why = '';
-  if (!allowed) {
-    if (o.ownedElsewhere) why = 'Shown in another window';
-    else if (o.pendingRow) why = 'Session is still starting';
-    else if (o.busy === true) why = 'Session is working';
-    else why = 'Session is not running';
+  // Refusals, the first that holds.
+  let reason = '';
+  let advice = '';
+  if (o.ownedElsewhere) reason = 'Shown in another window';
+  else if (o.didNotStop === true) {
+    reason = 'Session did not stop';
+    advice = 'It takes no typing. Press Stop to try once more.';
+  } else if (o.pendingRow) reason = 'Session is still starting';
+  else if (o.busy === true) reason = 'Session is working';
+  else if (!o.running) reason = 'Session is not running';
+  else if (o.lineOnWay === true) reason = 'Waiting for the session to confirm the Ultracode switch';
+  else if (screenState === 'question') {
+    reason = 'Session is asking you something';
+    advice = 'Answer it in the terminal first.';
   }
-  // The turn not having ended is the stronger reason, so it is the one named.
-  return { allowed, override, why, overrideTitle: ended ? OVERRIDE_TITLE_UNSEEN : OVERRIDE_TITLE };
+  const allowed = reason === '';
+
+  // Asks first, the first that holds. The turn not having ended is the
+  // stronger reason, so it is the one named.
+  if (allowed) {
+    if (!ended) reason = 'This session has not reported the end of its turn';
+    else if (o.busyKnown !== true) reason = 'This window has seen no busy or idle event for this session since it loaded';
+    else if (screenState === 'draft') reason = "There is text in this session's input box";
+    else if (screenState === 'unknown') reason = "Switchboard cannot see an empty prompt on this session's screen";
+  }
+  const override = allowed && reason !== '';
+  return {
+    allowed, override, reason, advice,
+    why: allowed ? '' : reason,
+    overrideTitle: ended ? OVERRIDE_TITLE_UNSEEN : OVERRIDE_TITLE,
+  };
+}
+
+/**
+ * The one place that puts the gate's reason into a text the user sees.
+ *   'tooltip'     a button that cannot be clicked: the reason, and the advice
+ *   'asks-first'  the title of a button that asks first; opts { prefix, action }
+ *                 (Hand off and Update: '' and 'Click to type the request')
+ *   'box'         the one box: the reason, the question with the exact text,
+ *                 and a last line; opts { line, hold }
+ *   'note'        the header note of a click that typed nothing
+ */
+function gateText(gate, use, opts) {
+  const g = gate && typeof gate === 'object' ? gate : {};
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const reason = typeof g.reason === 'string' ? g.reason : '';
+  const advice = typeof g.advice === 'string' ? g.advice : '';
+  const prefix = typeof o.prefix === 'string' ? o.prefix : '';
+  if (use === 'tooltip') return advice ? reason + '. ' + advice : reason;
+  if (use === 'asks-first') {
+    return reason ? prefix + reason + '. ' + o.action + ' anyway (asks first).' : prefix + o.action + ' (asks first).';
+  }
+  if (use === 'box') {
+    const lines = [];
+    if (reason) lines.push(reason + '.');
+    lines.push('Type "' + o.line + '" into this session anyway?');
+    if (reason === "There is text in this session's input box") {
+      lines.push(o.hold === true
+        ? 'If your own text is there, the line is typed after it and is not sent.'
+        : 'If your own text is there, it is sent together with this line.');
+    } else {
+      lines.push('If the terminal is asking you something, cancel: the typed line could answer it.');
+    }
+    return lines.join('\n\n');
+  }
+  if (use === 'note') return 'Not typed. ' + reason + '.' + (advice ? ' ' + advice : '');
+  return '';
+}
+
+/**
+ * The one header note, chosen from the live ones: the later shows. Each note
+ * is { text, atMs, open } and counts only with a non-empty text and a number
+ * for atMs. One with `open` true (a request that is still outstanding) lives
+ * while it is passed in; any other lives HANDOFF_ERROR_SHOWN_MS from atMs.
+ * → the chosen note, or null. Never throws.
+ */
+function chooseHeaderNote(notes, nowMs) {
+  if (!Array.isArray(notes)) return null;
+  let chosen = null;
+  for (const note of notes) {
+    if (!note || typeof note !== 'object') continue;
+    if (typeof note.text !== 'string' || !note.text || typeof note.atMs !== 'number') continue;
+    const live = note.open === true || nowMs - note.atMs < HANDOFF_ERROR_SHOWN_MS;
+    if (live && (!chosen || note.atMs > chosen.atMs)) chosen = note;
+  }
+  return chosen;
 }
 
 /**
  * What the header buttons show. `primary` is one button in three guises (Hand
  * off / Writing… / Continue in new session); `update` is the small one beside
  * Continue, for a handoff that has gone stale. `note` is the text beside them
- * (why the last request or the last Continue came to nothing); it is shown
- * whether or not a button is.
+ * (why the last request, the last Continue or the last click came to nothing:
+ * the later of the live ones, chosen by chooseHeaderNote); it is shown whether
+ * or not a button is.
  *
  * A typing control (Hand off, Update) is in one of three states:
- *   enabled, override false   the turn has ended: a click types the request
- *   enabled, override true    the session is not busy but has NOT reported the
- *                             end of its turn (no state file, no Stop since the
+ *   enabled, override false   the turn has ended and the screen shows an empty
+ *                             prompt: a click types the request
+ *   enabled, override true    one of four asks-first reasons (typingGate): the
+ *                             session is not busy but has NOT reported the end
+ *                             of its turn (no state file, no Stop since the
  *                             last prompt, the spinner came on after the last
  *                             Stop, or no Stop since the last request typed
- *                             here), OR `busyKnown` is not true (see below):
- *                             a click asks first (OVERRIDE_CONFIRM)
- *   disabled                  never typed into: busy, still starting, shown in
- *                             another window, not running. `title` says which.
+ *                             here); `busyKnown` is not true (see below); there
+ *                             is text in the input box; or the screen does not
+ *                             show an empty prompt: a click asks first (the one
+ *                             box, handoffConfirmTyping)
+ *   disabled                  never typed into: shown in another window, did
+ *                             not stop, still starting, busy, not running, an
+ *                             Ultracode switch on its way, or a question on the
+ *                             screen. `title` says which.
  * busy === true is never overridable.
  *
  * `busyKnown` says whether `busy` can be believed. Main sends cli-busy-state
@@ -371,7 +469,8 @@ function buttonModel(input) {
 
   const gate = typingGate(o);
   const { allowed, override } = gate;
-  const typingTitle = okTitle => (!allowed ? gate.why : override ? gate.overrideTitle : okTitle);
+  const typingTitle = okTitle => (!allowed ? gateText(gate, 'tooltip')
+    : override ? gateText(gate, 'asks-first', { prefix: '', action: 'Click to type the request' }) : okTitle);
 
   const info = handoffInfo(state, o.handoffReadable);
   if (canContinue(state, o.handoffReadable, running)) {
@@ -405,9 +504,19 @@ function buttonModel(input) {
       title: typingTitle('Ask this session to write its context handoff'),
     };
   }
-  if (request.phase === 'timeout') model.note = request.reason != null ? request.reason : null;
-  // The later of the two things that went wrong is the one on screen.
-  if (typeof o.continueError === 'string' && o.continueError) model.note = o.continueError;
+  // The later of the things that went wrong is the one on screen.
+  const notes = [];
+  if (request.phase === 'timeout' && request.reason != null) {
+    notes.push({ text: request.reason, atMs: typeof request.atMs === 'number' ? request.atMs : 0, open: true });
+  }
+  if (typeof o.continueError === 'string' && o.continueError) {
+    notes.push({ text: o.continueError, atMs: typeof o.continueErrorAtMs === 'number' ? o.continueErrorAtMs : o.nowMs, open: false });
+  }
+  if (typeof o.clickNote === 'string' && o.clickNote) {
+    notes.push({ text: o.clickNote, atMs: o.clickNoteAtMs, open: false });
+  }
+  const chosen = chooseHeaderNote(notes, o.nowMs);
+  model.note = chosen ? chosen.text : null;
   return model;
 }
 
@@ -504,22 +613,16 @@ function ultracodeModel(input) {
   }
   const gate = typingGate(o);
   if (!gate.allowed) {
-    model.title = gate.why;
+    model.title = gateText(gate, 'tooltip');
     return model;
   }
   model.enabled = true;
   model.override = gate.override || draftOpen(o.typed);
   model.target = value ? 'off' : 'on';
-  model.title = (value ? 'Ultracode is on. Click to switch it off' : 'Ultracode is off. Click to switch it on')
-    + (model.override ? ' (asks first).' : '.');
+  const prefix = value ? 'Ultracode is on. ' : 'Ultracode is off. ';
+  const action = value ? 'Click to switch it off' : 'Click to switch it on';
+  model.title = model.override ? gateText(gate, 'asks-first', { prefix, action }) : prefix + action + '.';
   return model;
-}
-
-// Asked before typing where ultracodeModel says override. It names the exact
-// text, and what the gate could not rule out.
-function ultracodeQuestion(target) {
-  return 'Type "' + ULTRACODE_TEXT[target] + '" into this session?\n\n'
-    + 'Only when it is waiting at an empty prompt. If it is asking you something, or you have text typed there, cancel.';
 }
 
 // The lines the program prints after /effort, counted on the rows of the
@@ -984,6 +1087,13 @@ function handoffIsTerminal(id) {
   return !!session && session.type === 'terminal';
 }
 
+// didNotStopIds (app.js) holds the sessions whose Stop did not finish. Like
+// activePtyIds it is REPLACED on every poll, so it is looked up each time and
+// never held on to. An older page without the set reads as "did not stop: no".
+function handoffDidNotStop(id) {
+  try { return typeof didNotStopIds !== 'undefined' && !!didNotStopIds && didNotStopIds.has(id); } catch { return false; }
+}
+
 // Everything buttonModel, ultracodeModel and chipState take, for one session.
 // The three flags that can only DISABLE typing fail closed: each starts as "do
 // not type" and is lowered only by a successful read of the app's own value.
@@ -1008,9 +1118,7 @@ function handoffInputs(id) {
   try { if (typeof window._isOwnedElsewhere === 'function') ownedElsewhere = !!window._isOwnedElsewhere(id); } catch {}
   const mainBusy = entry && typeof entry.mainBusy === 'boolean' ? entry.mainBusy : null;
   if (mainBusy === true) busy = true;
-  const errorShown = !!entry && !!entry.continueError && nowMs - entry.continueErrorAtMs < HANDOFF_ERROR_SHOWN_MS;
   const ultracode = entry ? ultracodeValue(entry.state, entry.ultraConfirmed) : null;
-  const ultraNoteShown = !!entry && !!entry.ultraNote && nowMs - entry.ultraNoteAtMs < HANDOFF_ERROR_SHOWN_MS;
   return {
     isTerminal: handoffIsTerminal(id),
     running: handoffIsRunning(id),
@@ -1023,11 +1131,18 @@ function handoffInputs(id) {
     ultracode: ultracode === true,
     ultracodeValue: ultracode,
     switching: !!entry && !!entry.ultraSwitch,
+    // The same fact as `switching`: the gate refuses on it, and ultracodeModel
+    // keeps reading `switching` for its own label.
+    lineOnWay: !!entry && !!entry.ultraSwitch,
+    screen: handoffScreenState(id),
+    didNotStop: handoffDidNotStop(id),
     typed: entry ? entry.typed : null,
-    ultracodeNote: ultraNoteShown ? entry.ultraNote : '',
     request: entry ? entry.request : handoffIdleRequest(),
     continueLocked: !!entry && nowMs < entry.continueLockUntil,
-    continueError: errorShown ? entry.continueError : '',
+    continueError: entry ? entry.continueError : '',
+    continueErrorAtMs: entry ? entry.continueErrorAtMs : 0,
+    clickNote: entry ? entry.ultraNote : '',
+    clickNoteAtMs: entry ? entry.ultraNoteAtMs : 0,
     nowMs,
   };
 }
@@ -1561,8 +1676,7 @@ function handoffRenderHeader() {
   });
   // With or without a button: a session that ended before its handoff was
   // written has no button left to sit beside.
-  // A switch that just came to nothing is the latest thing that went wrong.
-  const note = input.ultracodeNote || (model.note ? String(model.note) : '');
+  const note = model.note ? String(model.note) : '';
   handoffShow(els.note, !!note);
   handoffSetText(els.note, note);
   handoffSetTitle(els.note, note);
@@ -1746,32 +1860,49 @@ async function handoffContinue(id) {
 // looked like a second ago. null when that control is not on offer.
 function handoffTypingControl(id, which) {
   if (handoffHeaderOff(id)) return null;
-  // The ultracode button's text is on its way into the session, its Enter
-  // perhaps not yet: a line typed now would be sent joined to it.
-  const entry = handoffRt.cache.get(id);
-  if (entry && entry.ultraSwitch) return null;
-  const model = buttonModel(handoffInputs(id));
+  const input = handoffInputs(id);
+  const gate = typingGate(input);
+  const model = buttonModel(input);
   if (!model.visible) return null;
-  if (which === 'update') return model.update.visible ? model.update : null;
-  return model.primary.kind === 'handoff' ? model.primary : null;
+  if (which === 'update') return model.update.visible ? { ...model.update, gate } : null;
+  return model.primary.kind === 'handoff' ? { ...model.primary, gate } : null;
 }
 
 // The app's own in-page confirm (dialogs.js confirmDialog), which answers
 // through a Promise: the call below is awaited, and so is every call of this
 // function. Anything but an explicit yes is a no, a missing or failing dialog
 // included.
-async function handoffConfirmOverride() {
+async function handoffConfirmTyping(gate, line) {
   try {
+    const text = gateText(gate, 'box', { line, hold: false });
     return typeof confirmDialog === 'function'
-      && (await confirmDialog(OVERRIDE_CONFIRM, { confirm: 'Type it anyway', danger: true })) === true;
+      && (await confirmDialog(text, { confirm: 'Type it anyway' })) === true;
   } catch { return false; }
 }
 
+function handoffSetClickNote(entry, text) {
+  entry.ultraNote = text;
+  entry.ultraNoteAtMs = Date.now();
+  handoffRenderHeader();
+}
+
+function handoffNotTypedNote(left, gate, control) {
+  const changed = 'Not typed. The session changed while the box was open.';
+  if (left) return changed;
+  if (!gate.allowed) {
+    return gate.reason === 'Session is working' || gate.reason === 'Session is asking you something'
+      ? gateText(gate, 'note') : changed;
+  }
+  if (!control || !control.enabled) return changed;
+  return '';
+}
+
 async function handoffTypeRequest(id, which) {
-  let control = handoffTypingControl(id, which);
+  const entry = handoffEntry(id);
+  let control = handoffTypingControl(entry.id, which);
   if (!control || !control.enabled) return;
   if (control.override) {
-    if (!await handoffConfirmOverride()) return;
+    if (!await handoffConfirmTyping(control.gate, REQUEST_LINE)) return;
     // The question was open for as long as the user took: the session may have
     // gone busy meanwhile and the state file may have moved on. Wait, read
     // again and decide again. The wait is a real timer, not a resolved promise:
@@ -1781,15 +1912,18 @@ async function handoffTypeRequest(id, which) {
     // busy meanwhile is not typed into; one that is still (or now properly)
     // clear is, with the question already answered.
     await handoffDelay(HANDOFF_MIN_READ_GAP_MS);
-    await handoffRefresh(id);
-    if (handoffActiveId() !== id) return;
-    control = handoffTypingControl(id, which);
-    if (!control || !control.enabled) {
-      handoffRenderHeader();
+    await handoffRefresh(entry.id);
+    const gate = typingGate(handoffInputs(entry.id));
+    control = handoffTypingControl(entry.id, which);
+    const left = handoffActiveId() !== entry.id || handoffHeaderOff(entry.id);
+    const note = handoffNotTypedNote(left, gate, control);
+    if (note) {
+      handoffSetClickNote(entry, note);
       return;
     }
   }
-  handoffSendRequest(id);
+  handoffSetClickNote(entry, '');
+  handoffSendRequest(entry.id);
 }
 
 function handoffOnPrimaryClick() {
@@ -1813,27 +1947,20 @@ function handoffOnUpdateClick() {
 // headerOff is added here and not in handoffInputs: with the header off the
 // render never gets as far as the model, so a click is its only reader.
 function handoffUltracodeControl(id) {
-  const model = ultracodeModel({ ...handoffInputs(id), headerOff: handoffHeaderOff(id) });
-  return model.visible ? model : null;
+  const input = handoffInputs(id);
+  const model = ultracodeModel({ ...input, headerOff: handoffHeaderOff(id) });
+  return model.visible ? { ...model, gate: typingGate(input) } : null;
 }
 
-// As handoffConfirmOverride, with the button's own question: the call below is
-// awaited, and so is every call of this function. Anything but an explicit yes
-// is a no.
-async function handoffConfirmUltracode(target) {
-  try {
-    return typeof confirmDialog === 'function'
-      && (await confirmDialog(ultracodeQuestion(target), { confirm: 'Type it' })) === true;
-  } catch { return false; }
-}
-
-// The rows of a session's terminal screen, or null when they cannot be read
-// (no terminal in this window). The LIVE screen, from the buffer's baseY, and
-// not what is in view (TermDiag.viewportRows starts at viewportY): the text
-// goes straight to the pty and scrolls nothing. With the view scrolled up the
-// program's line is printed below it, and a line of an earlier switch that
-// scrolls into view would be counted as this one's.
-function handoffScreenRows(id) {
+// The rows of a session's terminal screen and the cursor's row on it,
+// { rows, cursorY }, or null when they cannot be read (no terminal in this
+// window). cursorY is null when the buffer gives no number for it. The LIVE
+// screen, from the buffer's baseY, and not what is in view
+// (TermDiag.viewportRows starts at viewportY): the text goes straight to the
+// pty and scrolls nothing. With the view scrolled up the program's line is
+// printed below it, and a line of an earlier switch that scrolls into view
+// would be counted as this one's.
+function handoffScreenRead(id) {
   try {
     const open = window._openSessions ? window._openSessions.get(id) : null;
     const terminal = open ? open.terminal : null;
@@ -1844,9 +1971,26 @@ function handoffScreenRows(id) {
       const line = buffer.getLine(buffer.baseY + y);
       rows.push(line ? line.translateToString(true) : '');
     }
-    return rows;
+    return { rows, cursorY: typeof buffer.cursorY === 'number' ? buffer.cursorY : null };
   } catch {
     return null;
+  }
+}
+
+function handoffScreenRows(id) {
+  const read = handoffScreenRead(id);
+  return read ? read.rows : null;
+}
+
+function handoffScreenState(id) {
+  try {
+    if (typeof window.PromptScreen === 'undefined' || !window.PromptScreen
+      || typeof window.PromptScreen.promptScreen !== 'function') {
+      return { state: 'unknown', why: 'prompt-screen.js is not loaded' };
+    }
+    return window.PromptScreen.promptScreen(handoffScreenRead(id));
+  } catch {
+    return { state: 'unknown', why: 'the screen check failed' };
   }
 }
 
@@ -1899,25 +2043,29 @@ function handoffSendUltracode(id, target) {
 }
 
 async function handoffToggleUltracode(id) {
-  let control = handoffUltracodeControl(id);
+  const entry = handoffEntry(id);
+  let control = handoffUltracodeControl(entry.id);
   if (!control || !control.enabled) return;
   // The direction is the click's: what the button said when it was pressed.
   const target = control.target;
   if (control.override) {
-    if (!await handoffConfirmUltracode(target)) return;
+    if (!await handoffConfirmTyping(control.gate, ULTRACODE_TEXT[target])) return;
     // As in handoffTypeRequest: the question was open for as long as the user
     // took, so wait, read again and decide again. A value that changed
     // meanwhile is not switched back.
     await handoffDelay(HANDOFF_MIN_READ_GAP_MS);
-    await handoffRefresh(id);
-    if (handoffActiveId() !== id) return;
-    control = handoffUltracodeControl(id);
-    if (!control || !control.enabled || control.target !== target) {
-      handoffRenderHeader();
+    await handoffRefresh(entry.id);
+    const gate = typingGate(handoffInputs(entry.id));
+    control = handoffUltracodeControl(entry.id);
+    const left = handoffActiveId() !== entry.id || handoffHeaderOff(entry.id);
+    let note = handoffNotTypedNote(left, gate, control);
+    if (!note && control.target !== target) note = 'Not typed. Ultracode is already ' + target + '.';
+    if (note) {
+      handoffSetClickNote(entry, note);
       return;
     }
   }
-  handoffSendUltracode(id, target);
+  handoffSendUltracode(entry.id, target);
 }
 
 function handoffOnUltracodeClick() {
@@ -2068,7 +2216,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    REQUEST_LINE, WARN_AT, DUE_AT, OVERRIDE_CONFIRM, OVERRIDE_TITLE, OVERRIDE_TITLE_UNSEEN,
+    REQUEST_LINE, WARN_AT, DUE_AT, OVERRIDE_TITLE, OVERRIDE_TITLE_UNSEEN,
     HANDOFF_NOT_LANDED, HANDOFF_NOT_WRITTEN, HANDOFF_SESSION_ENDED,
     REQUEST_EXPIRY_MS, POLL_EVERY_TICKS,
     fmtTokens, chipLevel, deriveCtxDir, meterModel, meterWidth, turnEnded, handoffInfo,
@@ -2076,7 +2224,7 @@ if (typeof module !== 'undefined' && module.exports) {
     parseStoredRequest, pollDue, launchFolder,
     ULTRACODE_TEXT, ULTRACODE_UNKNOWN_TITLE, ULTRACODE_NOT_CONFIRMED, ULTRACODE_NO_WORKFLOWS, ULTRACODE_NO_MODEL,
     STALE_AFTER_MS,
-    typingGate, ultracodeValue, draftOpen, ultracodeModel, ultracodeQuestion, ultracodeScreen, ultracodeOutcome,
+    typingGate, gateText, chooseHeaderNote, ultracodeValue, draftOpen, ultracodeModel, ultracodeScreen, ultracodeOutcome,
     parseStoredUltracode, parseStoredTyped, staleReading, staleTitle,
     handoffChipState, handoffBoltState, handoffNoteTyped, onActiveSessionChanged,
   };
