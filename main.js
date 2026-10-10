@@ -240,7 +240,7 @@ const {
   upsertSearchEntries, updateSearchTitle, deleteSearchSession, deleteSearchFolder, deleteSearchType,
   searchByType, searchSessionIds, isSearchIndexPopulated, searchFtsRecreated,
   getSetting, setSetting, mergeSetting, deleteSetting,
-  // A session whose id changes (fork / plan-accept) has to take its filing
+  // A session whose id changes (fork, plan-accept, /clear) has to take its filing
   // with it. Upstream also destructures `moveSessionAssignment`, for the
   // temp-id launch of a harness that only learns its id from its
   // transcript; this fork is Claude-only and passes --session-id, so the
@@ -2784,10 +2784,11 @@ sessionTransitions.init({
   // A fork re-keys the session; ownership and the MCP window must follow it.
   sendToOwner: registry.sendToOwner,
   rekeyOwner: registry.rekeyOwner,
-  // ...and so must everything that names the session by id. A fork or a
-  // plan-accept is the ONLY place in this fork where a session's id changes
-  // (Claude is launched with --session-id, so there is no temp id to
-  // resolve), which makes this the one place all three have to be applied:
+  // ...and so must everything that names the session by id. A fork, a
+  // plan-accept or a followed /clear is the ONLY way a session's id changes
+  // in this fork, all through rekey() in session-transitions.js (Claude is
+  // launched with --session-id, so there is no temp id to resolve), which
+  // makes this the one place all three have to be applied:
   //   copySessionAssignment  the new id belongs to the same project/track
   //   rekeyPlanLinks         a plan item says which session is working it
   //   rekeyScheduleSession   schedule.lastSessionId is what the ticker asks
