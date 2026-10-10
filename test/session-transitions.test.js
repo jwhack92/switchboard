@@ -217,8 +217,8 @@ function planPass({
 /** New transcript's modification time minus the old one's, as the file system kept them. */
 const planGap = (h) => fs.statSync(h.file(NEW)).mtimeMs - fs.statSync(h.file(LIVE)).mtimeMs;
 
-// PIN, changed on purpose by /clear: its last subtest only. After the fix copySessionAssignment, rekeyPlanLinks and rekeyScheduleSession are called with (old id, new id) on every move, after rekeyOwner and before the send.
-test('session-transitions (pin, last assertion changed on purpose by /clear): fork by forkedFrom, fork-session file, snapshot-only fork, plan-accept, unrelated file, empty file retried, skipped sessions; the effects in order; one re-key per pass; the send has two arguments and comes after the owner moves; the three database functions are not called', async (t) => {
+// PIN 14, changed on purpose by /clear re-key. Formerly: "session-transitions (pin, last assertion changed on purpose by /clear): fork by forkedFrom, fork-session file, snapshot-only fork, plan-accept, unrelated file, empty file retried, skipped sessions; the effects in order; one re-key per pass; the send has two arguments and comes after the owner moves; the three database functions are not called". Two subtests changed and no other: the last one (copySessionAssignment, rekeyPlanLinks and rekeyScheduleSession are now called once with (old id, new id) on every move, after rekeyOwner and before the send) and "fork by forkedFrom: of two sessions waiting ..." (a move to an id another live terminal has is refused).
+test('session-transitions (pin, changed by /clear): fork by forkedFrom, fork-session file, snapshot-only fork, plan-accept, unrelated file, empty file retried, skipped sessions; the effects in order; one re-key per pass; the send has two arguments and comes after the owner moves; the three database functions are called once on every move; a move to an id another live terminal has is refused', async (t) => {
   await t.test('fork by forkedFrom: a new transcript forked from the running session moves the session to it', () => {
     const h = boot();
     h.write(LIVE, [userLine(LIVE, { slug: 'first-slug' })]);
@@ -301,12 +301,11 @@ test('session-transitions (pin, last assertion changed on purpose by /clear): fo
     }
   });
 
-  // Recorded as it is. The second record takes the place of the first in the Map: the first terminal is
-  // then stored under no id at all, though it runs on. Nothing refuses a move to an id that is a key already.
-  // NOT on the agreed list of pins changed on purpose: the /clear plan (step 3(b)) adds a refusal of a move to
-  // an id that is a key already, which would fail this subtest. Jason decides whether it is named as changed
-  // on purpose by /clear, or whether forks keep today's behaviour.
-  await t.test('fork by forkedFrom: today two sessions waiting for a fork of the same source both take the same transcript, and the second replaces the first under the new id', () => {
+  // Changed on purpose by /clear re-key commit 1 (Jason, 2026-10-06, "Every kind (Recommended)"): the one
+  // rekey() refuses, with one warning, a move to an id another live terminal already has as its key or as
+  // an earlier id. Before this commit both sessions took the transcript and the second replaced the first
+  // in the Map, so the first terminal was stored under no id at all though it ran on.
+  await t.test('fork by forkedFrom: of two sessions waiting for a fork of the same source the first takes the transcript; the second is refused with one warning and stays under its own id', () => {
     const h = boot();
     h.write(SOURCE, [userLine(SOURCE)]);
     const first = h.session(TEMP, { forkFrom: SOURCE });
@@ -314,20 +313,19 @@ test('session-transitions (pin, last assertion changed on purpose by /clear): fo
     h.write(NEW, forkOf(SOURCE, NEW));
     h.pass();
 
-    assert.deepEqual(h.effects.map((e) => e.call),
-      ['rekeyMcpServer', 'rekeyOwner', 'sendToOwner', 'rekeyMcpServer', 'rekeyOwner', 'sendToOwner'], 'two moves in the pass');
-    assert.deepEqual(h.effects.map((e) => e.args.slice(0, e.call === 'sendToOwner' ? 4 : 2)), [
-      [TEMP, NEW], [TEMP, NEW], [NEW, 'session-forked', TEMP, NEW],
-      [TEMP_B, NEW], [TEMP_B, NEW], [NEW, 'session-forked', TEMP_B, NEW],
-    ]);
-    assert.deepEqual([...h.sessions.keys()], [NEW], 'one key is left');
-    assert.equal(h.sessions.get(NEW), second, 'and the second record is under it');
-    assert.equal([...h.sessions.values()].includes(first), false, 'the first record is under no key');
-    for (const [record, was] of [[first, TEMP], [second, TEMP_B]]) {
-      assert.equal(record.realSessionId, NEW);
-      assert.deepEqual(record.priorIds, [was]);
-      assert.equal(record.exited, false);
-    }
+    assertMoved(h, first, TEMP, NEW);
+    assert.equal(h.effects.length, 3, 'one move in the pass');
+    assert.deepEqual([...h.sessions.keys()].sort(), [NEW, TEMP_B].sort());
+    assert.equal(h.sessions.get(TEMP_B), second, 'the second record is still under its own id');
+    assert.equal(second.realSessionId, undefined);
+    assert.equal(second.priorIds, undefined);
+    assert.equal(second.exited, false);
+    const refused = () => h.logLines.filter((l) => l.startsWith('warn ') && l.includes('[session-transition] refused'));
+    assert.deepEqual(refused(), [`warn [session-transition] refused old=${TEMP_B} new=${NEW} kind=fork holder=${NEW}`]);
+    assert.equal(knows(second, NEW), true, 'the transcript is taken as known');
+    h.pass();
+    assert.equal(refused().length, 1, 'so it is refused once, not on every pass');
+    assert.equal(h.effects.length, 3);
   });
 
   await t.test('fork-session file: a transcript that opens with the source\'s own messages moves the session started as its fork, and nobody else', () => {
@@ -878,8 +876,10 @@ test('session-transitions (pin, last assertion changed on purpose by /clear): fo
     }
   });
 
-  // The assertion that is changed on purpose by /clear (see the line above this pin).
-  await t.test('the three database functions are not called: copySessionAssignment, rekeyPlanLinks and rekeyScheduleSession are handed to init and never used, whatever kind of move', () => {
+  // Changed on purpose by /clear re-key commit 1: the three are called with (old id, new id) on every move.
+  // Their place between the other calls (after rekeyOwner, before the send) is asserted by
+  // "detector: after any re-key ..." below, which records every call in one list.
+  await t.test('the three database functions are called once on every move with the old id and the new id: copySessionAssignment, rekeyPlanLinks, rekeyScheduleSession, whatever kind of move', () => {
     const byForkedFrom = boot();
     const forked = byForkedFrom.session(LIVE);
     byForkedFrom.write(NEW, forkOf(LIVE, NEW));
@@ -901,11 +901,13 @@ test('session-transitions (pin, last assertion changed on purpose by /clear): fo
     const plan = planPass({ oldAgeMs: 28 * SECOND });
     assertMoved(plan.h, plan.record, LIVE, NEW);
 
-    for (const [what, h] of [
-      ['fork by forkedFrom', byForkedFrom], ['fork-session file', forkSession],
-      ['snapshot-only fork', snapshotOnly], ['plan-accept', plan.h],
+    for (const [what, h, oldId] of [
+      ['fork by forkedFrom', byForkedFrom, LIVE], ['fork-session file', forkSession, TEMP],
+      ['snapshot-only fork', snapshotOnly, TEMP], ['plan-accept', plan.h, LIVE],
     ]) {
-      assert.deepEqual(h.dbCalls, [], what + ': none of the three is called today');
+      assert.deepEqual(h.dbCalls, [
+        ['copySessionAssignment', oldId, NEW], ['rekeyPlanLinks', oldId, NEW], ['rekeyScheduleSession', oldId, NEW],
+      ], what);
     }
   });
 });
@@ -941,4 +943,826 @@ test('session-transitions: keyOf gives the key a record is stored under, by iden
   const kept = require.cache[file];
   delete require.cache[file];
   try { assert.equal(require(file).keyOf({}, 'x'), null); } finally { require.cache[file] = kept; }
+});
+
+// --- /clear: the clear pass, rekey() for every kind, the 5 s follow ---
+
+const LIVE_C = uuid(0);      // a third running session in the folder
+const TAG_A = uuid('a');     // the tags of three terminals
+const TAG_B = uuid('b');
+const TAG_C = uuid('c');
+const TAG_E = uuid('e');     // a tag no terminal has
+
+/**
+ * The head of the transcript /clear starts. Record shapes read from two real transcripts (Claude Code
+ * 2.1.289): a mode record with the file's own id, a snapshot, the hook's attachment (not in every
+ * version), the caveat record, the /clear record, a system record. The value of `mode` is filler.
+ */
+const clearHead = (id, { attachment = true, command = true, commandId = id } = {}) => [
+  { type: 'mode', mode: 'default', sessionId: id },
+  snapshotLine(1),
+  ...(attachment ? [{ type: 'attachment', sessionId: id, uuid: 'at-1', attachment: { type: 'hook_success', hookName: 'SessionStart:clear', hookEvent: 'SessionStart' } }] : []),
+  userLine(id, { uuid: 'u-caveat', isMeta: true, message: { role: 'user', content: '<local-command-caveat>Caveat</local-command-caveat>' } }),
+  ...(command ? [userLine(commandId, { uuid: 'u-clear', message: { role: 'user', content: '<command-name>/clear</command-name>\n            <command-message>clear</command-message>' } })] : []),
+  { type: 'system', subtype: 'local_command', content: '', sessionId: id, uuid: 's-1' },
+];
+
+/** The note the hook writes for transcript `id`: started by /clear in the terminal tagged `tag`, 3 s before NOW. */
+const note = (id, tag, clearedFrom = null, extra = {}) => ({
+  v: 1, session_id: id, source: 'clear', host_token: tag, cleared_from: clearedFrom, prior: [], ts: NOW / 1000 - 3, ...extra,
+});
+
+/**
+ * boot() plus what the clear pass needs: notes, a clock, hand-made timers, and ONE list of every call a
+ * move makes, in the order made. init() is called once, here. A pass does not call it again, because
+ * init() forgets the files that wait for their note. So: one clearBoot at a time.
+ */
+function clearBoot() {
+  const h = boot();
+  const notes = new Map();     // transcript id -> what readClearOrigin answers for it
+  const noteReads = [];        // the ids it was asked for, in order
+  const calls = [];            // [name, ...args] of every call of a move
+  const throwing = new Set();  // names of database follow-ups that throw when called
+  const clock = { now: NOW };
+  let timers = [];
+  let seq = 0;
+  const log = {};
+  for (const level of ['debug', 'info', 'warn', 'error']) log[level] = (...args) => { h.logLines.push(level + ' ' + args.join(' ')); };
+  const record = (name) => (...args) => { calls.push([name, ...args]); };
+  const followUp = (name) => (...args) => { calls.push([name, ...args]); if (throwing.has(name)) throw new Error(name + ' failed'); };
+  transitions.init({
+    PROJECTS_DIR: path.dirname(h.dir), activeSessions: h.sessions, log,
+    rekeyMcpServer: record('rekeyMcpServer'),
+    rekeyOwner: (oldId, newId) => {
+      calls.push(['rekeyOwner', oldId, newId]);
+      if (h.owners.has(oldId)) { h.owners.set(newId, h.owners.get(oldId)); h.owners.delete(oldId); }
+    },
+    sendToOwner: record('sendToOwner'),
+    copySessionAssignment: followUp('copySessionAssignment'), rekeyPlanLinks: followUp('rekeyPlanLinks'),
+    rekeyScheduleSession: followUp('rekeyScheduleSession'), copyStar: followUp('copyStar'),
+    broadcast: record('broadcast'),
+    ownerId: (id) => (h.owners.has(id) ? h.owners.get(id) : null),
+    readClearOrigin: (id) => { noteReads.push(id); return notes.has(id) ? notes.get(id) : null; },
+    now: () => clock.now,
+    setTimer: (fn, ms) => { const timer = { id: ++seq, fn, at: clock.now + ms }; timers.push(timer); return timer; },
+    clearTimer: (timer) => { timers = timers.filter((t) => t !== timer); },
+  });
+  return {
+    ...h, notes, noteReads, calls, throwing, clock,
+    /** One pass over the folder at the clock's time. init() is NOT called again. */
+    pass(folder = FOLDER) {
+      const realNow = Date.now;
+      Date.now = () => clock.now;
+      try { transitions.detectSessionTransitions(folder); } finally { Date.now = realNow; }
+    },
+    /** Moves the clock on by ms and runs every timer that falls due, in order. */
+    advance(ms) {
+      const end = clock.now + ms;
+      for (;;) {
+        const due = timers.filter((t) => t.at <= end).sort((a, b) => a.at - b.at || a.id - b.id)[0];
+        if (!due) break;
+        clock.now = due.at;
+        timers = timers.filter((t) => t !== due);
+        due.fn();
+      }
+      clock.now = end;
+    },
+    /** How long from now each waiting timer falls due. */
+    waiting: () => timers.map((t) => t.at - clock.now),
+    /** The log lines of one level that hold `part`. */
+    lines: (level, part) => h.logLines.filter((l) => l.startsWith(level + ' ') && l.includes(part)),
+  };
+}
+
+/** The calls of one move, in the order rekey() makes them. `clearedAtMs` set = a clear. */
+const moveCalls = (oldId, newId, { clearedAtMs, windowId = null } = {}) => [
+  ['rekeyMcpServer', oldId, newId],
+  ['rekeyOwner', oldId, newId],
+  ['copySessionAssignment', oldId, newId],
+  ['rekeyPlanLinks', oldId, newId],
+  ['rekeyScheduleSession', oldId, newId],
+  ...(clearedAtMs === undefined ? [] : [['copyStar', oldId, newId]]),
+  clearedAtMs === undefined
+    ? ['sendToOwner', newId, 'session-forked', oldId, newId]
+    : ['sendToOwner', newId, 'session-forked', oldId, newId, 'clear', { clearedAtMs }],
+  ['broadcast', 'session-owner-changed', { sessionId: newId, windowId }],
+  ['broadcast', 'session-owner-changed', { sessionId: oldId, windowId: null }],
+];
+
+test('detector: after any re-key the owner broadcast, the three database follow-ups, and for a clear the star carry', async (t) => {
+  await t.test('a fork: MCP, owner, the three follow-ups, the send with two arguments, then the two broadcasts; no star carry', () => {
+    const h = clearBoot();
+    h.write(LIVE, [userLine(LIVE)]);
+    const a = h.session(LIVE);
+    h.owners.set(LIVE, 7);
+    h.write(NEW, forkOf(LIVE, NEW));
+    h.pass();
+    assert.equal(h.sessions.get(NEW), a);
+    assert.deepEqual(h.calls, moveCalls(LIVE, NEW, { windowId: 7 }));
+    assert.equal(a.rekeyedAtMs, NOW, 'the move is stamped with the injected clock');
+  });
+
+  await t.test('a plan-accept: the same calls in the same order', () => {
+    const h = clearBoot();
+    h.write(LIVE, planTail(SLUG), 28 * SECOND);
+    const a = h.session(LIVE);
+    h.write(NEW, [userLine(NEW, { slug: SLUG, planContent: '# Do it' })]);
+    h.pass();
+    assert.equal(h.sessions.get(NEW), a);
+    assert.deepEqual(h.calls, moveCalls(LIVE, NEW));
+    assert.deepEqual(h.lines('info', '[session-transition]'), [`info [session-transition] ${LIVE} → ${NEW} (plan-accept)`]);
+  });
+
+  for (const name of ['copySessionAssignment', 'rekeyPlanLinks', 'rekeyScheduleSession']) {
+    await t.test(`a follow-up that throws (${name}) stops neither the others, the send nor the broadcasts, and is logged once`, () => {
+      const h = clearBoot();
+      h.write(LIVE, [userLine(LIVE)]);
+      const a = h.session(LIVE);
+      h.throwing.add(name);
+      h.write(NEW, forkOf(LIVE, NEW));
+      assert.doesNotThrow(() => h.pass());
+      assert.equal(h.sessions.get(NEW), a);
+      assert.deepEqual(h.calls, moveCalls(LIVE, NEW));
+      assert.deepEqual(h.lines('warn', 'follow-up failed'),
+        [`warn [session-transition] follow-up failed name=${name} old=${LIVE} new=${NEW} error=${name} failed`]);
+    });
+  }
+  await t.test('a clear: the same order, the star carry after the three, and four arguments on the send', () => {
+    const { h, b } = oneTerminal();
+    h.owners.set(LIVE_B, 7);
+    h.write(NEW, clearHead(NEW));
+    h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+    h.pass();
+    assert.equal(h.sessions.get(NEW), b);
+    assert.deepEqual(h.calls, moveCalls(LIVE_B, NEW, { clearedAtMs: TS * 1000, windowId: 7 }));
+  });
+
+  await t.test('a clear whose star carry throws still sends and broadcasts, and is logged once', () => {
+    const { h, b } = oneTerminal();
+    h.throwing.add('copyStar');
+    h.write(NEW, clearHead(NEW));
+    h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+    assert.doesNotThrow(() => h.pass());
+    assert.equal(h.sessions.get(NEW), b);
+    assert.deepEqual(h.calls, moveCalls(LIVE_B, NEW, { clearedAtMs: TS * 1000 }));
+    assert.deepEqual(h.lines('warn', 'follow-up failed'),
+      [`warn [session-transition] follow-up failed name=copyStar old=${LIVE_B} new=${NEW} error=copyStar failed`]);
+  });
+});
+
+test("detector: the new id is already another live terminal's key or prior id (clear and fork); and new id equal to the old id", async (t) => {
+  const holders = [
+    ['its key', (h) => h.session(NEW), NEW],
+    ['an earlier id', (h) => h.session(LIVE_C, { realSessionId: LIVE_C, priorIds: [NEW] }), LIVE_C],
+    ['the key of a terminal that has ended', (h) => h.session(NEW, { exited: true }), NEW],
+  ];
+  for (const [what, makeHolder, holderKey] of holders) {
+    await t.test(`a fork to an id another terminal has as ${what} is refused with one warning and nothing moves`, () => {
+      const h = clearBoot();
+      h.write(LIVE, [userLine(LIVE)]);
+      const a = h.session(LIVE);
+      const holder = makeHolder(h);
+      h.write(NEW, forkOf(LIVE, NEW));
+      h.pass();
+      h.pass();
+      assert.equal(h.sessions.get(LIVE), a);
+      assert.equal(h.sessions.get(holderKey), holder);
+      assert.equal(a.realSessionId, undefined);
+      assert.equal(a.priorIds, undefined);
+      assert.equal(a.rekeyedAtMs, undefined);
+      assert.deepEqual(h.calls, []);
+      assert.deepEqual(h.lines('warn', '[session-transition]'),
+        [`warn [session-transition] refused old=${LIVE} new=${NEW} kind=fork holder=${holderKey}`]);
+    });
+  }
+
+  await t.test('an earlier id of a terminal that has ended does not count: the fork moves', () => {
+    const h = clearBoot();
+    h.write(LIVE, [userLine(LIVE)]);
+    const a = h.session(LIVE);
+    h.session(LIVE_C, { exited: true, realSessionId: LIVE_C, priorIds: [NEW] });
+    h.write(NEW, forkOf(LIVE, NEW));
+    h.pass();
+    assert.equal(h.sessions.get(NEW), a);
+    assert.deepEqual(h.lines('warn', ''), []);
+  });
+
+  await t.test('a plan-accept to an id another terminal has is refused the same way', () => {
+    const plan = planPass({ oldAgeMs: 28 * SECOND, before: (h) => { h.session(NEW); } });
+    assertNeverMoved(plan.h, plan.record, LIVE);
+    assert.deepEqual(plan.h.logLines.filter((l) => l.startsWith('warn ')),
+      [`warn [session-transition] refused old=${LIVE} new=${NEW} kind=plan-accept holder=${NEW}`]);
+  });
+
+  await t.test("a transcript with the terminal's own id that matches a fork rule changes nothing and logs nothing", () => {
+    const h = clearBoot();
+    h.write(SOURCE, [userLine(SOURCE)]);
+    const waiting = h.session(TEMP, { forkFrom: SOURCE });
+    h.write(TEMP, [userLine(SOURCE)]);   // opens with the source's messages, under the terminal's own id
+    h.pass();
+    assert.equal(h.sessions.get(TEMP), waiting);
+    assert.equal(waiting.realSessionId, undefined);
+    assert.equal(waiting.priorIds, undefined);
+    assert.deepEqual(h.calls, []);
+    assert.deepEqual(h.lines('warn', ''), []);
+    assert.deepEqual(h.lines('info', '[session-transition]'), []);
+    assert.equal(knows(waiting, TEMP), true);
+  });
+  for (const [what, makeHolder] of [
+    ['its key', (h) => h.session(NEW)],
+    ['an earlier id', (h) => h.session(LIVE_C, { realSessionId: LIVE_C, priorIds: [NEW] })],
+  ]) {
+    await t.test(`a clear note for a transcript another terminal has as ${what}: the file is left out before any note is read`, () => {
+      const { h, b } = oneTerminal();
+      makeHolder(h);
+      h.write(NEW, clearHead(NEW));
+      h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+      h.pass();
+      assert.equal(h.sessions.get(LIVE_B), b);
+      assert.equal(b.realSessionId, undefined);
+      assert.deepEqual(h.calls, []);
+      assert.deepEqual(h.noteReads, []);
+      assert.deepEqual(h.waiting(), []);
+      assert.deepEqual(h.lines('info', '[clear-detect]').concat(h.lines('warn', '')), []);
+    });
+  }
+});
+
+const MODE = (id) => ({ type: 'mode', mode: 'default', sessionId: id });
+/** A session waiting for its fork, alone in the folder, and one new transcript; then one pass. */
+function waitingFork(lines) {
+  const h = clearBoot();
+  h.write(SOURCE, [userLine(SOURCE)]);
+  const a = h.session(TEMP, { forkFrom: SOURCE, hostToken: TAG_A });
+  h.write(NEW, lines);
+  h.pass();
+  return { h, a };
+}
+
+test("detector: a real snapshot-only fork file, and a file with a snapshot whose first record names its own id but has no /clear record", async (t) => {
+  for (const [what, lines] of [
+    ['snapshots only', [snapshotLine(1), snapshotLine(2)]],
+    ['a mode record with its own id, then a snapshot', [MODE(NEW), snapshotLine(1)]],
+    ['the same, then a first prompt', [MODE(NEW), snapshotLine(1), userLine(NEW)]],
+  ]) {
+    await t.test(`${what}: still taken by the snapshot rule, as today`, () => {
+      const { h, a } = waitingFork(lines);
+      assert.equal(h.sessions.get(NEW), a, what);
+      assert.deepEqual(a.priorIds, [TEMP], what);
+      assert.deepEqual(h.calls, moveCalls(TEMP, NEW), what + ': a fork, so the send has two arguments');
+      assert.deepEqual(h.waiting(), [], what + ': a folder whose only tagged terminal waits for its fork arms no timer');
+      assert.deepEqual(h.noteReads, [NEW], what + ': the snapshot rule asks once whether the file has a clear note');
+    });
+  }
+});
+
+test('detector: a transcript marked as started by /clear is never taken by the snapshot rule', async (t) => {
+  const fillers = (n) => Array.from({ length: n }, (_, i) => ({ type: 'ai-title', aiTitle: 't' + i, sessionId: NEW }));
+  const caveat = userLine(NEW, { uuid: 'u-caveat', isMeta: true, message: { role: 'user', content: '<local-command-caveat>Caveat</local-command-caveat>' } });
+  const command = (sessionId) => userLine(sessionId, { uuid: 'u-clear', message: { role: 'user', content: '<command-name>/clear</command-name>' } });
+  const noId = (line) => { const copy = { ...line }; delete copy.sessionId; return copy; };
+  const half = JSON.stringify(userLine(NEW)).slice(0, 40);
+  const text = (lines) => lines.map((line) => JSON.stringify(line) + '\n').join('');
+
+  for (const [what, lines] of [
+    ['the whole real head', clearHead(NEW)],
+    ['the /clear record and no attachment', clearHead(NEW, { attachment: false })],
+    ['the attachment and no /clear record', clearHead(NEW, { command: false })],
+    ['a /clear record with no session id', [MODE(NEW), snapshotLine(1), caveat, noId(command(NEW))]],
+    ['the /clear record as the 40th record that is not a snapshot', [MODE(NEW), snapshotLine(1), ...fillers(37), caveat, command(NEW)]],
+    ['half a line after the /clear record', text([MODE(NEW), snapshotLine(1), caveat, command(NEW)]) + half],
+  ]) {
+    await t.test(`${what}: the waiting fork does not take it`, () => {
+      const { h, a } = waitingFork(lines);
+      assert.equal(h.sessions.get(TEMP), a, what);
+      assert.equal(a.realSessionId, undefined, what);
+      assert.deepEqual(h.calls, [], what);
+      assert.equal(knows(a, NEW), true, what + ': it is read at once and taken as known');
+    });
+  }
+
+  for (const [what, lines] of [
+    ["a /clear record that carries another conversation's id", clearHead(NEW, { attachment: false, commandId: OTHER })],
+    ['the /clear record as the 41st record that is not a snapshot', [MODE(NEW), snapshotLine(1), ...fillers(38), caveat, command(NEW)]],
+    ['half a line between the caveat and the /clear record', text([MODE(NEW), snapshotLine(1), caveat]) + half + '\n' + text([command(NEW)])],
+    ['the words in an assistant message', [MODE(NEW), snapshotLine(1), { type: 'assistant', sessionId: NEW, uuid: 'a-1', message: { role: 'assistant', content: '<command-name>/clear</command-name>' } }]],
+  ]) {
+    await t.test(`${what}: not a clear head, the snapshot rule takes it as today`, () => {
+      const { h, a } = waitingFork(lines);
+      assert.equal(h.sessions.get(NEW), a, what);
+      assert.deepEqual(h.calls, moveCalls(TEMP, NEW), what);
+    });
+  }
+});
+
+/** Terminal B (tag TAG_B) alone in the folder, with its transcript; returns { h, b }. */
+function oneTerminal(fields = {}) {
+  const h = clearBoot();
+  h.write(LIVE_B, [userLine(LIVE_B)]);
+  const b = h.session(LIVE_B, { hostToken: TAG_B, ...fields });
+  return { h, b };
+}
+const TS = NOW / 1000 - 3;   // the note's time in seconds; note() uses it
+
+test("detector: real /clear head (mode record with its own id, snapshot, attachment, caveat record, /clear record), three terminals in one folder, a note with B's tag and B's id as old id", () => {
+  const h = clearBoot();
+  for (const id of [LIVE, LIVE_B, LIVE_C]) h.write(id, [userLine(id)]);
+  const a = h.session(LIVE, { hostToken: TAG_A });
+  const b = h.session(LIVE_B, { hostToken: TAG_B });
+  const c = h.session(LIVE_C, { hostToken: TAG_C });
+  h.owners.set(LIVE_B, 7);
+  h.write(NEW, clearHead(NEW));
+  h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+  h.pass();
+
+  assert.deepEqual([...h.sessions.keys()], [LIVE, LIVE_C, NEW]);
+  assert.equal(h.sessions.get(NEW), b, 'only B moved');
+  assert.equal(h.sessions.get(LIVE), a);
+  assert.equal(h.sessions.get(LIVE_C), c);
+  assert.equal(b.realSessionId, NEW);
+  assert.deepEqual(b.priorIds, [LIVE_B]);
+  assert.equal(b.rekeyedAtMs, NOW);
+  assert.equal(a.realSessionId, undefined);
+  assert.equal(c.realSessionId, undefined);
+  assert.deepEqual(h.calls, moveCalls(LIVE_B, NEW, { clearedAtMs: TS * 1000, windowId: 7 }));
+  assert.deepEqual(h.lines('info', '[session-transition]'), [`info [session-transition] ${LIVE_B} → ${NEW} (clear)`]);
+  assert.deepEqual(h.lines('info', '[clear-detect]'),
+    [`info [clear-detect] new=${NEW} tag=bbbbbbbb followed: old=${LIVE_B} look=first afterMs=3000`]);
+  assert.deepEqual(h.lines('warn', ''), []);
+  assert.deepEqual(h.noteReads, [NEW], 'the note is read once in the pass');
+  assert.deepEqual(h.waiting(), [], 'nothing waits, no timer');
+  for (const record of [a, b, c]) assert.equal(knows(record, NEW), true);
+});
+
+test('detector: the same real head, note arrives AFTER the first look', () => {
+  const { h, b } = oneTerminal();
+  h.write(NEW, clearHead(NEW));
+  h.pass();
+  assert.equal(h.sessions.get(LIVE_B), b, 'not moved yet');
+  assert.equal(knows(b, NEW), true, 'the fork and plan rules took the file as known, as today');
+  assert.deepEqual(h.waiting(), [2000], 'one re-check, in 2 s');
+  h.notes.set(NEW, note(NEW, TAG_B, LIVE_B, { ts: NOW / 1000 + 1 }));
+  h.advance(2000);   // the transcript is not touched again
+  assert.equal(h.sessions.get(NEW), b);
+  assert.deepEqual(b.priorIds, [LIVE_B]);
+  assert.equal(b.rekeyedAtMs, NOW + 2000);
+  assert.deepEqual(h.calls, moveCalls(LIVE_B, NEW, { clearedAtMs: NOW + 1000 }));
+  assert.deepEqual(h.lines('info', '[clear-detect]'),
+    [`info [clear-detect] new=${NEW} tag=bbbbbbbb followed: old=${LIVE_B} look=recheck afterMs=1000`]);
+  assert.deepEqual(h.waiting(), [], 'the timer stops when nothing waits');
+});
+
+test('detector: note that is 11 minutes old when the pass runs', () => {
+  const { h, b } = oneTerminal();
+  h.write(NEW, clearHead(NEW));
+  h.notes.set(NEW, note(NEW, TAG_B, LIVE_B, { ts: NOW / 1000 - 660 }));
+  h.pass();
+  assert.equal(h.sessions.get(NEW), b);
+  assert.deepEqual(h.lines('info', '[clear-detect]'),
+    [`info [clear-detect] new=${NEW} tag=bbbbbbbb followed: old=${LIVE_B} look=first afterMs=660000`]);
+});
+
+test('detector: no note ever; injected clock past 60 s', () => {
+  const { h, b } = oneTerminal();   // one terminal alone in the folder: being the only candidate attaches nothing
+  h.write(NEW, clearHead(NEW));
+  h.pass();
+  h.advance(58000);
+  assert.equal(h.sessions.get(LIVE_B), b);
+  assert.deepEqual(h.waiting(), [2000]);
+  assert.deepEqual(h.lines('info', '[clear-detect]'), []);
+  h.advance(2000);   // the look at 60 s
+  assert.deepEqual(h.lines('info', '[clear-detect]'), [`info [clear-detect] new=${NEW} tag=none not followed: no note after 60 s`]);
+  assert.deepEqual(h.waiting(), [], 'the timer stops');
+  assert.equal(h.noteReads.length, 31, 'the first look and thirty re-checks');
+  assert.equal(h.sessions.get(LIVE_B), b);
+  assert.deepEqual(h.calls, []);
+  h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+  h.pass();
+  h.advance(10000);
+  assert.equal(h.sessions.get(LIVE_B), b, 'a note that comes after the file was dropped moves nothing');
+  assert.equal(h.lines('info', '[clear-detect]').length, 1, 'and the line is not written again');
+});
+
+test("detector: terminal A waits for a fork and comes first in the Map; B's clear file is seen with a late note", () => {
+  const h = clearBoot();
+  h.write(SOURCE, [userLine(SOURCE)]);
+  h.write(LIVE_B, [userLine(LIVE_B)]);
+  const a = h.session(TEMP, { forkFrom: SOURCE, hostToken: TAG_A });
+  const b = h.session(LIVE_B, { hostToken: TAG_B });
+  h.write(NEW, clearHead(NEW));
+  h.pass();
+  assert.equal(h.sessions.get(TEMP), a, 'A did not take the cleared transcript');
+  assert.equal(a.realSessionId, undefined);
+  assert.deepEqual(h.calls, []);
+  h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+  h.advance(2000);
+  assert.equal(h.sessions.get(NEW), b);
+  assert.equal(h.sessions.get(TEMP), a);
+  assert.deepEqual(h.lines('warn', ''), []);
+});
+
+test("detector: A waits for a fork, B's clear file has a valid note in the same pass", () => {
+  const h = clearBoot();
+  h.write(SOURCE, [userLine(SOURCE)]);
+  h.write(LIVE_B, [userLine(LIVE_B)]);
+  const a = h.session(TEMP, { forkFrom: SOURCE, hostToken: TAG_A });   // first in the Map
+  const b = h.session(LIVE_B, { hostToken: TAG_B });
+  // No /clear record and no attachment in the head: only the pass order and the note keep A away.
+  h.write(NEW, [MODE(NEW), snapshotLine(1)]);
+  h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+  h.pass();
+  assert.equal(h.sessions.get(NEW), b, 'B is moved before any fork rule runs');
+  assert.equal(h.sessions.get(TEMP), a);
+  assert.equal(a.realSessionId, undefined);
+  assert.deepEqual(h.calls, moveCalls(LIVE_B, NEW, { clearedAtMs: TS * 1000 }));
+  assert.deepEqual(h.lines('warn', ''), [], 'A did not even try: a file with a valid clear note is not a snapshot fork');
+});
+
+test('detector: note whose tag belongs to no live terminal, or to one that is exited, plain, in another folder, or a fork waiting for its file', async (t) => {
+  for (const [what, tag, fields] of [
+    ['no terminal', TAG_E, {}],
+    ['an exited terminal', TAG_B, { exited: true }],
+    ['a plain terminal', TAG_B, { isPlainTerminal: true }],
+    ['a terminal of another folder', TAG_B, { projectFolder: 'C--another-project' }],
+    ['a fork still waiting for its file', TAG_B, { forkFrom: SOURCE }],
+  ]) {
+    await t.test(`${what} has the tag: nobody moves, one line`, () => {
+      const h = clearBoot();
+      h.write(LIVE, [userLine(LIVE)]);
+      h.write(LIVE_B, [userLine(LIVE_B)]);
+      const watcher = h.session(LIVE, { hostToken: TAG_A });   // an eligible terminal, so the folder is looked at
+      const target = h.session(LIVE_B, { hostToken: TAG_B, ...fields });
+      h.write(NEW, clearHead(NEW));
+      h.notes.set(NEW, note(NEW, tag, LIVE_B));
+      h.pass();
+      h.pass();
+      assert.equal(h.sessions.get(LIVE_B), target, what);
+      assert.equal(target.realSessionId, undefined, what);
+      assert.equal(h.sessions.get(LIVE), watcher, what);
+      assert.deepEqual(h.calls, [], what);
+      assert.deepEqual(h.lines('info', '[clear-detect]'),
+        [`info [clear-detect] new=${NEW} tag=${tag.slice(0, 8)} not followed: no live terminal has this tag`], what);
+      assert.deepEqual(h.waiting(), [], what);
+    });
+  }
+});
+
+test("detector: note with B's tag and no old id", async (t) => {
+  for (const [what, change] of [
+    ['cleared_from null', (n) => n],
+    ['no cleared_from field', (n) => { delete n.cleared_from; return n; }],
+    ['no cleared_from and no prior field', (n) => { delete n.cleared_from; delete n.prior; return n; }],
+  ]) {
+    await t.test(`${what}: the tag is enough`, () => {
+      const { h, b } = oneTerminal();
+      h.write(NEW, clearHead(NEW));
+      h.notes.set(NEW, change(note(NEW, TAG_B, null)));
+      h.pass();
+      assert.equal(h.sessions.get(NEW), b, what);
+      assert.deepEqual(b.priorIds, [LIVE_B], what);
+    });
+  }
+});
+
+test("detector: note with B's tag whose old id is another terminal's id or an unknown id, and no prior list", async (t) => {
+  for (const [what, clearedFrom] of [["another terminal's id", LIVE], ['an unknown id', OTHER]]) {
+    await t.test(`${what}: nobody moves, one warning`, () => {
+      const h = clearBoot();
+      h.write(LIVE, [userLine(LIVE)]);
+      h.write(LIVE_B, [userLine(LIVE_B)]);
+      const a = h.session(LIVE, { hostToken: TAG_A });
+      const b = h.session(LIVE_B, { hostToken: TAG_B });
+      h.write(NEW, clearHead(NEW));
+      h.notes.set(NEW, note(NEW, TAG_B, clearedFrom));
+      h.pass();
+      h.pass();
+      assert.equal(h.sessions.get(LIVE), a, what);
+      assert.equal(h.sessions.get(LIVE_B), b, what);
+      assert.deepEqual(h.calls, [], what);
+      assert.deepEqual(h.lines('warn', '[clear-detect]'),
+        [`warn [clear-detect] new=${NEW} tag=bbbbbbbb not followed: old id does not lead back to this terminal`], what);
+      assert.deepEqual(h.lines('info', '[clear-detect]'), [], what);
+      assert.deepEqual(h.waiting(), [], what);
+    });
+  }
+});
+
+test("detector: a missed clear, then a second one whose note lists the terminal's key under prior; and the same through an older note of the same tag", async (t) => {
+  await t.test('through the prior list', () => {
+    const { h, b } = oneTerminal({ realSessionId: LIVE_B, priorIds: [OLDER] });
+    h.write(NEW, clearHead(NEW));
+    h.pass();              // the first clear: its start step was cut off, no note ever
+    h.advance(60000);      // dropped
+    h.write(NEW2, clearHead(NEW2));
+    h.notes.set(NEW2, note(NEW2, TAG_B, NEW, { prior: [LIVE_B] }));
+    h.pass();
+    assert.equal(h.sessions.get(NEW2), b);
+    assert.deepEqual(b.priorIds, [OLDER, NEW, LIVE_B], 'the missed id goes in before the old key, which stays the newest earlier id');
+    assert.deepEqual(h.calls, moveCalls(LIVE_B, NEW2, { clearedAtMs: TS * 1000 }));
+  });
+
+  await t.test('through an older note of the same tag', () => {
+    const h = clearBoot();
+    h.write(LIVE_B, [userLine(LIVE_B)]);
+    h.write(NEW, clearHead(NEW));   // there before the terminal's list was taken: never looked at as new
+    const b = h.session(LIVE_B, { hostToken: TAG_B });
+    h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+    h.write(NEW2, clearHead(NEW2));
+    h.notes.set(NEW2, note(NEW2, TAG_B, NEW));
+    h.pass();
+    assert.equal(h.sessions.get(NEW2), b);
+    assert.deepEqual(b.priorIds, [NEW, LIVE_B]);
+    assert.deepEqual(h.noteReads, [NEW2, NEW], 'the older note is read once, for the hop');
+  });
+
+  await t.test('an older note with another tag does not count', () => {
+    const { h, b } = oneTerminal();
+    h.notes.set(NEW, note(NEW, TAG_C, LIVE_B));
+    h.write(NEW2, clearHead(NEW2));
+    h.notes.set(NEW2, note(NEW2, TAG_B, NEW));
+    h.pass();
+    assert.equal(h.sessions.get(LIVE_B), b);
+    assert.equal(h.lines('warn', '[clear-detect]').length, 1);
+  });
+});
+
+test('detector: two clears from one terminal in one pass, both file orders', async (t) => {
+  for (const [first, second] of [[NEW, NEW2], [NEW2, NEW]]) {
+    await t.test(`the older clear is ${first === NEW ? 'listed first' : 'listed last'}: one re-key, to the newest`, () => {
+      const { h, b } = oneTerminal();
+      h.write(first, clearHead(first));
+      h.write(second, clearHead(second));
+      h.notes.set(first, note(first, TAG_B, LIVE_B, { ts: TS }));
+      h.notes.set(second, note(second, TAG_B, first, { ts: TS + 2 }));
+      h.pass();
+      assert.deepEqual([...h.sessions.keys()], [second]);
+      assert.equal(h.sessions.get(second), b);
+      assert.deepEqual(b.priorIds, [first, LIVE_B]);
+      assert.deepEqual(h.calls, moveCalls(LIVE_B, second, { clearedAtMs: (TS + 2) * 1000 }));
+      h.pass();
+      h.advance(4000);
+      assert.equal(h.calls.filter((call) => call[0] === 'sendToOwner').length, 1, 'and it never goes back to the older one');
+    });
+  }
+});
+
+test('detector: two terminals clear in the same pass', () => {
+  const h = clearBoot();
+  h.write(LIVE, [userLine(LIVE)]);
+  h.write(LIVE_B, [userLine(LIVE_B)]);
+  const a = h.session(LIVE, { hostToken: TAG_A });
+  const b = h.session(LIVE_B, { hostToken: TAG_B });
+  h.write(NEW, clearHead(NEW));
+  h.write(NEW2, clearHead(NEW2));
+  h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));   // the first file listed belongs to the second terminal
+  h.notes.set(NEW2, note(NEW2, TAG_A, LIVE));
+  h.pass();
+  assert.equal(h.sessions.get(NEW), b);
+  assert.equal(h.sessions.get(NEW2), a);
+  assert.deepEqual([...h.sessions.keys()].sort(), [NEW, NEW2]);
+  assert.equal(h.calls.filter((call) => call[0] === 'sendToOwner').length, 2);
+});
+
+test("detector: malformed note, wrong session_id, source 'startup', tag not a UUID, ts not a number", async (t) => {
+  for (const [what, bad] of [
+    ['a string', 'not a note'],
+    ['an array', [1]],
+    ['v 2', note(NEW, TAG_B, LIVE_B, { v: 2 })],
+    ['the session_id of another file', note(NEW, TAG_B, LIVE_B, { session_id: NEW2 })],
+    ["source 'startup'", note(NEW, TAG_B, LIVE_B, { source: 'startup' })],
+    ['a tag that is not a UUID', note(NEW, TAG_B, LIVE_B, { host_token: 'bbbbbbbb' })],
+    ['no tag', note(NEW, TAG_B, LIVE_B, { host_token: undefined })],
+    ['ts as text', note(NEW, TAG_B, LIVE_B, { ts: String(TS) })],
+    ['ts NaN', note(NEW, TAG_B, LIVE_B, { ts: NaN })],
+  ]) {
+    await t.test(`${what}: treated as no note, the file waits`, () => {
+      const { h, b } = oneTerminal();
+      h.write(NEW, clearHead(NEW));
+      h.notes.set(NEW, bad);
+      h.pass();
+      assert.equal(h.sessions.get(LIVE_B), b, what);
+      assert.deepEqual(h.calls, [], what);
+      assert.deepEqual(h.waiting(), [2000], what);
+      assert.deepEqual(h.lines('info', '[clear-detect]').concat(h.lines('warn', '[clear-detect]')), [], what);
+    });
+  }
+});
+
+test("detector: a new terminal's own first transcript is not held for a note and not logged", () => {
+  const { h } = oneTerminal();
+  const c = h.session(NEW, { hostToken: TAG_C });   // started under NEW; its transcript is not there yet
+  h.write(NEW, [userLine(NEW)]);
+  h.pass();
+  assert.equal(h.sessions.get(NEW), c);
+  assert.deepEqual(h.noteReads, []);
+  assert.deepEqual(h.waiting(), [], 'no timer for a file that is a live terminal\'s own');
+  assert.deepEqual(h.lines('info', '[clear-detect]'), []);
+});
+
+test('detector: a note that lands 59 s after the first look is still followed at the look at 60 s', () => {
+  const { h, b } = oneTerminal();
+  h.write(NEW, clearHead(NEW));
+  h.pass();
+  h.advance(58000);
+  h.notes.set(NEW, note(NEW, TAG_B, LIVE_B, { ts: NOW / 1000 + 59 }));
+  h.advance(2000);
+  assert.equal(h.sessions.get(NEW), b);
+  assert.deepEqual(h.lines('info', '[clear-detect]'),
+    [`info [clear-detect] new=${NEW} tag=bbbbbbbb followed: old=${LIVE_B} look=recheck afterMs=1000`]);
+  assert.deepEqual(h.waiting(), []);
+});
+
+test('detector: a transcript that stays new for several passes is looked at once and logged once; an empty transcript with a valid note is followed at once', () => {
+  const settled = oneTerminal();
+  settled.h.write(NEW, '');   // empty: the fork rules hold it back, so it is new again on every pass
+  settled.h.notes.set(NEW, note(NEW, TAG_E, null));
+  settled.h.pass();
+  settled.h.pass();
+  settled.h.pass();
+  assert.equal(knows(settled.b, NEW), false, 'held back as an empty file, as today');
+  assert.deepEqual(settled.h.noteReads, [NEW]);
+  assert.equal(settled.h.lines('info', '[clear-detect]').length, 1);
+  assert.deepEqual(settled.h.waiting(), []);
+
+  const followed = oneTerminal();
+  followed.h.write(NEW, '');
+  followed.h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+  followed.h.pass();
+  assert.equal(followed.h.sessions.get(NEW), followed.b, 'the tag decides; the transcript need not have a line yet');
+});
+
+test('detector: two notes that name each other as the old id end the walk and move nobody', () => {
+  const { h, b } = oneTerminal();
+  h.write(NEW, clearHead(NEW));
+  h.write(NEW2, clearHead(NEW2));
+  h.notes.set(NEW, note(NEW, TAG_B, NEW2));
+  h.notes.set(NEW2, note(NEW2, TAG_B, NEW));
+  h.pass();
+  assert.equal(h.sessions.get(LIVE_B), b);
+  assert.deepEqual(h.calls, []);
+  assert.equal(h.lines('warn', '[clear-detect]').length, 2, 'one warning for each file');
+  assert.deepEqual(h.waiting(), []);
+});
+
+test('detector: a tagged terminal that accepts a plan or forks moves in that pass as before; its new transcript gets no clear line and the one re-check stops by itself', async (t) => {
+  for (const [what, oldLines, oldAgeMs, newLines] of [
+    ['a plan-accept', planTail(SLUG), 28 * SECOND, [userLine(NEW, { slug: SLUG, planContent: '# Do it' })]],
+    ['a fork', [userLine(LIVE)], 0, forkOf(LIVE, NEW)],
+  ]) {
+    await t.test(what, () => {
+      const h = clearBoot();
+      h.write(LIVE, oldLines, oldAgeMs);
+      const a = h.session(LIVE, { hostToken: TAG_A });
+      h.write(NEW, newLines);
+      h.pass();
+      assert.equal(h.sessions.get(NEW), a, what);
+      assert.deepEqual(h.calls, moveCalls(LIVE, NEW), what + ': two arguments on the send, no star carry');
+      assert.deepEqual(h.noteReads, [NEW], what + ': the clear pass looked at the file first and found no note');
+      assert.deepEqual(h.waiting(), [2000], what + ': so one re-check was armed before the old rule took the file');
+      h.advance(2000);
+      assert.deepEqual(h.waiting(), [], what + ": by then the file is the terminal's own key: forgotten, and the timer stops");
+      assert.deepEqual(h.noteReads, [NEW], what + ': the note is not asked for again');
+      assert.deepEqual(h.calls, moveCalls(LIVE, NEW), what + ': no further call');
+      assert.deepEqual(h.lines('info', '[clear-detect]').concat(h.lines('warn', '')), [], what);
+    });
+  }
+});
+
+test('detector: the tagged terminal ends, or leaves the list, while its cleared transcript waits for its note: nobody moves, and a note that lands afterwards moves nothing', async (t) => {
+  for (const [what, gone] of [
+    ['the terminal has ended', (h, b) => { b.exited = true; }],
+    ['the terminal has left the list', (h) => { h.sessions.delete(LIVE_B); }],
+  ]) {
+    await t.test(`${what}, alone in its folder: the re-check stops and no line is written`, () => {
+      const { h, b } = oneTerminal();
+      h.write(NEW, clearHead(NEW));
+      h.pass();
+      assert.deepEqual(h.waiting(), [2000], what + ': the file waits for its note');
+      gone(h, b);
+      assert.doesNotThrow(() => h.advance(2000), what);
+      assert.deepEqual(h.waiting(), [], what + ': no eligible terminal is left in the folder, so the timer stops');
+      h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+      assert.doesNotThrow(() => { h.pass(); h.advance(10000); }, what);
+      assert.equal(b.realSessionId, undefined, what);
+      assert.equal(h.sessions.has(NEW), false, what + ': nobody is stored under the new id');
+      assert.deepEqual(h.calls, [], what);
+      assert.deepEqual(h.waiting(), [], what);
+      assert.deepEqual(h.lines('info', '[clear-detect]').concat(h.lines('warn', '')), [], what);
+    });
+  }
+
+  await t.test('the terminal has ended and another tagged terminal runs in the folder: the late note ends the file with one line', () => {
+    const h = clearBoot();
+    h.write(LIVE, [userLine(LIVE)]);
+    h.write(LIVE_B, [userLine(LIVE_B)]);
+    const watcher = h.session(LIVE, { hostToken: TAG_A });
+    const b = h.session(LIVE_B, { hostToken: TAG_B });
+    h.write(NEW, clearHead(NEW));
+    h.pass();
+    assert.deepEqual(h.waiting(), [2000]);
+    b.exited = true;
+    h.advance(2000);
+    assert.deepEqual(h.waiting(), [2000], 'the file still waits: the other terminal keeps the folder looked at');
+    h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+    h.advance(2000);
+    assert.equal(h.sessions.get(LIVE_B), b);
+    assert.equal(b.realSessionId, undefined);
+    assert.equal(h.sessions.get(LIVE), watcher);
+    assert.deepEqual(h.calls, []);
+    assert.deepEqual(h.lines('info', '[clear-detect]'),
+      [`info [clear-detect] new=${NEW} tag=bbbbbbbb not followed: no live terminal has this tag`]);
+    assert.deepEqual(h.lines('warn', ''), []);
+    assert.deepEqual(h.waiting(), [], 'the file has its outcome: the timer stops');
+  });
+});
+
+test('detector: a second /clear from the same terminal while the first cleared transcript still waits for its note', () => {
+  const { h, b } = oneTerminal();
+  h.write(NEW, clearHead(NEW));
+  h.pass();            // the first clear: no note yet, the file waits
+  h.advance(10000);
+  assert.deepEqual(h.waiting(), [2000], 'still waiting, 10 s in');
+  h.write(NEW2, clearHead(NEW2));
+  h.notes.set(NEW2, note(NEW2, TAG_B, NEW, { prior: [LIVE_B], ts: NOW / 1000 + 9 }));
+  h.pass();
+  assert.deepEqual([...h.sessions.keys()], [NEW2], 'one re-key, to the newest id');
+  assert.equal(h.sessions.get(NEW2), b);
+  assert.deepEqual(b.priorIds, [NEW, LIVE_B], 'the id that still waited goes in before the old key');
+  assert.deepEqual(h.calls, moveCalls(LIVE_B, NEW2, { clearedAtMs: NOW + 9000 }));
+  h.advance(60000);
+  assert.deepEqual(h.lines('info', '[clear-detect]'),
+    [`info [clear-detect] new=${NEW2} tag=bbbbbbbb followed: old=${LIVE_B} look=first afterMs=1000`],
+    'the first file is an earlier id of a live terminal now: forgotten, with no "not followed" line');
+  assert.deepEqual(h.lines('warn', ''), []);
+  assert.deepEqual(h.waiting(), [], 'and the timer stops');
+  assert.equal(h.calls.filter((call) => call[0] === 'sendToOwner').length, 1);
+});
+
+test("detector: a clear's missed id that another terminal holds does not become an earlier id of the terminal that moved on; forgetPriorId still takes an id out of the list rekey() wrote", async (t) => {
+  for (const [what, makeHolder, holderKey] of [
+    ['its key', (h) => h.session(NEW), NEW],
+    ['an earlier id', (h) => h.session(LIVE_C, { realSessionId: LIVE_C, priorIds: [NEW] }), LIVE_C],
+  ]) {
+    await t.test(`the missed id is another terminal's, as ${what}: the clear is followed and the id is left out`, () => {
+      // B's first /clear (to NEW) was missed: no note ever. NEW was then opened again in a second terminal.
+      const { h, b } = oneTerminal({ realSessionId: LIVE_B, priorIds: [OLDER] });
+      const holder = makeHolder(h);
+      h.write(NEW2, clearHead(NEW2));
+      h.notes.set(NEW2, note(NEW2, TAG_B, NEW, { prior: [LIVE_B] }));
+      h.pass();
+      assert.equal(h.sessions.get(NEW2), b, what + ': the clear is followed');
+      assert.equal(h.sessions.get(holderKey), holder, what + ': the other terminal is not touched');
+      assert.deepEqual(b.priorIds, [OLDER, LIVE_B], what + ': NEW belongs to the other terminal, so it is no earlier id of this one');
+      assert.deepEqual(h.calls, moveCalls(LIVE_B, NEW2, { clearedAtMs: TS * 1000 }), what);
+      assert.deepEqual(h.lines('warn', ''), [], what);
+      // Task 04's rule itself still works on the list rekey() wrote.
+      transitions.forgetPriorId(LIVE_B);
+      assert.deepEqual(b.priorIds, [OLDER], what);
+    });
+  }
+});
+
+test('resolveInputSession table', () => {
+  const sessions = new Map();
+  transitions.init({ activeSessions: sessions });   // as the pty harness does: nothing else is needed, nothing throws
+  const T = NOW;
+  const moved = { exited: false, realSessionId: 'now', priorIds: ['first', 'before'], rekeyedAtMs: T - 4000 };
+  sessions.set('now', moved);
+  const at = (id, nowMs = T) => transitions.resolveInputSession(id, nowMs);
+
+  assert.deepEqual(Object.keys(at('now')), ['id', 'session']);
+  assert.equal(at('now').id, 'now');
+  assert.equal(at('now').session, moved, 'the exact key');
+  assert.equal(at('before').id, 'now', 'the newest earlier id, 4 s after the move: the live id is answered');
+  assert.equal(at('before').session, moved);
+  assert.equal(at('before', moved.rekeyedAtMs + 5000).session, moved, 'exactly 5 s: still followed');
+  assert.equal(at('before', moved.rekeyedAtMs + 5001), null, 'one ms more: not followed');
+  assert.equal(at('first'), null, 'an older earlier id is never followed');
+  assert.equal(at('nobody'), null);
+  for (const bad of [undefined, null, '', 7]) assert.equal(at(bad), null, 'not an id: ' + String(bad));
+
+  // A record that was moved by something that did not stamp it is not followed.
+  sessions.set('unstamped', { exited: false, realSessionId: 'unstamped', priorIds: ['was'] });
+  assert.equal(at('was'), null);
+  // A record with an empty list of earlier ids is not found by a missing id.
+  sessions.set('fresh', { exited: false, priorIds: [], rekeyedAtMs: T });
+  assert.equal(at(undefined), null);
+
+  // The exact key always wins: another record stored under the earlier id.
+  const resumed = { exited: false };
+  sessions.set('before', resumed);
+  assert.equal(at('before').session, resumed);
+  assert.equal(at('before').id, 'before');
+  sessions.delete('before');
+
+  // A moved record that has ended is not followed; under its own key it is answered as it is.
+  moved.exited = true;
+  assert.equal(at('before'), null);
+  assert.equal(at('now').session, moved);
+});
+
+test('session-transitions: the file says that a change to it needs an app restart, and names the other lookup', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'session-transitions.js'), 'utf8');
+  assert.ok(source.slice(0, 600).includes('a change here needs an app restart'));
+  assert.match(source, /resolveLiveSession/);
 });

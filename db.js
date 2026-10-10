@@ -1145,6 +1145,14 @@ function copySessionAssignment(fromId, toId) {
   return true;
 }
 
+function copyStar(fromId, toId) {
+  const from = stmts.get.get(fromId);
+  const to = stmts.get.get(toId);
+  if (!from || !from.starred || (to && to.starred)) return false;
+  stmts.upsertStar.run(toId);
+  return true;
+}
+
 // A session that runs under a temporary id until its transcript appears: the
 // assignment recorded at launch has to follow it to the real id, and the
 // placeholder row must not keep claiming the project.
@@ -1172,7 +1180,7 @@ module.exports = {
   listSchedules, listSchedulesByProject, getSchedule, insertSchedule, updateSchedule, deleteSchedule,
   getImportedScheduleFiles, importLegacySchedule,
   recordScheduleRun, rekeyScheduleSession,
-  setSessionAssignment, copySessionAssignment, moveSessionAssignment,
+  setSessionAssignment, copySessionAssignment, copyStar, moveSessionAssignment,
   insertPlanLink, listPlanLinks, rekeyPlanLinks,
   closeDb,
 };
