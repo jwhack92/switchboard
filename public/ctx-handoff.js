@@ -666,9 +666,12 @@ function launchFolder(session, sidecar) {
 }
 
 // Forward slashes: the path is pasted into a prompt, where a backslash is one
-// escaping rule away from being eaten.
+// escaping rule away from being eaten. "Main session only" matches the hook's
+// own paste line: a workflow agent is handed the session's last typed message,
+// and without it the agents open the handoff too.
 function continuePrompt(handoffPath) {
-  return 'Read ' + String(handoffPath).replace(/\\/g, '/') + ' in full before doing anything else, then continue';
+  return 'Main session only; workflow agents and subagents skip this and do only the task in their prompt: read ' +
+    String(handoffPath).replace(/\\/g, '/') + ' in full before doing anything else, then continue';
 }
 
 // How the state file relates to one request. The hook stamps crossed_at when

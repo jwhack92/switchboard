@@ -1342,20 +1342,20 @@ test('buttonModel: no input at all is an invisible, disabled model', () => {
 test('continuePrompt: backslashes become forward slashes', () => {
   assert.equal(
     continuePrompt(HANDOFF_PATH),
-    'Read C:/Users/jhack/AppData/Local/claude-ctx/handoffs/abc.md in full before doing anything else, then continue'
+    'Main session only; workflow agents and subagents skip this and do only the task in their prompt: read C:/Users/jhack/AppData/Local/claude-ctx/handoffs/abc.md in full before doing anything else, then continue'
   );
 });
 
 test('continuePrompt: a forward-slash path is left alone', () => {
   assert.equal(
     continuePrompt('C:/Users/jhack/AppData/Local/claude-ctx/handoffs/abc.md'),
-    'Read C:/Users/jhack/AppData/Local/claude-ctx/handoffs/abc.md in full before doing anything else, then continue'
+    'Main session only; workflow agents and subagents skip this and do only the task in their prompt: read C:/Users/jhack/AppData/Local/claude-ctx/handoffs/abc.md in full before doing anything else, then continue'
   );
 });
 
 test('continuePrompt: mixed slashes and spaces, every backslash converted', () => {
   const out = continuePrompt('C:\\Users\\Some One/AppData\\Local/claude-ctx\\h.md');
-  assert.equal(out, 'Read C:/Users/Some One/AppData/Local/claude-ctx/h.md in full before doing anything else, then continue');
+  assert.equal(out, 'Main session only; workflow agents and subagents skip this and do only the task in their prompt: read C:/Users/Some One/AppData/Local/claude-ctx/h.md in full before doing anything else, then continue');
   assert.ok(!out.includes('\\'));
 });
 
@@ -2902,7 +2902,7 @@ test('browser: Continue starts one sibling in the same folder, no worktree, told
   assert.equal(h.launches.length, 1);
   assert.deepEqual(JSON.parse(h.launches[0]), {
     target: { projectPath: 'C:\\proj' },
-    options: { model: 'm', initialPrompt: 'Read C:/h/handoff.md in full before doing anything else, then continue' },
+    options: { model: 'm', initialPrompt: 'Main session only; workflow agents and subagents skip this and do only the task in their prompt: read C:/h/handoff.md in full before doing anything else, then continue' },
   });
   assert.deepEqual(h.sent, [], 'Continue types nothing into the old session');
   assert.equal(h.confirms.length, 0);
@@ -2925,7 +2925,7 @@ test('browser: Continue from an ultracode session starts the sibling in ultracod
     target: { projectPath: 'C:\\proj' },
     options: {
       model: 'm', effort: 'ultracode',
-      initialPrompt: 'Read C:/h/handoff.md in full before doing anything else, then continue',
+      initialPrompt: 'Main session only; workflow agents and subagents skip this and do only the task in their prompt: read C:/h/handoff.md in full before doing anything else, then continue',
     },
   });
 });
@@ -3209,7 +3209,7 @@ test('browser: a session with nothing to carry over continues unnamed, as before
     assert.equal(h.launches.length, 1, JSON.stringify(fields));
     assert.deepEqual(JSON.parse(h.launches[0]), {
       target: { projectPath: 'C:\\proj' },
-      options: { model: 'm', initialPrompt: 'Read C:/h/handoff.md in full before doing anything else, then continue' },
+      options: { model: 'm', initialPrompt: 'Main session only; workflow agents and subagents skip this and do only the task in their prompt: read C:/h/handoff.md in full before doing anything else, then continue' },
     });
     assert.equal(h.launchExtras[0].name, null);
     assert.deepEqual(remembered(localStorage), [], 'nothing to remember');
