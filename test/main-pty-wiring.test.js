@@ -1294,6 +1294,8 @@ function spawnFakes() {
     MAX_BUFFER_SIZE: 256 * 1024,
     cleanPtyEnv: {},
     TERMINAL_IDENTITY_ENV: require('../pty-env').TERMINAL_IDENTITY_ENV,
+    ...require('../launch-plan'),
+    LAUNCH_HOST: { platform: 'linux', fs: null, gitBash: null },
     getMeta: () => null,
     getCachedSession: () => ({}),
     projects: {},
@@ -3155,4 +3157,97 @@ test('main-pty-wiring: each of the two lookups of an earlier id names the other 
   const input = transitions.indexOf('function resolveInputSession(');
   assert.ok(input > 0);
   assert.match(transitions.slice(Math.max(0, input - 1500), input), /resolveLiveSession/);
+});
+
+// --- Launch without Git Bash (task L): the open-terminal handler asks launch-plan.js ---
+
+test('main-pty-wiring: on Windows a session starts claude.exe directly, a missing claude starts nothing, a pre-launch on Auto goes to Git Bash, and a plain terminal types the start-up line only into a shell that needs it', async (t) => {
+  const { windowsCommandLine } = require('../launch-plan');
+  const CLAUDE_EXE = 'C:\\bin\\claude.exe';
+  const GIT_BASH = { root: 'C:\\Git', bash: 'C:\\Git\\bin\\bash.exe' };
+  const PATH_ERROR = "claude was not found on PATH (searched the app's PATH; a PATH set only in a shell profile is not read)";
+  // A Windows file system that holds only the files named.
+  const windowsFs = (...files) => ({
+    existsSync: (p) => files.includes(p),
+    lstatSync: (p) => (files.includes(p) ? { isSymbolicLink: () => false } : undefined),
+  });
+  const onWindows = ({ files = [CLAUDE_EXE], gitBash = null, profile = { id: 'auto', path: 'C:\\pwsh\\pwsh.exe', args: [] } } = {}) => {
+    const env = spawnFakes();
+    env.globals.LAUNCH_HOST = { platform: 'win32', fs: windowsFs(...files), gitBash };
+    env.globals.cleanPtyEnv = { Path: 'C:\\bin;C:\\Windows\\System32' };
+    env.globals.resolveShell = () => profile;
+    const h = boot({ blocks: ['resolve', 'open'], globals: env.globals });
+    return { env, h, a: h.window() };
+  };
+
+  await t.test('a session: claude.exe with its arguments as one command line, the tag in its environment, and a [launch] line beside [terminal-tag]', async () => {
+    const { env, h, a } = onWindows();
+    const { session, proc } = await start(h, env, a, 's1');
+    assert.equal(proc.shell, CLAUDE_EXE);
+    assert.equal(typeof proc.args, 'string', 'node-pty is handed one command line, not an array');
+    assert.equal(proc.args, windowsCommandLine(['--session-id', 's1', '--ide']));
+    assert.equal(proc.options.env.SWITCHBOARD_TERMINAL_ID, session.hostToken, 'the tag is still in the environment handed to pty.spawn');
+    const tagAt = h.log.lines.findIndex((line) => line.startsWith('info [terminal-tag] session=s1 '));
+    const launchAt = h.log.lines.indexOf('info [launch] kind=session id=s1 how=direct file=' + CLAUDE_EXE);
+    assert.ok(tagAt >= 0, 'the [terminal-tag] line');
+    assert.ok(launchAt >= 0, 'the [launch] line');
+    assert.equal(Math.abs(launchAt - tagAt), 1, 'the two lines stand together');
+  });
+
+  await t.test('claude not found: the answer names PATH, nothing is spawned, and the MCP server of the id is shut down', async () => {
+    const { env, h, a } = onWindows({ files: [] });
+    const answer = await h.invoke('open-terminal', a, 's1', PROJECT, true);
+    assert.equal(answer.ok, false);
+    assert.equal(answer.error, PATH_ERROR);
+    assert.equal(env.spawned.length, 0, 'nothing was spawned');
+    assert.deepEqual(env.mcpStarted, ['s1']);
+    assert.deepEqual(env.mcpShutdowns, ['s1'], 'the MCP server started for the id is shut down');
+    assert.equal(h.activeSessions.has('s1'), false, 'no record is left');
+  });
+
+  await t.test('a pre-launch command on an Auto project with Git Bash: a Git Bash login with the pre-launch, claude and --ide', async () => {
+    const { env, h, a } = onWindows({ gitBash: GIT_BASH });
+    const { proc } = await start(h, env, a, 's1', { options: { preLaunchCmd: 'aws-vault exec p --' } });
+    assert.equal(proc.shell, GIT_BASH.bash);
+    assert.deepEqual([...proc.args], ['-l', '-i', '-c', "aws-vault exec p -- claude '--session-id' 's1' --ide"]);
+  });
+
+  await t.test('a plain terminal whose profile is pwsh: -NoProfile -NoExit, and nothing typed at 300 ms', async () => {
+    const { env, h, a } = onWindows({ profile: { id: 'pwsh', path: 'C:\\pwsh\\pwsh.exe', args: [] } });
+    const { proc } = await start(h, env, a, 't1', { options: { type: 'terminal' } });
+    assert.equal(proc.shell, 'C:\\pwsh\\pwsh.exe');
+    assert.equal(typeof proc.args, 'string');
+    assert.ok(proc.args.includes('"-NoProfile" "-NoExit"'), proc.args);
+    h.timers.advance(300);
+    assert.deepEqual(proc.calls, [], 'no start-up line');
+  });
+
+  await t.test('a plain terminal whose profile is cmd: nothing typed', async () => {
+    const { env, h, a } = onWindows({ profile: { id: 'cmd', path: 'C:\\Windows\\System32\\cmd.exe', args: [] } });
+    const { proc } = await start(h, env, a, 't1', { options: { type: 'terminal' } });
+    assert.equal(proc.shell, 'C:\\Windows\\System32\\cmd.exe');
+    assert.deepEqual([...proc.args], []);
+    h.timers.advance(300);
+    assert.deepEqual(proc.calls, [], 'no start-up line');
+  });
+
+  await t.test('a plain terminal whose profile is Git Bash: a login shell and the start-up line as today', async () => {
+    const { env, h, a } = onWindows({ profile: { id: 'git-bash', path: 'C:\\Program Files\\Git\\bin\\bash.exe', args: [] } });
+    const { proc } = await start(h, env, a, 't1', { options: { type: 'terminal' } });
+    assert.deepEqual([...proc.args], ['-l', '-i']);
+    h.timers.advance(300);
+    assert.equal(proc.calls.length, 1);
+    assert.equal(proc.calls[0].op, 'write');
+    assert.ok(proc.calls[0].data.startsWith('claude() {'), 'the shell function');
+    assert.ok(proc.calls[0].data.endsWith(' clear\n'), 'then clear');
+  });
+});
+
+test('main-pty-wiring: the open-terminal handler asks launch-plan.js for the command: planLaunch once, planTerminal once, and no shellArgs or quoteArgvForShell of its own', () => {
+  const open = cut('main.js', '// --- IPC: open-terminal ---', "ipcMain.handle('get-window-info', (event) => {");
+  const count = (needle) => open.split(needle).length - 1;
+  assert.equal(count('planLaunch('), 1);
+  assert.equal(count('planTerminal('), 1);
+  assert.equal(count('shellArgs('), 0);
+  assert.equal(count('quoteArgvForShell('), 0);
 });

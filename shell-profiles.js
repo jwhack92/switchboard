@@ -4,6 +4,63 @@ const fs = require('fs');
 // --- Cross-platform shell resolution ---
 const isWindows = process.platform === 'win32';
 
+function exeExists(p, fsLike = fs) {
+  try {
+    if (fsLike.existsSync(p)) return true;
+    return !!fsLike.lstatSync(p, { throwIfNoEntry: false });
+  } catch {
+    return false;
+  }
+}
+
+function pwshCandidates(env) {
+  const programFiles = env.ProgramFiles || 'C:\\Program Files';
+  const candidates = [
+    path.win32.join(programFiles, 'PowerShell', '7', 'pwsh.exe'),
+    path.win32.join(programFiles, 'PowerShell', '7-preview', 'pwsh.exe'),
+  ];
+  if (env.LOCALAPPDATA) candidates.push(path.win32.join(env.LOCALAPPDATA, 'Microsoft', 'WindowsApps', 'pwsh.exe'));
+  if (env.USERPROFILE) candidates.push(path.win32.join(env.USERPROFILE, 'AppData', 'Local', 'Microsoft', 'WindowsApps', 'pwsh.exe'));
+  return candidates;
+}
+
+function findGitBash(env = process.env, fsLike = fs) {
+  const candidates = [
+    path.win32.join(env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe'),
+    path.win32.join(env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'bin', 'bash.exe'),
+  ];
+  if (env.LOCALAPPDATA) candidates.push(path.win32.join(env.LOCALAPPDATA, 'Programs', 'Git', 'bin', 'bash.exe'));
+  for (const bash of candidates) {
+    if (exeExists(bash, fsLike)) return { root: path.win32.dirname(path.win32.dirname(bash)), bash };
+  }
+  return null;
+}
+
+function windowsEnvFacts(platform = process.platform, env = process.env, { fs: fsLike = fs, execFileSync = require('child_process').execFileSync, now = Date.now } = {}) {
+  if (platform !== 'win32') return null;
+  const git = findGitBash(env, fsLike);
+  const localeSet = Object.keys(env).some((k) => ['LANG', 'LC_ALL', 'LC_CTYPE'].includes(k.toUpperCase()) && env[k]);
+  let locale = null;
+  let ms = 0;
+  if (git && !localeSet) {
+    const start = now();
+    try {
+      const out = execFileSync(path.win32.join(git.root, 'usr', 'bin', 'locale.exe'), ['-uU'], { encoding: 'utf8', timeout: 1500, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+      locale = String(out).trim() || null;
+    } catch {
+      locale = null;
+    }
+    ms = now() - start;
+  }
+  let intl = null;
+  try {
+    intl = Intl.DateTimeFormat().resolvedOptions().locale || null;
+  } catch {
+    intl = null;
+  }
+  return { git, locale, intl, ms };
+}
+
 // Discover available shell profiles on this system.
 // Returns an array of { id, name, path, args? } objects.
 function discoverShellProfiles() {
@@ -19,12 +76,8 @@ function discoverShellProfiles() {
     }
 
     // PowerShell 7+ (pwsh)
-    const pwshCandidates = [
-      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe'),
-      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'PowerShell', '7-preview', 'pwsh.exe'),
-    ];
-    for (const p of pwshCandidates) {
-      if (fs.existsSync(p)) {
+    for (const p of pwshCandidates(process.env)) {
+      if (exeExists(p)) {
         profiles.push({ id: 'pwsh', name: 'PowerShell 7', path: p });
         break;
       }
@@ -37,16 +90,9 @@ function discoverShellProfiles() {
     }
 
     // Git Bash
-    const gitBashCandidates = [
-      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe'),
-      path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'bin', 'bash.exe'),
-      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Git', 'bin', 'bash.exe'),
-    ];
-    for (const p of gitBashCandidates) {
-      if (p && fs.existsSync(p)) {
-        profiles.push({ id: 'git-bash', name: 'Git Bash', path: p });
-        break;
-      }
+    const gitBash = findGitBash();
+    if (gitBash) {
+      profiles.push({ id: 'git-bash', name: 'Git Bash', path: gitBash.bash });
     }
 
     // MSYS2
@@ -112,30 +158,17 @@ function resolveShell(profileId) {
   if (profileId && profileId !== 'auto') {
     const profiles = getShellProfiles();
     const profile = profiles.find(p => p.id === profileId);
-    if (profile && (profile.path === 'wsl.exe' || fs.existsSync(profile.path))) {
+    if (profile && (profile.path === 'wsl.exe' || fs.existsSync(profile.path) || (isWindows && exeExists(profile.path)))) {
       return profile;
     }
   }
 
   // Auto: original detection logic
+  if (isWindows) return require('./launch-plan').pickWindowsAuto(getShellProfiles(), process.env);
+
   // 1. Respect explicit SHELL env (set by Git Bash, MSYS2, WSL, etc.)
   if (process.env.SHELL && fs.existsSync(process.env.SHELL)) {
     return { id: 'auto', name: 'Auto', path: process.env.SHELL };
-  }
-
-  if (isWindows) {
-    // 2. Look for Git Bash in common locations
-    const candidates = [
-      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe'),
-      path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'bin', 'bash.exe'),
-      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Git', 'bin', 'bash.exe'),
-      'C:\\msys64\\usr\\bin\\bash.exe',
-    ];
-    for (const c of candidates) {
-      if (c && fs.existsSync(c)) return { id: 'auto', name: 'Auto', path: c };
-    }
-    // 3. Fall back to PowerShell / cmd
-    return { id: 'auto', name: 'Auto', path: process.env.COMSPEC || 'powershell.exe' };
   }
 
   // Unix fallback chain
@@ -185,7 +218,7 @@ function quoteArgvForShell(shellPath, argv) {
 }
 
 // Returns spawn args appropriate for the resolved shell
-function shellArgs(shellPath, cmd, extraArgs) {
+function shellArgs(shellPath, cmd, extraArgs, platform = process.platform) {
   const base = path.basename(shellPath).toLowerCase();
   const isBashLike = base.includes('bash') || base.includes('zsh') || base === 'sh';
   const isFish = base === 'fish';
@@ -202,14 +235,14 @@ function shellArgs(shellPath, cmd, extraArgs) {
     if (isBashLike) return ['-l', '-i', '-c', cmd];
     if (isFish) return ['-l', '-c', cmd];
     if (isNushell) return ['-l', '-c', cmd];
-    if (base.includes('powershell') || base.includes('pwsh')) return ['-NoLogo', '-Command', cmd];
+    if (base.includes('powershell') || base.includes('pwsh')) return platform === 'win32' ? ['-NoLogo', '-NoProfile', '-Command', cmd] : ['-NoLogo', '-Command', cmd];
     return ['/C', cmd];
   }
   if (isBashLike) return ['-l', '-i'];
   if (isFish) return ['-l', '-i'];
   if (isNushell) return ['-l', '-i'];
-  if (base.includes('powershell') || base.includes('pwsh')) return ['-NoLogo', '-NoExit'];
+  if (base.includes('powershell') || base.includes('pwsh')) return platform === 'win32' ? ['-NoLogo', '-NoProfile', '-NoExit'] : ['-NoLogo', '-NoExit'];
   return [];
 }
 
-module.exports = { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgForShell, quoteArgvForShell };
+module.exports = { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgForShell, quoteArgvForShell, exeExists, pwshCandidates, findGitBash, windowsEnvFacts };

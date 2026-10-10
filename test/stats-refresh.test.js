@@ -236,6 +236,8 @@ function bootRefreshStats({ base = { PATH: 'C:\\fake\\bin' }, settings = { shell
       pty: { spawn: (...args) => { seen.spawned.push(args); return 'the pty'; } },
       os: { homedir: () => STATS_HOME },
       cleanPtyEnv: base,
+      ...sourceCut.realOrStandIn('./launch-plan', {}),
+      LAUNCH_HOST: { platform: 'linux', fs: null, gitBash: null },
       log: { warn: (...args) => seen.warns.push(args), info() {}, error() {}, debug() {} },
     },
   });
@@ -294,7 +296,8 @@ test('stats refresh wiring (pin): one run at a time; the home folder; the comman
     await pending;
   });
 
-  await t.test('the command: claude "/stats" through the shell profile of the settings, started with the pty', async () => {
+  // PIN 26, subtest changed on purpose by launch without Git Bash. Formerly: "the command: claude "/stats" through the shell profile of the settings, started with the pty".
+  await t.test('the command: off Windows, claude "/stats" through the shell profile of the settings, as launch-plan.js builds it, started with the pty', async () => {
     const { refresh, seen, realShellArgs } = bootRefreshStats();
     const pending = refresh();
     const { opts } = seen.runs[0];
@@ -302,10 +305,6 @@ test('stats refresh wiring (pin): one run at a time; the home folder; the comman
     assert.deepEqual(seen.settingKeys, ['global']);
     assert.deepEqual(seen.profileIds, ['bash-profile'], 'the shell profile chosen in the settings');
     assert.equal(opts.shell, BASH_PROFILE.path);
-    assert.equal(seen.shellArgs.length, 1);
-    assert.equal(seen.shellArgs[0][0], BASH_PROFILE.path);
-    assert.equal(seen.shellArgs[0][1], STATS_COMMAND);
-    assert.deepEqual([...seen.shellArgs[0][2]], BASH_PROFILE.args, 'the profile\'s own arguments are handed on');
     assert.deepEqual([...opts.args], realShellArgs(BASH_PROFILE.path, STATS_COMMAND, BASH_PROFILE.args));
     assert.equal([...opts.args].filter((arg) => arg === STATS_COMMAND).length, 1, 'the command is one argument, as written');
 
@@ -321,13 +320,14 @@ test('stats refresh wiring (pin): one run at a time; the home folder; the comman
     await pending;
   });
 
-  await t.test('the command: without saved settings the default profile is used, and a profile without arguments gives none', async () => {
+  // PIN 26, subtest changed on purpose by launch without Git Bash. Formerly: "the command: without saved settings the default profile is used, and a profile without arguments gives none".
+  await t.test('the command: off Windows, without saved settings the default profile is used, and a profile without arguments gives none', async () => {
     for (const settings of [null, {}]) {
       const { refresh, seen } = bootRefreshStats({ settings, profile: { path: BASH_PROFILE.path } });
       const pending = refresh();
       assert.deepEqual(seen.profileIds, ['the-default-profile'], JSON.stringify(settings));
-      assert.equal(seen.shellArgs[0][1], STATS_COMMAND);
-      assert.deepEqual([...seen.shellArgs[0][2]], []);
+      assert.equal([...seen.runs[0].opts.args].at(-1), STATS_COMMAND);
+      assert.deepEqual([...seen.runs[0].opts.args], sourceCut.realOrStandIn('./shell-profiles').shellArgs(BASH_PROFILE.path, STATS_COMMAND, []));
       seen.runs[0].finish({ error: null });
       await pending;
     }
@@ -406,4 +406,59 @@ test('stats-refresh: the refresh-stats handler uses statsPtyEnv (wiring only)', 
   assert.equal(kept.seen.runs[0].opts.options.env.MSYS2_ARG_CONV_EXCL, '/foo;/stats');
   kept.seen.runs[0].finish({ error: null });
   await keptPending;
+});
+
+test('stats-refresh: on Windows the Stats run starts claude.exe directly with "/stats" and the same environment; a missing claude answers an error without a run', async () => {
+  const launchPlan = require('../launch-plan');
+  const { statsPtyEnv } = require('../pty-env');
+  const CLAUDE_EXE = 'C:\\bin\\claude.exe';
+  const base = { Path: 'C:\\bin;C:\\Windows\\System32' };
+  // Its own small loader of the same cut, with a Windows host.
+  const bootOnWindows = (files) => {
+    const block = sourceCut.cut('main.js', '// --- IPC: refresh-stats', '// --- IPC: get-usage');
+    const handlers = new Map();
+    const runs = [];
+    const infos = [];
+    sourceCut.load(block, {
+      file: 'main.js',
+      globals: {
+        ...require('../pty-env'),
+        ...launchPlan,
+        LAUNCH_HOST: {
+          platform: 'win32',
+          fs: { existsSync: (p) => files.includes(p), lstatSync: () => undefined },
+          gitBash: null,
+        },
+        ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) },
+        fetchAndTransformUsage: async () => ({}),
+        refreshStatsCache: async (file, run) => ({ stats: null, statsError: (await run()).error }),
+        runStatsCommand: (opts) => { runs.push(opts); return Promise.resolve({ error: null }); },
+        STATS_CACHE_PATH: STATS_CACHE_FILE,
+        getSetting: () => ({ shellProfile: 'auto' }),
+        SETTING_DEFAULTS: { shellProfile: 'auto' },
+        resolveShell: () => ({ id: 'auto', name: 'Auto', path: 'C:\\pwsh\\pwsh.exe', args: [] }),
+        shellArgs: require('../shell-profiles').shellArgs,
+        pty: { spawn: () => 'the pty' },
+        os: { homedir: () => STATS_HOME },
+        cleanPtyEnv: base,
+        log: { warn() {}, info: (line) => infos.push(line), error() {}, debug() {} },
+      },
+    });
+    return { refresh: () => handlers.get('refresh-stats')({}), runs, infos };
+  };
+
+  const found = bootOnWindows([CLAUDE_EXE]);
+  const answer = await found.refresh();
+  assert.equal(found.runs.length, 1);
+  assert.equal(found.runs[0].shell, CLAUDE_EXE);
+  assert.equal(found.runs[0].args, launchPlan.windowsCommandLine(['/stats']));
+  assert.deepEqual({ ...found.runs[0].options.env }, statsPtyEnv(base), 'the environment is still statsPtyEnv of the base');
+  assert.equal(answer.statsError, null);
+  assert.ok(found.infos.includes('[launch] kind=stats how=direct file=' + CLAUDE_EXE), JSON.stringify(found.infos));
+
+  const missing = bootOnWindows([]);
+  const failed = await missing.refresh();
+  assert.equal(missing.runs.length, 0, 'nothing is run');
+  assert.equal(failed.statsError, "claude was not found on PATH (searched the app's PATH; a PATH set only in a shell profile is not read)");
+  assert.ok(missing.infos.includes('[launch] kind=stats how=none reason=not-found'), JSON.stringify(missing.infos));
 });

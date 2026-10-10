@@ -62,7 +62,7 @@ const CLAUDE_SESSION_VARS = [
 
 const LOCALE_VARS = ['LC_ALL', 'LC_CTYPE', 'LANG'];
 
-function buildPtyEnv(sourceEnv, platform = process.platform) {
+function buildPtyEnv(sourceEnv, platform = process.platform, facts = null) {
   const env = Object.fromEntries(
     Object.entries(sourceEnv).filter(([k]) =>
       !k.startsWith('ELECTRON_') &&
@@ -99,7 +99,83 @@ function buildPtyEnv(sourceEnv, platform = process.platform) {
   // what a GUI launch actually produces.
   if (platform === 'darwin' && !LOCALE_VARS.some((k) => env[k])) env.LC_CTYPE = 'UTF-8';
 
+  if (platform === 'win32' && facts) return fillWindowsEnv(env, facts);
+
   return env;
+}
+
+function keyOf(env, name) {
+  const upper = name.toUpperCase();
+  return Object.keys(env).find((k) => k.toUpperCase() === upper);
+}
+
+function fillWhenUnset(env, name, value) {
+  const key = keyOf(env, name);
+  if (key !== undefined && env[key]) return;
+  env[key === undefined ? name : key] = value;
+}
+
+function samePathEntry(a, b) {
+  const norm = (p) => p.replace(/\\+$/, '').toLowerCase();
+  return norm(a) === norm(b);
+}
+
+function fillWindowsEnv(env, facts) {
+  const pathKeys = Object.keys(env).filter((k) => k.toUpperCase() === 'PATH');
+  if (pathKeys.length > 1) {
+    const lastKey = pathKeys[pathKeys.length - 1];
+    const value = env[lastKey];
+    for (const k of pathKeys) delete env[k];
+    env[lastKey] = value;
+  }
+
+  if (!LOCALE_VARS.some((name) => { const k = keyOf(env, name); return k !== undefined && env[k]; })) {
+    const locale = facts.locale;
+    const lang = typeof locale === 'string' && (/^[A-Za-z]{2,3}(_[A-Z]{2})?\.UTF-8$/.test(locale) || locale === 'C.UTF-8')
+      ? locale
+      : (langFromLocaleTag(facts.intl) || 'C.UTF-8');
+    fillWhenUnset(env, 'LANG', lang);
+  }
+
+  const git = facts.git;
+  if (git) {
+    const pathKey = keyOf(env, 'PATH');
+    if (pathKey !== undefined) {
+      const front = [git.root + '\\cmd', git.root + '\\bin'];
+      const back = [git.root + '\\mingw64\\bin', git.root + '\\usr\\bin'];
+      const entries = String(env[pathKey]).split(';');
+      let at = entries.findIndex((e) => /\\system32$/i.test(e.replace(/\\+$/, '')));
+      if (at < 0) at = 0;
+      const before = entries.slice(0, at);
+      const toInsert = front.filter((f) => !before.some((e) => samePathEntry(e, f)));
+      const after = entries.slice(at).filter((e) => !front.some((f) => samePathEntry(e, f)));
+      const result = [...before, ...toInsert, ...after];
+      for (const b of back) {
+        if (!result.some((e) => samePathEntry(e, b))) result.push(b);
+      }
+      env[pathKey] = result.join(';');
+    }
+    fillWhenUnset(env, 'CLAUDE_CODE_GIT_BASH_PATH', git.root + '\\bin\\bash.exe');
+    fillWhenUnset(env, 'MSYSTEM', 'MINGW64');
+  }
+
+  const profileKey = keyOf(env, 'USERPROFILE');
+  if (profileKey !== undefined && env[profileKey]) fillWhenUnset(env, 'HOME', env[profileKey]);
+
+  return env;
+}
+
+function langFromLocaleTag(tag) {
+  if (typeof tag !== 'string') return null;
+  let t = tag;
+  for (const ext of ['-u-', '-x-']) {
+    const i = t.indexOf(ext);
+    if (i >= 0) t = t.slice(0, i);
+  }
+  if (t === 'und') return null;
+  t = t.replace(/-/g, '_');
+  if (!/^[a-z]{2,3}(_[A-Z]{2})?$/.test(t)) return null;
+  return t + '.UTF-8';
 }
 
 // The values every terminal child is given so that programs draw as in a real
@@ -136,4 +212,4 @@ function statsPtyEnv(baseEnv) {
   };
 }
 
-module.exports = { buildPtyEnv, CLAUDE_SESSION_VARS, TERMINAL_IDENTITY_ENV, statsPtyEnv };
+module.exports = { buildPtyEnv, CLAUDE_SESSION_VARS, TERMINAL_IDENTITY_ENV, statsPtyEnv, langFromLocaleTag };

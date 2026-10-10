@@ -89,7 +89,14 @@ mainFaults.installListeners(process);
 // the Claude-marker strip in particular is ours and has no upstream equivalent.
 const { buildPtyEnv, TERMINAL_IDENTITY_ENV, statsPtyEnv } = require('./pty-env');
 
-const cleanPtyEnv = buildPtyEnv(process.env);
+const { windowsEnvFacts } = require('./shell-profiles');
+const launchFacts = windowsEnvFacts();
+const cleanPtyEnv = buildPtyEnv(process.env, process.platform, launchFacts);
+if (launchFacts) {
+  const lang = cleanPtyEnv.LANG;
+  const from = lang === process.env.LANG ? 'inherited' : lang === launchFacts.locale ? 'git' : lang === 'C.UTF-8' ? 'default' : 'intl';
+  log.info(`[launch-env] lang=${lang} from=${from} ms=${launchFacts.ms}`);
+}
 
 // The pty guard: the one gate for every terminal write, resize and kill
 // (pty-guard.js). Nothing else in this file calls a session's pty. Required
@@ -107,6 +114,8 @@ const ptyGuard = createPtyGuard({
 // Shell profiles → shell-profiles.js
 const { resolveEffectiveSettings } = require('./resolve-effective-settings');
 const { discoverShellProfiles, getShellProfiles, resolveShell, isWindows, isWslShell, windowsToWslPath, shellArgs, quoteArgvForShell } = require('./shell-profiles');
+const { planLaunch, planTerminal, markAutoPick, launchLogLine } = require('./launch-plan');
+const LAUNCH_HOST = { platform: process.platform, fs, gitBash: launchFacts && launchFacts.git };
 // The old file-based cron loop (`startScheduler`) is GONE — projects.js owns
 // scheduling now, and two tickers would each fire every schedule-*.md task.
 // What survives is `scanSchedules`, the reader for those files: it feeds
@@ -1489,6 +1498,7 @@ try {
 // that one argument, for this run only. Measured 2026-10-06 with Git Bash:
 // /stats arrives unchanged and /c/Users is still converted. NOT measured:
 // whether Stats > Activity then finishes inside the 10 second limit.
+// On Windows the run starts claude.exe directly (launch-plan.js), with no shell between.
 let statsRefreshInFlight = null;
 ipcMain.handle('refresh-stats', async () => {
   if (statsRefreshInFlight) return statsRefreshInFlight;
@@ -1498,10 +1508,13 @@ ipcMain.handle('refresh-stats', async () => {
     const result = await refreshStatsCache(STATS_CACHE_PATH, () => {
       const globalSettings = getSetting('global') || {};
       const profile = resolveShell(globalSettings.shellProfile || SETTING_DEFAULTS.shellProfile);
+      const plan = planLaunch({ ...LAUNCH_HOST, binary: 'claude', args: ['/stats'], shellCommand: 'claude "/stats"', profile, env: cleanPtyEnv, target: 'pty' });
+      log.info(launchLogLine({ kind: 'stats', plan }, LAUNCH_HOST.fs));
+      if (plan.how === 'none') return { error: plan.error };
       return runStatsCommand({
         spawn: (...args) => pty.spawn(...args),
-        shell: profile.path,
-        args: shellArgs(profile.path, 'claude "/stats"', profile.args || []),
+        shell: plan.file,
+        args: plan.args,
         options: {
           name: 'xterm-256color', cols: 120, rows: 40, cwd: os.homedir(),
           env: statsPtyEnv(cleanPtyEnv),
@@ -1886,7 +1899,7 @@ ipcMain.handle('get-setting-defaults', () => ({ ...SETTING_DEFAULTS }));
 
 ipcMain.handle('get-shell-profiles', () => {
   _shellProfiles = null; // refresh on each request
-  return getShellProfiles();
+  return markAutoPick(getShellProfiles(), process.platform, process.env);
 });
 
 ipcMain.handle('get-effective-settings', (_event, projectPath) => {
@@ -2314,7 +2327,8 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
       // Plain terminal: interactive login shell, no claude command
       // Inject a shell function to override `claude` with a helpful message
       const claudeShim = 'claude() { echo "\\033[33mTo start a Claude session, use the + button in the sidebar.\\033[0m"; return 1; }; export -f claude 2>/dev/null;';
-      ptyProcess = pty.spawn(shell, shellArgs(shell, undefined, shellExtraArgs), {
+      const tplan = planTerminal({ platform: LAUNCH_HOST.platform, profile: { path: shell, args: shellExtraArgs } });
+      ptyProcess = pty.spawn(tplan.file, tplan.args, {
         name: 'xterm-256color',
         cols: 120,
         rows: 30,
@@ -2328,7 +2342,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
           BASH_ENV: claudeShim,
         },
       });
-      startupLine = claudeShim + ' clear\n';
+      startupLine = tplan.typeShim ? claudeShim + ' clear\n' : null;
     } else {
       // Argv is built by the harness and quoted here, so a value can never be
       // spliced into the command line as shell syntax.
@@ -2344,7 +2358,8 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         sessionId, isNew, startFresh, options: sessionOptions,
       });
 
-      let claudeCmd = claudeHarness.binary + ' ' + quoteArgvForShell(shell, claudeArgs);
+      const flags = [];
+      let preLaunchCmd = '';
 
       // preLaunchCmd is raw shell by design (e.g. "aws-vault exec profile --") — block newlines only
       if (sessionOptions?.preLaunchCmd) {
@@ -2352,7 +2367,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         if (/[\r\n]/.test(pre)) {
           return { ok: false, error: 'preLaunchCmd must not contain newlines' };
         }
-        claudeCmd = pre + ' ' + claudeCmd;
+        preLaunchCmd = pre;
       }
 
       // Start MCP server for this session so Claude CLI sends diffs/file opens to Switchboard
@@ -2362,7 +2377,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
           // panelPaths.watchWindow for the same reason as the reattach path
           // above: the bridge's own pushes are what make an MCP diff savable.
           mcpServer = await startMcpServer(sessionId, [projectPath], panelPaths.watchWindow(win), log);
-          claudeCmd += ' --ide';
+          flags.push('--ide');
         } catch (err) {
           log.error(`[mcp] Failed to start MCP server for ${sessionId}: ${err.message}`);
         }
@@ -2381,7 +2396,13 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
       hostToken = require('crypto').randomUUID();
       ptyEnv.SWITCHBOARD_TERMINAL_ID = hostToken;
 
-      ptyProcess = pty.spawn(shell, shellArgs(shell, claudeCmd, shellExtraArgs), {
+      const plan = planLaunch({ ...LAUNCH_HOST, binary: claudeHarness.binary, args: claudeArgs, flags, preLaunchCmd, profile: shellProfile, env: ptyEnv, target: 'pty' });
+      if (plan.how === 'none') {
+        if (mcpServer) shutdownMcpServer(sessionId);
+        return { ok: false, error: plan.error };
+      }
+
+      ptyProcess = pty.spawn(plan.file, plan.args, {
         name: 'xterm-256color',
         cols: 120,
         rows: 30,
@@ -2389,6 +2410,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         env: ptyEnv,
       });
       log.info(`[terminal-tag] session=${sessionId} tag=${hostToken.slice(0, 8)}`);
+      log.info(launchLogLine({ kind: 'session', id: sessionId, plan }, LAUNCH_HOST.fs));
 
     }
   } catch (err) {
@@ -3184,9 +3206,7 @@ if (!gotSingleInstanceLock) {
       const globalSettings = getSetting('global') || {};
       const profileId = globalSettings.shellProfile || SETTING_DEFAULTS.shellProfile;
       const profile = resolveShell(profileId);
-      const shell = profile.path;
-      const cmd = 'claude ' + quoteArgvForShell(shell, claudeArgv);
-      const args = shellArgs(shell, cmd, profile.args || []);
+      const plan = planLaunch({ ...LAUNCH_HOST, binary: 'claude', args: claudeArgv, profile, env: cleanPtyEnv, target: 'child' });
 
       // THE single gate. Both spawn paths reach this function — the cron loop
       // in schedule-runner.js and `run-schedule-now` in schedule-ipc.js — so
@@ -3201,9 +3221,16 @@ if (!gotSingleInstanceLock) {
         return;
       }
 
-      log.info(`[schedule] Running: ${shell} ${args.join(' ')}`);
+      if (plan.how === 'none') {
+        log.error(`[schedule] ${name} could not start: ${plan.error}`);
+        if (onDone) onDone();
+        return;
+      }
+
+      log.info(`[schedule] Running: ${plan.file} ${plan.args.join(' ')}`);
+      log.info(launchLogLine({ kind: 'schedule', name, plan }, LAUNCH_HOST.fs));
       const startedAtMs = Date.now();
-      const child = cpSpawn(shell, args, {
+      const child = cpSpawn(plan.file, plan.args, {
         cwd,
         stdio: ['ignore', 'ignore', 'pipe'],
         env: { ...cleanPtyEnv, FORCE_COLOR: '0' },

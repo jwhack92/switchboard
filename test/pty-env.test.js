@@ -232,3 +232,120 @@ test('pty-env: an inherited SWITCHBOARD_TERMINAL_ID is stripped', () => {
   // (statsPtyEnv is the name task 11 declared at the top of this file; it is not declared again.)
   assert.equal('SWITCHBOARD_TERMINAL_ID' in statsPtyEnv(buildPtyEnv(inherited, 'linux')), false);
 });
+
+// --- launch without Git Bash: the Windows fill-ins (task L) ---
+
+const ptyEnvModule = require('../pty-env');
+
+const GIT = { root: 'C:\\Program Files\\Git', bash: 'C:\\Program Files\\Git\\bin\\bash.exe' };
+const FACTS = { git: GIT, locale: 'en_US.UTF-8', intl: 'en-US', ms: 5 };
+const WIN_PATH = 'C:\\Windows\\System32;C:\\Windows;C:\\nodejs';
+
+test('pty-env: with facts null, win32, darwin and linux give what they give without the parameter, two PATH keys included', () => {
+  const sources = [
+    { PATH: '/usr/bin' },
+    { Path: WIN_PATH, PATH: 'C:\\other', USERPROFILE: 'C:\\Users\\u' },
+    { LANG: '' },
+  ];
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    for (const source of sources) {
+      assert.deepEqual(buildPtyEnv(source, platform, null), buildPtyEnv(source, platform), `${platform} ${JSON.stringify(source)}`);
+    }
+  }
+  assert.deepEqual(buildPtyEnv({ Path: WIN_PATH, PATH: 'C:\\other' }, 'win32', null), { Path: WIN_PATH, PATH: 'C:\\other' });
+});
+
+test('pty-env: LANG is filled on win32 only when LANG, LC_ALL and LC_CTYPE are all unset, from locale.exe, else Intl, else C.UTF-8', () => {
+  assert.equal(buildPtyEnv({ Path: WIN_PATH }, 'win32', FACTS).LANG, 'en_US.UTF-8');
+  assert.equal(buildPtyEnv({ Path: WIN_PATH }, 'win32', { ...FACTS, locale: 'C.UTF-8' }).LANG, 'C.UTF-8');
+  assert.equal(buildPtyEnv({ Path: WIN_PATH }, 'win32', { ...FACTS, locale: 'garbage', intl: 'de-DE' }).LANG, 'de_DE.UTF-8');
+  assert.equal(buildPtyEnv({ Path: WIN_PATH }, 'win32', { ...FACTS, locale: null, intl: 'de-DE' }).LANG, 'de_DE.UTF-8');
+  assert.equal(buildPtyEnv({ Path: WIN_PATH }, 'win32', { ...FACTS, locale: null, intl: 'und' }).LANG, 'C.UTF-8');
+  assert.equal(buildPtyEnv({ Path: WIN_PATH }, 'win32', { ...FACTS, locale: null, intl: null }).LANG, 'C.UTF-8');
+  for (const inherited of [{ LANG: 'de_DE.UTF-8' }, { LC_ALL: 'ja_JP.UTF-8' }, { LC_CTYPE: 'fr_FR.UTF-8' }, { lang: 'pt_BR.UTF-8' }]) {
+    const env = buildPtyEnv({ Path: WIN_PATH, ...inherited }, 'win32', FACTS);
+    for (const [k, v] of Object.entries(inherited)) assert.equal(env[k], v, `${k} kept`);
+    const langKeys = Object.keys(env).filter((k) => k.toUpperCase() === 'LANG');
+    assert.deepEqual(langKeys, Object.keys(inherited).filter((k) => k.toUpperCase() === 'LANG'), `no LANG added beside ${JSON.stringify(inherited)}`);
+  }
+});
+
+test('pty-env: CLAUDE_CODE_GIT_BASH_PATH is filled on win32 with Git\'s bin\\bash.exe only when unset', () => {
+  assert.equal(buildPtyEnv({ Path: WIN_PATH }, 'win32', FACTS).CLAUDE_CODE_GIT_BASH_PATH, 'C:\\Program Files\\Git\\bin\\bash.exe');
+  assert.equal(buildPtyEnv({ Path: WIN_PATH, CLAUDE_CODE_GIT_BASH_PATH: 'D:\\mine\\bash.exe' }, 'win32', FACTS).CLAUDE_CODE_GIT_BASH_PATH, 'D:\\mine\\bash.exe');
+  const lower = buildPtyEnv({ Path: WIN_PATH, claude_code_git_bash_path: 'D:\\mine\\bash.exe' }, 'win32', FACTS);
+  assert.equal(lower.claude_code_git_bash_path, 'D:\\mine\\bash.exe');
+  assert.equal('CLAUDE_CODE_GIT_BASH_PATH' in lower, false, 'unset is checked case-insensitively');
+});
+
+test('pty-env: MSYSTEM is filled on win32 with MINGW64 only when unset', () => {
+  assert.equal(buildPtyEnv({ Path: WIN_PATH }, 'win32', FACTS).MSYSTEM, 'MINGW64');
+  assert.equal(buildPtyEnv({ Path: WIN_PATH, MSYSTEM: 'UCRT64' }, 'win32', FACTS).MSYSTEM, 'UCRT64');
+});
+
+test('pty-env: HOME is filled on win32 with the env\'s USERPROFILE only when unset', () => {
+  assert.equal(buildPtyEnv({ Path: WIN_PATH, USERPROFILE: 'C:\\Users\\u' }, 'win32', FACTS).HOME, 'C:\\Users\\u');
+  assert.equal(buildPtyEnv({ Path: WIN_PATH, USERPROFILE: 'C:\\Users\\u', HOME: 'H:\\' }, 'win32', FACTS).HOME, 'H:\\');
+  const lower = buildPtyEnv({ Path: WIN_PATH, USERPROFILE: 'C:\\Users\\u', home: 'H:\\' }, 'win32', FACTS);
+  assert.equal(lower.home, 'H:\\');
+  assert.equal('HOME' in lower, false, 'unset is checked case-insensitively');
+});
+
+test('pty-env: PATH under Path: Git\'s cmd and bin go right before System32, a later Git\\cmd is moved, the end entries come once, and a second run adds nothing', () => {
+  const source = { Path: 'C:\\nodejs;C:\\WINDOWS\\system32\\;C:\\Windows;C:\\Program Files\\Git\\cmd;C:\\Program Files\\Git\\usr\\bin' };
+  const env = buildPtyEnv(source, 'win32', FACTS);
+  assert.deepEqual(Object.keys(env).filter((k) => k.toUpperCase() === 'PATH'), ['Path'], 'edited under its own key');
+  assert.equal(env.Path, [
+    'C:\\nodejs',
+    'C:\\Program Files\\Git\\cmd',
+    'C:\\Program Files\\Git\\bin',
+    'C:\\WINDOWS\\system32\\',
+    'C:\\Windows',
+    'C:\\Program Files\\Git\\usr\\bin',
+    'C:\\Program Files\\Git\\mingw64\\bin',
+  ].join(';'));
+  assert.deepEqual(buildPtyEnv(env, 'win32', FACTS), env, 'a second run adds nothing');
+});
+
+test('pty-env: PATH with Git\\cmd both before and after System32 keeps one copy of it, before System32', () => {
+  const env = buildPtyEnv({ Path: 'C:\\Program Files\\Git\\cmd;C:\\Windows\\System32;C:\\Program Files\\Git\\cmd;C:\\b' }, 'win32', FACTS);
+  assert.equal(env.Path.split(';').filter((e) => e === 'C:\\Program Files\\Git\\cmd').length, 1, env.Path);
+  assert.equal(env.Path, 'C:\\Program Files\\Git\\cmd;C:\\Program Files\\Git\\bin;C:\\Windows\\System32;C:\\b;C:\\Program Files\\Git\\mingw64\\bin;C:\\Program Files\\Git\\usr\\bin');
+  assert.deepEqual(buildPtyEnv(env, 'win32', FACTS), env, 'a second run adds nothing');
+});
+
+test('pty-env: with facts on win32, a source holding Path and PATH gives one key, the later one\'s value, edited', () => {
+  const env = buildPtyEnv({ Path: 'C:\\old', PATH: 'C:\\nodejs;C:\\Windows\\System32' }, 'win32', FACTS);
+  assert.deepEqual(Object.keys(env).filter((k) => k.toUpperCase() === 'PATH'), ['PATH']);
+  assert.equal(env.PATH, 'C:\\nodejs;C:\\Program Files\\Git\\cmd;C:\\Program Files\\Git\\bin;C:\\Windows\\System32;C:\\Program Files\\Git\\mingw64\\bin;C:\\Program Files\\Git\\usr\\bin');
+});
+
+test('pty-env: with no System32 entry, Git\'s cmd and bin go to the front of PATH', () => {
+  const env = buildPtyEnv({ Path: 'C:\\nodejs;C:\\tools' }, 'win32', FACTS);
+  assert.equal(env.Path, 'C:\\Program Files\\Git\\cmd;C:\\Program Files\\Git\\bin;C:\\nodejs;C:\\tools;C:\\Program Files\\Git\\mingw64\\bin;C:\\Program Files\\Git\\usr\\bin');
+});
+
+test('pty-env: without Git on win32 only LANG and HOME are filled', () => {
+  const source = { Path: WIN_PATH, USERPROFILE: 'C:\\Users\\u' };
+  const env = buildPtyEnv(source, 'win32', { git: null, locale: null, intl: 'en-GB', ms: 0 });
+  assert.deepEqual(env, { Path: WIN_PATH, USERPROFILE: 'C:\\Users\\u', LANG: 'en_GB.UTF-8', HOME: 'C:\\Users\\u' });
+});
+
+test('pty-env: langFromLocaleTag turns a plain language-region tag into xx_YY.UTF-8 and refuses the rest', () => {
+  const { langFromLocaleTag } = ptyEnvModule;
+  assert.equal(langFromLocaleTag('en-US'), 'en_US.UTF-8');
+  assert.equal(langFromLocaleTag('zh-Hans-CN'), null);
+  assert.equal(langFromLocaleTag('sr-Latn-RS'), null);
+  assert.equal(langFromLocaleTag('es-419'), null);
+  assert.equal(langFromLocaleTag('en'), 'en.UTF-8');
+  assert.equal(langFromLocaleTag('und'), null);
+  assert.equal(langFromLocaleTag('en-US-u-hc-h23'), 'en_US.UTF-8');
+});
+
+test('pty-env: with facts off win32 nothing is filled', () => {
+  for (const platform of ['darwin', 'linux']) {
+    const source = { PATH: '/usr/bin', Path: '/x', USERPROFILE: '/home/u' };
+    assert.deepEqual(buildPtyEnv(source, platform, FACTS), buildPtyEnv(source, platform), platform);
+  }
+  assert.deepEqual(buildPtyEnv({ PATH: '/usr/bin' }, 'linux', FACTS), { PATH: '/usr/bin' });
+});

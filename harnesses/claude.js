@@ -36,6 +36,7 @@ function sessionsRoot() {
  * not the PATH a session actually runs under, and probing it reported every CLI
  * as missing. Whether a CLI can be started is left to the launch itself, which
  * surfaces the shell's own error.
+ * On Windows, sessions start claude.exe directly (launch-plan.js), without a login shell: only the app's PATH is searched.
  */
 function available() {
   return fs.existsSync(sessionsRoot());

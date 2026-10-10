@@ -54,6 +54,7 @@ const {
   shellArgs,
   windowsToWslPath,
 } = require('./shell-profiles');
+const { commandForShell, findExecutable, windowsCommandLine, withExitSuffix } = require('./launch-plan');
 
 const MAX_BUFFER_SIZE = 256 * 1024;
 
@@ -67,12 +68,29 @@ function taskKey(projectPath, label) {
   return `${projectPath}\0${label}`;
 }
 
+function isPowerShellPath(shellPath) {
+  const base = path.win32.basename(String(shellPath)).toLowerCase();
+  return base.includes('powershell') || base.includes('pwsh');
+}
+
+function collapseCaseDuplicateKeys(env) {
+  const last = new Map();
+  for (const key of Object.keys(env)) last.set(key.toLowerCase(), key);
+  const collapsed = {};
+  for (const key of Object.keys(env)) {
+    if (last.get(key.toLowerCase()) === key) collapsed[key] = env[key];
+  }
+  return collapsed;
+}
+
 function createTaskManager(options = {}) {
   const runs = new Map();
   const watchers = new Map();
   const spawnPty = options.pty || null;
   const loadTasks = options.loadProjectTasks || loadProjectTasks;
   const baseEnv = options.baseEnv || buildPtyEnv(process.env);
+  const platform = options.platform || process.platform;
+  const fsLike = options.fs || fs;
   const logger = options.log || console;
   const send = options.send || (() => {});
   const getShellProfile = options.getShellProfile || (() => resolveShell('auto'));
@@ -171,13 +189,14 @@ function createTaskManager(options = {}) {
   }
 
   function effectiveEnv(task) {
-    const env = {
+    let env = {
       ...baseEnv,
       TERM: baseEnv.TERM || 'xterm-256color',
       COLORTERM: baseEnv.COLORTERM || 'truecolor',
       FORCE_COLOR: baseEnv.FORCE_COLOR || '1',
       ...(task.env || {}),
     };
+    if (platform === 'win32') env = collapseCaseDuplicateKeys(env);
     for (const [name, value] of Object.entries(env)) {
       if (value === null) delete env[name];
       else if (value !== undefined) env[name] = String(value);
@@ -202,10 +221,25 @@ function createTaskManager(options = {}) {
       // wsl.exe itself needs a Windows cwd.
       cwd = projectPath;
     }
+    if (platform === 'win32' && isPowerShellPath(shell)) {
+      let text;
+      if (task.type === 'shell') {
+        text = withExitSuffix(`${task.executable}${task.args.length ? ` ${quoteArgvForShell(shell, task.args)}` : ''}`, { raw: true });
+      } else {
+        let executable = task.executable;
+        if (task.type === 'process') {
+          const found = findExecutable(task.executable, effectiveEnv(task), fsLike, { cwd: task.cwd });
+          if (found && found.direct) return { executable: found.path, args: windowsCommandLine(task.args), cwd };
+          if (found) executable = found.path;
+        }
+        text = withExitSuffix(commandForShell(shell, executable, task.args));
+      }
+      return { executable: shell, args: windowsCommandLine(shellArgs(shell, text, extraArgs, platform)), cwd };
+    }
     const command = task.type === 'shell'
       ? `${task.executable}${task.args.length ? ` ${quoteArgvForShell(shell, task.args)}` : ''}`
       : `${quoteArgForShell(shell, task.executable)}${task.args.length ? ` ${quoteArgvForShell(shell, task.args)}` : ''}`;
-    return { executable: shell, args: shellArgs(shell, command, extraArgs), cwd };
+    return { executable: shell, args: shellArgs(shell, command, extraArgs, platform), cwd };
   }
 
   function syncCompound(run) {
@@ -240,7 +274,7 @@ function createTaskManager(options = {}) {
     resetRun(run);
     try {
       const spec = spawnSpec(task, run.projectPath);
-      logger.info(`[task] ${task.label}: ${spec.executable} ${spec.args.join(' ')}`);
+      logger.info(`[task] ${task.label}: ${spec.executable} ${Array.isArray(spec.args) ? spec.args.join(' ') : spec.args}`);
       run.process = (spawnPty || defaultPty()).spawn(spec.executable, spec.args, {
         name: 'xterm-256color',
         cols: 120,

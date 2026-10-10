@@ -139,6 +139,8 @@
     // Discover available shell profiles
     let shellProfiles = [];
     try { shellProfiles = await window.api.getShellProfiles(); } catch {};
+    const autoPicked = shellProfiles.find(p => p.autoPick);
+    const autoPickLabel = autoPicked ? 'Auto (' + escapeHtml(autoPicked.name) + ')' : 'Auto (detect)';
     // Chromium fills the voice list about a second after load, so ask the engine
     // rather than reading getVoices() directly here.
     let speechVoices = [];
@@ -230,7 +232,7 @@
               <span class="settings-label">Pre-launch Command</span>
               ${useGlobalCheckbox('preLaunchCmd')}
             </div>
-            <div class="settings-description">Prepended to the claude command (e.g. "aws-vault exec profile --")</div>
+            <div class="settings-description">Prepended to the claude command (e.g. "aws-vault exec profile --"). On Windows it runs in Git Bash unless the project picks another shell.</div>
           </div>
           <div class="settings-field-control">
             <input type="text" class="settings-input" id="sv-pre-launch" placeholder="e.g. aws-vault exec profile --" value="${escapeHtml(preLaunchValue)}" ${fieldDisabled('preLaunchCmd')}>
@@ -289,11 +291,11 @@
         <div class="settings-field">
           <div class="settings-field-info">
             <span class="settings-label">Shell Profile</span>
-            <div class="settings-description">Shell used for terminal and Claude sessions. Changes take effect for new sessions only.</div>
+            <div class="settings-description">Shell for plain terminals, shell tasks and pre-launch commands. On Windows, Claude sessions start claude.exe directly, and PowerShell profiles are not loaded.</div>
           </div>
           <div class="settings-field-control">
             <select class="settings-select" id="sv-shell-profile">
-              <option value="auto" ${shellProfileValue === 'auto' ? 'selected' : ''}>Auto (detect)</option>
+              <option value="auto" ${shellProfileValue === 'auto' ? 'selected' : ''}>${autoPickLabel}</option>
               ${shellProfiles.map(p =>
                 `<option value="${escapeHtml(p.id)}" ${shellProfileValue === p.id ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
               ).join('')}
