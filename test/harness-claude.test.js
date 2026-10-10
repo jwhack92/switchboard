@@ -361,35 +361,122 @@ test('every harness can report activity', () => {
 
 // ----------------------------------------------------------- OSC 9;4 progress
 //
-// Claude emits these when its `terminalProgressBarEnabled` setting is on
-// (default). A slash command produces `4;3;` then `4;0;` ~200ms later without
-// ever touching the title, so the busy state it raises can only be cleared by
-// honouring `4;0` — otherwise the session spins until Claude's "waiting for
-// your input" notice a full minute later. This fork previously ignored `4;0`
-// outright; the title veto below is what makes honouring it safe, which is why
-// the two were adopted together.
+// A progress report of level 1 to 3 raises working only while the latest
+// title does not say idle. The end of progress (level 0) is never read as
+// finished: any program in a plain terminal can send it, and "finished" is
+// spoken.
 
-test('progress start marks a session busy', () => {
+test('harness-claude: a progress report does not mark a session working while its title says idle', () => {
   for (const level of ['1', '2', '3']) {
+    assert.equal(progressBusyState({ level, titleIdle: true }), null, level);
+  }
+});
+
+test('harness-claude: a progress report still marks a session working when the title does not say idle', () => {
+  for (const level of ['1', '2', '3']) {
+    assert.equal(progressBusyState({ level, titleIdle: false }), 'busy', level);
+    // A plain terminal, no title yet, an unrecognised title: nothing says idle.
+    assert.equal(progressBusyState({ level }), 'busy', level);
+    assert.equal(progressBusyState({ level, titleIdle: undefined }), 'busy', level);
+    // Only a real true counts as "the title says idle".
+    assert.equal(progressBusyState({ level, titleIdle: 'idle' }), 'busy', level);
+    assert.equal(progressBusyState({ level, titleIdle: 1 }), 'busy', level);
+    // The old argument is not read any more.
     assert.equal(progressBusyState({ level, titleBusy: false }), 'busy', level);
+    assert.equal(progressBusyState({ level, titleBusy: true }), 'busy', level);
   }
 });
 
-test('progress end clears busy when the title does not say otherwise', () => {
-  assert.equal(progressBusyState({ level: '0', titleBusy: false }), 'idle');
-});
-
-test('progress end is ignored while the title shows a spinner', () => {
-  // Any child process in the PTY can emit 9;4 — a build tool, a test runner.
-  // The title comes from the CLI itself, so a subprocess finishing its progress
-  // bar must not report the CLI as idle while it is visibly still working.
-  assert.equal(progressBusyState({ level: '0', titleBusy: true }), null);
-});
-
-test('an unknown progress level changes nothing', () => {
-  for (const level of ['9', '', undefined]) {
-    assert.equal(progressBusyState({ level, titleBusy: false }), null, String(level));
+test('harness-claude: the end of progress never reports idle', () => {
+  for (const titleIdle of [true, false, undefined]) {
+    assert.equal(progressBusyState({ level: '0', titleIdle }), null, String(titleIdle));
   }
+  assert.equal(progressBusyState({ level: '0', titleBusy: false }), null, 'the old call that answered idle');
+  // No input gives 'idle'.
+  for (const level of ['0', '1', '2', '3', '9', '', undefined]) {
+    for (const titleIdle of [true, false, undefined]) {
+      assert.notEqual(progressBusyState({ level, titleIdle }), 'idle', `${level} ${titleIdle}`);
+    }
+  }
+});
+
+test('harness-claude: an unknown progress level changes nothing, whatever the title says', () => {
+  for (const level of ['9', '', undefined, '4', '10', '01', '12', ' 1']) {
+    for (const titleIdle of [true, false, undefined]) {
+      assert.equal(progressBusyState({ level, titleIdle }), null, `${JSON.stringify(level)} ${titleIdle}`);
+    }
+  }
+});
+
+const { titleLogDue } = require('../harnesses');
+
+test("harness-claude: a title line is due when the title's state changes, and once for each new unknown character, up to 16", () => {
+  const ask = (state, previous, codePoint, seen) => titleLogDue({ state, previous, codePoint, seen });
+  // The two answers: write the line, remember the character.
+  const LINE_ONLY = { due: true, remember: false };
+  const LINE_AND_REMEMBER = { due: true, remember: true };
+  const NOTHING = { due: false, remember: false };
+
+  // A change of state is always due, also for a character seen before and at the first title.
+  // A character that is in the set already is not remembered again.
+  for (const [state, previous] of [['busy', undefined], ['idle', undefined], ['none', undefined],
+    ['busy', 'idle'], ['idle', 'busy'], ['none', 'busy'], ['none', 'idle'], ['busy', 'none'], ['idle', 'none']]) {
+    assert.deepEqual(ask(state, previous, 'U+25D0', new Set(['U+25D0'])), LINE_ONLY, `${previous} to ${state}`);
+  }
+
+  // Only an unknown title's character is remembered: never the character of a busy or an idle title.
+  for (const state of ['busy', 'idle']) {
+    for (const previous of [undefined, 'none', state === 'busy' ? 'idle' : 'busy']) {
+      for (const seen of [new Set(), undefined]) {
+        assert.deepEqual(ask(state, previous, 'U+0041', seen), LINE_ONLY, `${previous} to ${state}`);
+      }
+    }
+  }
+  // A change to an unknown title whose character is new: the line, and the character is remembered.
+  for (const previous of [undefined, 'busy', 'idle']) {
+    assert.deepEqual(ask('none', previous, 'U+006D', new Set()), LINE_AND_REMEMBER, `${previous} to none`);
+    assert.deepEqual(ask('none', previous, 'U+006D', undefined), LINE_AND_REMEMBER, `${previous} to none, no set`);
+  }
+
+  // The same telling state again is never due, whatever the character.
+  for (const state of ['busy', 'idle']) {
+    for (const seen of [new Set(), new Set(['U+0041']), undefined]) {
+      assert.deepEqual(ask(state, state, 'U+0041', seen), NOTHING, state);
+    }
+  }
+
+  // An unknown title after an unknown title: once for each character.
+  assert.deepEqual(ask('none', 'none', 'U+006D', new Set()), LINE_AND_REMEMBER);
+  assert.deepEqual(ask('none', 'none', 'U+006D', undefined), LINE_AND_REMEMBER, 'a missing set counts as empty');
+  assert.deepEqual(ask('none', 'none', 'U+006D', new Set(['U+006D'])), NOTHING);
+  assert.deepEqual(ask('none', 'none', 'U+004D', new Set(['U+006D'])), LINE_AND_REMEMBER);
+  // An empty title has the character 'none'; it is logged once like any other.
+  assert.deepEqual(ask('none', 'none', 'none', new Set()), LINE_AND_REMEMBER);
+  assert.deepEqual(ask('none', 'none', 'none', new Set(['none'])), NOTHING);
+
+  // The cap: with 16 characters remembered no further one is due or remembered; a change of
+  // state is still due, and its character is not remembered either.
+  const full = new Set(Array.from({ length: 16 }, (_, i) => `U+01${i.toString(16).toUpperCase().padStart(2, '0')}`));
+  assert.equal(full.size, 16);
+  assert.deepEqual(ask('none', 'none', 'U+0061', full), NOTHING);
+  assert.deepEqual(ask('none', 'none', 'U+0100', full), NOTHING);
+  assert.deepEqual(ask('none', 'idle', 'U+0061', full), LINE_ONLY);
+  const fifteen = new Set([...full].slice(0, 15));
+  assert.deepEqual(ask('none', 'none', 'U+0061', fifteen), LINE_AND_REMEMBER);
+  assert.deepEqual(ask('none', 'idle', 'U+0061', fifteen), LINE_AND_REMEMBER);
+
+  // Both fields are real booleans, and the answer has no third field.
+  for (const answer of [ask('busy', undefined, 'U+25D0', undefined), ask('none', 'none', 'U+0061', full)]) {
+    assert.deepEqual(Object.keys(answer).sort(), ['due', 'remember']);
+    assert.equal(typeof answer.due, 'boolean');
+    assert.equal(typeof answer.remember, 'boolean');
+  }
+
+  // Pure: the set is the caller's to change.
+  const seen = new Set();
+  ask('none', 'none', 'U+006D', seen);
+  ask('none', 'idle', 'U+006D', seen);
+  assert.equal(seen.size, 0);
 });
 
 // -------------------------------------------------------------------- viewer

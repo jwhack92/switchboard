@@ -129,7 +129,7 @@ const { encodeProjectPath } = require('./encode-project-path');
 // an edit under harnesses/ needs a manual restart before it is in effect (its
 // unit tests still run without the app), which is the trade this file already
 // makes for every other module of its kind.
-const { getHarness, DEFAULT_HARNESS, allHarnesses } = require('./harnesses');
+const { getHarness, DEFAULT_HARNESS, allHarnesses, progressBusyState, titleLogDue } = require('./harnesses');
 const claudeHarness = getHarness(DEFAULT_HARNESS);
 
 // Ported-feature modules, all deliberately on THIS side of the reloader line
@@ -2451,6 +2451,10 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
     ptyGuard.markOutput(session);
 
     // Parse OSC sequences (title changes, progress, notifications, etc.)
+    // Two passes over a chunk: all its titles (OSC 0) are read first, then
+    // its OSC 9 texts. So a progress report is weighed against the last title
+    // of its own chunk even when it was written ahead of that title, and a
+    // busy event leaves before a notification written ahead of the title.
     if (data.includes('\x1b]')) {
       const oscMatches = data.matchAll(/\x1b\](\d+);([^\x07\x1b]*)(?:\x07|\x1b\\)/g);
       for (const m of oscMatches) {
@@ -2473,10 +2477,20 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
           // Keep the raw codepoint in the log. A glyph the harness does not
           // recognise reads as state=none, which is indistinguishable from a
           // plain title — and it was exactly this field that caught Claude
-          // 2.1.228 moving the spinner from braille to half-circles.
+          // 2.1.228 moving the spinner from braille to half-circles. The line
+          // is written only when harnesses' titleLogDue says it is due, and the
+          // same answer says whether the character is remembered in
+          // _titleSeen. _titleNow is the LATEST title's state; _titleBusy is
+          // the last TELLING title's (read by read-ctx-state), so the two
+          // differ after a plain or unrecognised title.
           const firstChar = payload.trim()[0];
           const cp = firstChar ? 'U+' + firstChar.codePointAt(0).toString(16).toUpperCase().padStart(4, '0') : 'none';
-          log.debug(`[OSC 0] session=${currentId} char=${cp} state=${titleState || 'none'} wasBusy=${!!session._cliBusy}`);
+          const titleNow = titleState || 'none';
+          const titleSeen = session._titleSeen || (session._titleSeen = new Set());
+          const titleLog = titleLogDue({ state: titleNow, previous: session._titleNow, codePoint: cp, seen: titleSeen });
+          if (titleLog.due) log.debug(`[OSC 0] session=${currentId} char=${cp} state=${titleNow} wasBusy=${!!session._cliBusy}`);
+          if (titleLog.remember) titleSeen.add(cp);
+          session._titleNow = titleNow;
           if (isBusy && !session._cliBusy) {
             session._cliBusy = true;
             session._oscIdle = false;
@@ -2497,29 +2511,30 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         // OSC 9;4 progress: 4;0; = clear/done, 4;1;N = running at N%, 4;2;N = error, 4;3; = indeterminate
         if (payload.startsWith('4;')) {
           const level = payload.split(';')[1];
-          // 4;0 is NOT treated as idle here, deliberately — upstream's
-          // progressBusyState() vetoes it with the terminal title, and that veto
-          // does not work for this fork.
+          log.debug(`[OSC 9;4] session=${currentId} level=${level} payload="${payload}" wasBusy=${!!session._cliBusy} titleNow=${session._titleNow || 'none'}`);
+          // A report of level 1 to 3 raises busy only while the latest title
+          // does not say idle (harnesses' progressBusyState): the title is the
+          // program's own word. A session whose latest title is a spinner is
+          // busy already. A plain terminal, an unrecognised title and a new
+          // session before its first idle title are treated as before: the
+          // report raises busy.
           //
-          // For a Claude session _titleBusy is true in exactly the states
-          // _cliBusy is, so the clear can never fire: the change is inert.
-          // For a PLAIN TERMINAL nothing ever sets _titleBusy, so the veto is
-          // permanently false and any child emitting OSC 9;4 progress — curl,
-          // npm, git clone — would go busy on 4;1 and idle on 4;0. That reaches
-          // setActivity() in the renderer, which calls
-          // window.speech.announceFinished(). The app would talk at you because
-          // a download finished.
-          //
-          // So: no benefit where it would be safe, an audible regression where
-          // it would fire. Revisit only if a title-busy signal exists for plain
-          // terminals, which would need something other than Claude's OSC 0.
+          // The skip of level 0 is a rule kept in main.js on purpose (the
+          // conventions name it): the end of progress is never read as
+          // finished, whatever a rule in another file answers. Any program in a
+          // plain terminal sends it (curl, npm, git clone), and "finished" is
+          // spoken: the app would talk at you because a download finished.
           if (level === '0') continue;
-          log.debug(`[OSC 9;4] session=${currentId} level=${level} payload="${payload}" wasBusy=${!!session._cliBusy}`);
-          if ((level === '1' || level === '2' || level === '3') && !session._cliBusy) {
-            session._cliBusy = true;
-            session._oscIdle = false;
-            log.debug(`[OSC 9;4] session=${currentId} → BUSY`);
-            registry.sendToOwner(currentId, 'cli-busy-state', currentId, true);
+          const titleIdle = session._titleNow === 'idle';
+          if (progressBusyState({ level, titleIdle }) === 'busy') {
+            if (!session._cliBusy) {
+              session._cliBusy = true;
+              session._oscIdle = false;
+              log.debug(`[OSC 9;4] session=${currentId} → BUSY`);
+              registry.sendToOwner(currentId, 'cli-busy-state', currentId, true);
+            }
+          } else if (titleIdle && progressBusyState({ level, titleIdle: false }) === 'busy') {
+            log.debug(`[OSC 9;4] session=${currentId} level=${level} ignored: title says idle`);
           }
         } else {
           // Regular notification (attention, permission, etc.)

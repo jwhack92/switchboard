@@ -141,6 +141,41 @@ function bootBusy(entries) {
   return ctx.isSessionBusy;
 }
 
+/** A full session id, as the log must show it. */
+const FULL_ID = 'aaaaaaaa-1111-2222-3333-444444444444';
+
+/** Runs fn and returns every debug and info line the block wrote meanwhile, in order. */
+function logged(fn) {
+  const lines = [];
+  const { debug, info } = SILENT_LOG;
+  SILENT_LOG.debug = (line) => { lines.push(String(line)); };
+  SILENT_LOG.info = (line) => { lines.push(String(line)); };
+  try { fn(); } finally { SILENT_LOG.debug = debug; SILENT_LOG.info = info; }
+  return lines;
+}
+const titleLines = (lines) => lines.filter((line) => line.startsWith('[OSC 0] ') && line.includes(' char='));
+
+/**
+ * The same block once more, with stand-ins for the two rules of harnesses/index.js,
+ * to show that main.js asks the rules and keeps no copy of them.
+ */
+function bootWithRules(rules) {
+  const sink = { events: [], lines: [] };
+  const record = (line) => { sink.lines.push(String(line)); };
+  const ctx = load(`function readChunk(data, session, sessionId) {\n${CURRENT_ID_STATEMENT}\n${OSC_BLOCK}\n}`, {
+    file: 'main.js',
+    globals: {
+      ...harnesses,
+      ...rules,
+      claudeHarness: harnesses.getHarness(harnesses.DEFAULT_HARNESS),
+      log: { debug: record, info: record, warn() {}, error() {} },
+      registry: { sendToOwner(ownerKey, channel, id, value) { sink.events.push({ to: ownerKey, channel, id, value }); return true; } },
+    },
+  });
+  const session = sessionRecord();
+  return { ...sink, session, feed(...chunks) { for (const data of chunks) ctx.readChunk(data, session, FULL_ID); } };
+}
+
 // --- Pin 11 ---
 
 test("main osc busy (pin): a spinner title gives one busy event and an idle title one idle event; progress 0 never marks idle; other OSC 9 text is passed on; a plain terminal never 'finishes'", async (t) => {
@@ -504,28 +539,32 @@ test("main osc busy (pin): a spinner title gives one busy event and an idle titl
 
 // --- Pin 12 ---
 
-// PIN, changed on purpose by ready state: a progress report of level 1 to 3 will be ignored while the title says idle; today it marks the session busy, and that is the stuck 'working'.
-test('main osc busy (pin, changed on purpose by ready state): progress 1 to 3 marks a session busy whatever the title says', async (t) => {
-  await t.test('the title says idle after a finished turn: the report marks it busy, and it stays busy', () => {
+// PIN 12, changed on purpose by ready state. Formerly: "main osc busy (pin, changed on purpose by ready state): progress 1 to 3 marks a session busy whatever the title says". A progress report of level 1 to 3 is now ignored while the latest title says idle; before this commit it marked the session busy whatever the title said, and that was the stuck 'working'.
+test('main osc busy (pin, changed by ready state): progress 1 to 3 marks a session busy unless its latest title says idle', async (t) => {
+  await t.test('the title says idle after a finished turn: the report is ignored, and the session stays idle', () => {
     for (const level of [1, 2, 3]) {
       for (const report of [progress(level), progress(level, ';'), progress(level, ';50'), progress(level, ';', ST)]) {
         const shown = JSON.stringify(report);
         const h = boot();
         feed(h, working(), finished());
         assert.equal(h.session._titleBusy, false, 'the title says idle');
+        assert.equal(h.session._titleNow, 'idle');
         feed(h, report);
-        assert.deepEqual(busyEvents(h), [true, false, true], shown);
-        assert.equal(h.session._cliBusy, true, shown);
-        assert.equal(h.session._titleBusy, false, 'and still says idle: busy under an idle title');
+        assert.deepEqual(busyEvents(h), [true, false], shown);
+        assert.equal(h.session._cliBusy, false, shown);
+        assert.equal(h.session._titleBusy, false, shown);
 
-        // More reports give no second event; level 0 does not end it.
-        feed(h, report, progress(0, ';'), progress(0));
-        assert.deepEqual(busyEvents(h), [true, false, true], shown);
-        assert.equal(h.session._cliBusy, true, shown);
+        // More reports and the end of progress change nothing either.
+        feed(h, report, progress(0, ';'), progress(0), report);
+        assert.deepEqual(busyEvents(h), [true, false], shown);
+        assert.equal(h.events.length, 2, shown);
+        assert.equal(h.session._cliBusy, false, shown);
         assert.deepEqual(notices(h), []);
         assertAddressed(h);
 
-        // Only the next idle title ends it.
+        // The next turn is shown by its title, once, and ended by its title.
+        feed(h, working(), report);
+        assert.deepEqual(busyEvents(h), [true, false, true], shown);
         feed(h, finished());
         assert.deepEqual(busyEvents(h), [true, false, true, false], shown);
         assert.equal(h.session._cliBusy, false, shown);
@@ -533,19 +572,20 @@ test('main osc busy (pin, changed on purpose by ready state): progress 1 to 3 ma
     }
   });
 
-  await t.test('the first title of a new session says idle: the report marks it busy', () => {
+  await t.test('the first title of a new session says idle: the report is ignored', () => {
     for (const level of [1, 2, 3]) {
       const h = boot();
       feed(h, title(`${IDLE} Claude Code`));
       assert.equal(h.events.length, 0);
       feed(h, progress(level, ';'));
-      assert.deepEqual(h.events, [{ to: 'sess-1', channel: 'cli-busy-state', id: 'sess-1', value: true }], `level ${level}`);
-      assert.equal(h.session._cliBusy, true, `level ${level}`);
+      assert.equal(h.events.length, 0, `level ${level}`);
+      assert.ok(!h.session._cliBusy, `level ${level}`);
       assert.equal(h.session._titleBusy, false, `level ${level}`);
+      assert.equal(h.session._titleNow, 'idle', `level ${level}`);
     }
   });
 
-  await t.test('the idle title and the report in one chunk: the session ends busy, in either order', () => {
+  await t.test('the idle title and the report in one chunk: the session ends idle, in either order', () => {
     for (const level of [1, 2, 3]) {
       // Titles are read first, so the report is weighed against the idle title
       // even when it was written ahead of it.
@@ -553,13 +593,13 @@ test('main osc busy (pin, changed on purpose by ready state): progress 1 to 3 ma
         const shown = JSON.stringify(chunk);
         const wasWorking = boot();
         feed(wasWorking, working(), chunk);
-        assert.deepEqual(busyEvents(wasWorking), [true, false, true], shown);
-        assert.equal(wasWorking.session._cliBusy, true, shown);
+        assert.deepEqual(busyEvents(wasWorking), [true, false], shown);
+        assert.equal(wasWorking.session._cliBusy, false, shown);
 
         const wasIdle = boot();
         feed(wasIdle, working(), finished(), chunk);
-        assert.deepEqual(busyEvents(wasIdle), [true, false, true], shown);
-        assert.equal(wasIdle.session._cliBusy, true, shown);
+        assert.deepEqual(busyEvents(wasIdle), [true, false], shown);
+        assert.equal(wasIdle.session._cliBusy, false, shown);
       }
     }
   });
@@ -680,5 +720,213 @@ test('main osc busy (pin): isSessionBusy is true only for a live session with th
     assert.equal(termBusy('term-1'), true);
     term.session.exited = true;
     assert.equal(termBusy('term-1'), false);
+  });
+});
+
+test('main-osc-busy (main.js source cut, run in a vm)', async (t) => {
+  const line94 = (level, payload, wasBusy, titleNow) =>
+    `[OSC 9;4] session=${FULL_ID} level=${level} payload="${payload}" wasBusy=${wasBusy} titleNow=${titleNow}`;
+  const line0 = (cp, state, wasBusy) => `[OSC 0] session=${FULL_ID} char=${cp} state=${state} wasBusy=${wasBusy}`;
+
+  await t.test('(a) idle title, then level 3: the session is not marked busy and no event is sent', () => {
+    const h = boot();
+    feed(h, working(), finished(), progress(3, ';'));
+    assert.deepEqual(busyEvents(h), [true, false]);
+    assert.equal(h.events.length, 2);
+    assert.equal(h.session._cliBusy, false);
+    assert.equal(h.session._titleNow, 'idle');
+  });
+
+  await t.test('(b) spinner title: one busy event; later progress sends nothing; an idle title sends one idle event', () => {
+    const h = boot();
+    feed(h, working());
+    assert.equal(h.session._titleNow, 'busy');
+    feed(h, progress(3, ';'), progress(1, ';40'));
+    assert.deepEqual(busyEvents(h), [true]);
+    feed(h, finished());
+    assert.deepEqual(busyEvents(h), [true, false]);
+    assert.equal(h.events.length, 2);
+  });
+
+  await t.test('(c) no title, level 1 then level 0: one busy event and no idle event', () => {
+    const h = boot({ session: { isPlainTerminal: true } });
+    feed(h, progress(1, ';10'), progress(0, ';'));
+    assert.deepEqual(busyEvents(h), [true]);
+    assert.equal(h.session._cliBusy, true);
+    assert.equal(h.session._titleNow, undefined, 'no title was ever read');
+  });
+
+  await t.test('(d) idle title, then a title with an unrecognised first character, then level 3: busy is sent', () => {
+    const odd = '\u25CC Fix the build';
+    assert.equal(harnesses.getHarness(harnesses.DEFAULT_HARNESS).parseTitleState(odd), null, 'the character is not a known mark');
+    const h = boot();
+    feed(h, working(), finished(), title(odd));
+    assert.equal(h.session._titleBusy, false, 'the last telling title said idle');
+    assert.equal(h.session._titleNow, 'none', 'the latest title does not');
+    feed(h, progress(3, ';'));
+    assert.deepEqual(busyEvents(h), [true, false, true]);
+    assert.equal(h.session._cliBusy, true);
+  });
+
+  await t.test("(e) session start: the plain titles 'C' then 'c', then level 3: busy is sent, as before", () => {
+    const h = boot();
+    feed(h, title('C'), title('c'), progress(3, ';'));
+    assert.deepEqual(busyEvents(h), [true]);
+    assert.equal(h.session._titleNow, 'none');
+  });
+
+  await t.test('(f) idle title and level 3 in one chunk, spinner title in the next: busy arrives with the title', () => {
+    const h = boot();
+    feed(h, working(), finished());
+    feed(h, finished() + progress(3, ';'));
+    assert.deepEqual(busyEvents(h), [true, false], 'nothing with the report');
+    feed(h, working());
+    assert.deepEqual(busyEvents(h), [true, false, true]);
+  });
+
+  await t.test("(g) every level, 0 included, writes one report line; an ignored report also writes 'ignored: title says idle'", () => {
+    // No title yet: three reports, three lines, and the one that marks busy says so.
+    const fresh = boot({ startId: FULL_ID });
+    assert.deepEqual(logged(() => feed(fresh, progress(0, ';'), progress(9, ';'), progress(2, ';5'))), [
+      line94('0', '4;0;', false, 'none'),
+      line94('9', '4;9;', false, 'none'),
+      line94('2', '4;2;5', false, 'none'),
+      `[OSC 9;4] session=${FULL_ID} → BUSY`,
+    ]);
+
+    // The title says idle: level 3 is ignored and says why; level 0 and an unknown level are only logged.
+    const idle = boot({ startId: FULL_ID });
+    feed(idle, working(), finished());
+    assert.deepEqual(logged(() => feed(idle, progress(3, ';'), progress(0, ';'), progress(9, ';'))), [
+      line94('3', '4;3;', false, 'idle'),
+      `[OSC 9;4] session=${FULL_ID} level=3 ignored: title says idle`,
+      line94('0', '4;0;', false, 'idle'),
+      line94('9', '4;9;', false, 'idle'),
+    ]);
+    assert.deepEqual(busyEvents(idle), [true, false]);
+
+    // The title says busy: one line, nothing ignored, no second BUSY.
+    const busy = boot({ startId: FULL_ID });
+    feed(busy, working());
+    assert.deepEqual(logged(() => feed(busy, progress(1, ';40'))), [line94('1', '4;1;40', true, 'busy')]);
+
+    // After a re-key every line carries the id the session has now, in full.
+    const moved = boot({ startId: 'started-as', session: { realSessionId: FULL_ID } });
+    feed(moved, finished());
+    const lines = logged(() => feed(moved, progress(3, ';')));
+    assert.deepEqual(lines, [line94('3', '4;3;', false, 'idle'), `[OSC 9;4] session=${FULL_ID} level=3 ignored: title says idle`]);
+  });
+
+  await t.test('(h) 50 spinner titles in a row write one title line; each unknown first character is logged once, 16 at most', () => {
+    const h = boot({ startId: FULL_ID });
+    const spin = logged(() => { for (let i = 0; i < 50; i++) feed(h, title(`${FRAMES[i % FRAMES.length]} Fix the build`)); });
+    assert.deepEqual(spin, [line0('U+2802', 'busy', false), `[OSC 0] session=${FULL_ID} → BUSY`]);
+
+    assert.deepEqual(logged(() => feed(h, finished(), finished(), finished(ST))),
+      [line0('U+2733', 'idle', true), `[OSC 0] session=${FULL_ID} → IDLE`]);
+
+    // Unknown titles: one line for each new first character; an empty title and a
+    // spinner character behind a blank are unknown titles too.
+    const plain = logged(() => feed(h, title('my-project'), title('my-project'), title('Make'), title('my-project'),
+      title(''), title(''), title(` ${SPIN} Fix`), title(` ${SPIN} Fix`)));
+    assert.deepEqual(plain, [line0('U+006D', 'none', false), line0('U+004D', 'none', false), line0('none', 'none', false), line0('U+25D0', 'none', false)]);
+    assert.equal(h.session._titleSeen.size, 4);
+    assert.ok(h.session._titleSeen.has('U+006D'));
+
+    // A change of state is logged even when the character was seen before.
+    assert.deepEqual(logged(() => feed(h, finished(), title('my-project'), working())),
+      [line0('U+2733', 'idle', false), line0('U+006D', 'none', false), line0('U+25D0', 'busy', false), `[OSC 0] session=${FULL_ID} → BUSY`]);
+
+    // A plain terminal with 40 different first characters, each shown twice: 16 lines.
+    const term = boot({ startId: 'term-1', session: { isPlainTerminal: true } });
+    const many = logged(() => { for (let i = 0; i < 40; i++) { const text = `${String.fromCodePoint(0x100 + i)} job`; feed(term, title(text), title(text)); } });
+    assert.equal(titleLines(many).length, 16);
+    assert.equal(term.session._titleSeen.size, 16);
+
+    // The set stays at 16 also when every unknown title is logged for its change of state.
+    const turns = boot();
+    const all = logged(() => { for (let i = 0; i < 40; i++) feed(turns, finished(), title(`${String.fromCodePoint(0x100 + i)} job`)); });
+    assert.equal(titleLines(all).length, 80);
+    assert.equal(turns.session._titleSeen.size, 16);
+
+    // The marks are the session's own: one terminal's titles hide none of another's.
+    // b's first title is another unknown one, so that its 'my-project' is a step from
+    // unknown to unknown, which only b's own set decides (a set shared with a would hide it).
+    const a = boot({ startId: 'a' });
+    const b = boot({ startId: 'b' });
+    feed(a, title('my-project'));
+    feed(b, title('x'));
+    assert.equal(titleLines(logged(() => feed(b, title('my-project')))).length, 1);
+    assert.equal(b.session._titleSeen.size, 2);
+    assert.equal(a.session._titleSeen.size, 1);
+  });
+});
+
+test('main-osc-busy: main.js asks progressBusyState and titleLogDue and keeps no copy of either rule; the skip of level 0 is its own', async (t) => {
+  await t.test('progressBusyState is asked with the level and whether the latest title says idle', () => {
+    const calls = [];
+    const h = bootWithRules({ progressBusyState: (arg) => { calls.push({ ...arg }); return harnesses.progressBusyState(arg); } });
+    h.feed(progress(2, ';'));
+    assert.deepEqual(calls, [{ level: '2', titleIdle: false }]);
+    calls.length = 0;
+    h.feed(finished(), progress(3, ';'));
+    // Ignored under an idle title: asked again without the title, to tell "ignored" from "unknown level".
+    assert.deepEqual(calls, [{ level: '3', titleIdle: true }, { level: '3', titleIdle: false }]);
+    calls.length = 0;
+    h.feed(progress(9, ';'));
+    assert.deepEqual(calls, [{ level: '9', titleIdle: true }, { level: '9', titleIdle: false }]);
+    assert.equal(h.lines.filter((line) => line.endsWith('ignored: title says idle')).length, 1, 'only the level 3 report was ignored');
+    calls.length = 0;
+    h.feed(progress(0, ';'));
+    assert.deepEqual(calls, [], 'level 0 is skipped before the rule is asked');
+  });
+
+  await t.test('what the rule answers is what happens', () => {
+    const yes = bootWithRules({ progressBusyState: () => 'busy' });
+    yes.feed(finished(), progress(3, ';'));
+    assert.deepEqual(yes.events.map((e) => e.value), [true], 'main.js has no title check of its own');
+    yes.feed(finished());
+    yes.feed(progress(0, ';'));
+    assert.deepEqual(yes.events.map((e) => e.value), [true, false], 'and level 0 does nothing even when the rule would say busy');
+
+    const no = bootWithRules({ progressBusyState: () => null });
+    no.feed(progress(3, ';'), progress(1, ';5'));
+    assert.equal(no.events.length, 0, 'main.js has no level list of its own');
+    assert.ok(!no.session._cliBusy);
+  });
+
+  await t.test('titleLogDue decides every title line and every remembered character, and is handed the state, the state before, the character and the session\'s set', () => {
+    const calls = [];
+    const never = bootWithRules({ titleLogDue: (arg) => { calls.push({ state: arg.state, previous: arg.previous, codePoint: arg.codePoint, seenSize: arg.seen.size }); return { due: false, remember: false }; } });
+    never.feed(finished(), title('my-project'), working());
+    assert.deepEqual(calls, [
+      { state: 'idle', previous: undefined, codePoint: 'U+2733', seenSize: 0 },
+      { state: 'none', previous: 'idle', codePoint: 'U+006D', seenSize: 0 },
+      { state: 'busy', previous: 'none', codePoint: 'U+25D0', seenSize: 0 },
+    ]);
+    assert.equal(never.lines.filter((line) => line.includes(' char=')).length, 0, 'no title line when the rule says no');
+    assert.equal(never.session._titleSeen.size, 0, 'nothing is remembered when the rule says no');
+    assert.deepEqual(never.events.map((e) => e.value), [true], 'the busy event does not depend on the log rule');
+    assert.equal(never.session._titleNow, 'busy');
+
+    // The line follows `due` alone: main.js remembers nothing by itself, not even
+    // the character of an unknown title whose line it has just written.
+    const always = bootWithRules({ titleLogDue: () => ({ due: true, remember: false }) });
+    always.feed(working(), working(), working(), working(), working());
+    assert.equal(always.lines.filter((line) => line.includes(' char=')).length, 5);
+    always.feed(title('my-project'), title('my-project'));
+    assert.equal(always.lines.filter((line) => line.includes(' char=')).length, 7);
+    assert.equal(always.session._titleSeen.size, 0, 'main.js has no "unknown title" check of its own');
+
+    // The remembered character follows `remember` alone: with no line written, whatever
+    // the title's state, and past 16 (the cap is the rule's, main.js has none).
+    const quiet = bootWithRules({ titleLogDue: () => ({ due: false, remember: true }) });
+    quiet.feed(working(), finished());
+    assert.equal(quiet.lines.filter((line) => line.includes(' char=')).length, 0);
+    assert.equal(quiet.session._titleSeen.size, 2);
+    assert.ok(quiet.session._titleSeen.has('U+25D0'));
+    assert.ok(quiet.session._titleSeen.has('U+2733'));
+    for (let i = 0; i < 20; i++) quiet.feed(title(`${String.fromCodePoint(0x100 + i)} job`));
+    assert.equal(quiet.session._titleSeen.size, 22, 'main.js has no cap of its own');
   });
 });

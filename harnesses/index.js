@@ -1,4 +1,5 @@
 // Harness registry.
+// main.js loads this file after its reloader line: a change here needs an app restart.
 //
 // A "harness" is a CLI that drives a model and records its sessions on disk —
 // `claude`. Each one owns its transcript layout, its
@@ -50,22 +51,34 @@ function availableHarnesses() {
 /**
  * What an OSC 9;4 progress report means for a session's busy state.
  *
- * `4;1/2/3` start or update progress, `4;0` ends it. The catch is that `4;0`
- * also arrives when nothing was running, and any child process in the PTY can
- * emit these — so it only clears a busy state the terminal title does not
- * currently contradict. The title comes from the CLI itself and is the more
- * trustworthy signal; a subprocess's progress bar must never be able to report
- * the CLI as idle while it is visibly working.
- *
- * This fork previously skipped `4;0` entirely (main.js, "unreliable as an idle
- * signal") because it had no title veto to lean on. Adopting this is what makes
- * that skip unnecessary — but only once a title-busy signal is actually wired.
+ * The title is the program's own word. A progress report (`4;1`, `4;2` or
+ * `4;3`) may raise busy only while the latest title does not say idle.
+ * The end of progress (`4;0`) is never read as idle: any program in a plain
+ * terminal sends it (a download, for one), and reading it as idle would make
+ * the app speak. main.js keeps its own skip of level 0 as well.
  */
-function progressBusyState({ level, titleBusy }) {
-  if (level === '0') return titleBusy ? null : 'idle';
-  if (level === '1' || level === '2' || level === '3') return 'busy';
+function progressBusyState({ level, titleIdle }) {
+  if (level === '1' || level === '2' || level === '3') return titleIdle === true ? null : 'busy';
   return null;
 }
 
+const TITLE_SEEN_MAX = 16;
+
+/**
+ * Should main.js write the log line of this title, and remember its character?
+ *
+ * Title lines were almost the whole log. So one is written only when the
+ * title's state changes, and once per session for each unknown first
+ * character (an unknown title's character is remembered in `seen`, at most
+ * TITLE_SEEN_MAX of them): that is what catches a new spinner character.
+ * Pure: `seen` is the caller's to change, and a missing one counts as empty.
+ */
+function titleLogDue({ state, previous, codePoint, seen }) {
+  const remember = state === 'none' && !(seen && seen.has(codePoint))
+    && (seen ? seen.size : 0) < TITLE_SEEN_MAX;
+  const due = state !== previous || remember;
+  return { due, remember };
+}
+
 module.exports = { HARNESSES, DEFAULT_HARNESS, getHarness, allHarnesses, availableHarnesses,
-  progressBusyState };
+  progressBusyState, titleLogDue };
