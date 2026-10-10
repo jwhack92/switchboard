@@ -54,6 +54,10 @@ const CLAUDE_SESSION_VARS = [
   'CLAUDE_CODE_USE_POWERSHELL_TOOL',
   'CLAUDE_EFFORT',
   'CLAUDE_PID',
+  // Not a Claude Code variable: Switchboard's own tag for a Claude terminal
+  // (main.js sets a fresh one after this strip). It is in this list because
+  // the rule is the same: an inherited one must not reach a child.
+  'SWITCHBOARD_TERMINAL_ID',
 ];
 
 const LOCALE_VARS = ['LC_ALL', 'LC_CTYPE', 'LANG'];

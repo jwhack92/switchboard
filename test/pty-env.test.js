@@ -222,3 +222,13 @@ test('pty-env: statsPtyEnv with a base that already steers the path conversion: 
     assert.deepEqual(base, { MSYS2_ARG_CONV_EXCL: had }, had + ': the base is not written to');
   }
 });
+
+test('pty-env: an inherited SWITCHBOARD_TERMINAL_ID is stripped', () => {
+  // A Switchboard started from inside a Switchboard terminal must not hand its parent's tag to every terminal.
+  const inherited = { PATH: '/usr/bin', SWITCHBOARD_TERMINAL_ID: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' };
+  assert.deepEqual(buildPtyEnv(inherited, 'linux'), { PATH: '/usr/bin' });
+  assert.ok(CLAUDE_SESSION_VARS.includes('SWITCHBOARD_TERMINAL_ID'));
+  // The Stats run is built from the stripped base, so it carries no tag either.
+  // (statsPtyEnv is the name task 11 declared at the top of this file; it is not declared again.)
+  assert.equal('SWITCHBOARD_TERMINAL_ID' in statsPtyEnv(buildPtyEnv(inherited, 'linux')), false);
+});

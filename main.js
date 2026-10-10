@@ -273,6 +273,16 @@ const activeSessions = new Map();
  * Returns { id, session } with the id the session actually lives under now, or
  * { id, session: null } when it really is gone. Direct hit first; the scan is
  * over live sessions only, which is a handful.
+ *
+ * This lookup follows ANY earlier id with no time limit, until another
+ * terminal is started under that id (then forgetPriorId of
+ * session-transitions.js, which open-terminal calls when it starts a terminal,
+ * has taken the id out of the list). It is for the callers that must never
+ * take a moved session for a dead one: tear-off adopt, the busy flag for the
+ * meter, session meta, and stop-session's "it moved" answer. Typed input and
+ * resize do not come here: they use sessionTransitions.resolveInputSession,
+ * which follows only the newest earlier id and only for 5 seconds, so that a
+ * key addressed to a long-dead id can never reach a terminal.
  */
 function resolveLiveSession(sessionId) {
   const direct = activeSessions.get(sessionId);
@@ -2298,6 +2308,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
   let ptyProcess;
   let startupLine = null;
   let mcpServer = null;
+  let hostToken = null;
   try {
     if (isPlainTerminal) {
       // Plain terminal: interactive login shell, no claude command
@@ -2367,6 +2378,8 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
       if (mcpServer) {
         ptyEnv.CLAUDE_CODE_SSE_PORT = String(mcpServer.port);
       }
+      hostToken = require('crypto').randomUUID();
+      ptyEnv.SWITCHBOARD_TERMINAL_ID = hostToken;
 
       ptyProcess = pty.spawn(shell, shellArgs(shell, claudeCmd, shellExtraArgs), {
         name: 'xterm-256color',
@@ -2375,6 +2388,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         cwd: isWsl ? os.homedir() : projectPath,
         env: ptyEnv,
       });
+      log.info(`[terminal-tag] session=${sessionId} tag=${hostToken.slice(0, 8)}`);
 
     }
   } catch (err) {
@@ -2388,6 +2402,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
     projectFolder, knownJsonlFiles, sessionSlug,
     isPlainTerminal, forkFrom: sessionOptions?.forkFrom || null,
     mcpServer, _openedAt: Date.now(),
+    hostToken,
   };
   // A terminal starts under this id: from now on the id means this terminal.
   // A terminal that once had the id and has moved on (a fork, a plan-accept,
@@ -2694,7 +2709,8 @@ ipcMain.handle('session-drag-cancel', () => sessionMove.dragCancel());
 ipcMain.on('terminal-input', (event, sessionId, data) => {
   // The same three steps as terminal-resize, in the same order.
   // (1) Find the live session.
-  const found = activeSessions.has(sessionId) ? { id: sessionId, session: activeSessions.get(sessionId) } : null;
+  // It follows the newest earlier id for 5 s, so a key pressed while a re-key lands is not lost; the owner is asked under the live id, as the re-key took the owner away from the old one.
+  const found = sessionTransitions.resolveInputSession(sessionId, Date.now());
   if (!found || found.session.exited) return;
   const { id: liveId, session } = found;
   // (2) Only the owning window may drive the PTY. A window that has just handed a
@@ -2710,7 +2726,8 @@ ipcMain.on('terminal-input', (event, sessionId, data) => {
 ipcMain.on('terminal-resize', (event, sessionId, cols, rows) => {
   // The same three steps as terminal-input, in the same order.
   // (1) Find the live session.
-  const found = activeSessions.has(sessionId) ? { id: sessionId, session: activeSessions.get(sessionId) } : null;
+  // It follows the newest earlier id for 5 s, so a size sent while a re-key lands is not lost; the owner is asked under the live id, as the re-key took the owner away from the old one.
+  const found = sessionTransitions.resolveInputSession(sessionId, Date.now());
   if (!found || found.session.exited) return;
   const { id: liveId, session } = found;
   // (2) A PTY has exactly one size. Letting a non-owner resize it is how two
@@ -2756,6 +2773,12 @@ ipcMain.on('close-terminal', (event, sessionId) => {
 
 // Session transitions → session-transitions.js
 const sessionTransitions = require('./session-transitions');
+// The folder the ctx-handoff hook writes its notes to, worked out at each call.
+// The same expression stands first in the read-ctx-state handler, which is not
+// edited here: another test file cuts that handler as it is.
+function claudeCtxDir() {
+  return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'claude-ctx');
+}
 sessionTransitions.init({
   PROJECTS_DIR, activeSessions, log, rekeyMcpServer,
   // A fork re-keys the session; ownership and the MCP window must follow it.
@@ -2774,7 +2797,22 @@ sessionTransitions.init({
   copySessionAssignment,
   rekeyPlanLinks,
   rekeyScheduleSession: dbModule.rekeyScheduleSession,
+  // For the /clear re-key:
+  //   copyStar          on a /clear the pin is copied to the new id
+  //   readClearOrigin   the hook's note <id>.origin.json, which says which
+  //                     terminal cleared; null when the id is not a session
+  //                     id (then no file is touched), or the note is not
+  //                     there or does not parse
+  //   broadcast,        after a re-key every window is told the new owner,
+  //   ownerId           the one ownerId gives under the new id
+  copyStar: dbModule.copyStar,
+  readClearOrigin: (id) => (typeof id === 'string' && CTX_ID_RE.test(id)
+    ? readCtxJson(path.join(claudeCtxDir(), id + '.origin.json')).value
+    : null),
+  broadcast: registry.broadcast,
+  ownerId: registry.ownerId,
 });
+log.info(`[clear-detect] notes dir=${claudeCtxDir()}`);
 const { detectSessionTransitions } = sessionTransitions;
 
 // --- fs.watch on projects directory ---

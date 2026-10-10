@@ -199,6 +199,11 @@ function boot({ blocks = [], globals = {}, modules = {} } = {}) {
     sessionTransitions,
     ...globals,
   };
+  // The open-terminal block asks for one module by name: a Claude terminal's
+  // tag is require('crypto').randomUUID(). A module goes through `modules`,
+  // never as a `require` among the globals (that would replace the helper's
+  // own require in every block of the boot, the guard block among them).
+  modules = { crypto: require('crypto'), ...modules };
   // From the crash guard on, two blocks of main.js are loaded in every boot,
   // before the named ones. 'resolve' (unless the test names it): stop-session
   // asks resolveLiveSession. 'guard': main.js's own lines make the REAL
@@ -2901,4 +2906,253 @@ test("main-pty-wiring: main.js has no direct '.pty.resize(', '.pty.write(' or '.
   assert.deepEqual(direct, [], 'every terminal write, resize and kill goes through ptyGuard, in comments too');
   for (const call of ['ptyGuard.write(', 'ptyGuard.resize(', 'ptyGuard.kill(']) assert.ok(src.includes(call), call);
   assert.equal(src.includes('_isDisposed'), false, "the start-up line asks the guard, not a field the terminal object does not have");
+});
+
+// --- /clear re-key: the terminal's tag ---
+
+test('main-pty-wiring: a Claude terminal gets a tag of its own in its environment and on its record, with one log line; a plain terminal gets none', async () => {
+  const env = spawnFakes();
+  const h = boot({ blocks: ['resolve', 'open'], globals: env.globals });
+  const a = h.window();
+  const one = await start(h, env, a, 's1');
+  const two = await start(h, env, a, 's2');
+  const term = await start(h, env, a, 't1', { options: { type: 'terminal' } });
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const tagLines = () => h.log.lines.filter((line) => line.includes('[terminal-tag]'));
+
+  for (const [id, started] of [['s1', one], ['s2', two]]) {
+    assert.match(started.session.hostToken, UUID, id);
+    assert.equal(started.proc.options.env.SWITCHBOARD_TERMINAL_ID, started.session.hostToken, id + ': the same tag in the environment handed to pty.spawn');
+    assert.deepEqual(tagLines().filter((line) => line.includes('session=' + id + ' ')),
+      [`info [terminal-tag] session=${id} tag=${started.session.hostToken.slice(0, 8)}`]);
+  }
+  assert.notEqual(one.session.hostToken, two.session.hostToken, 'two terminals, two tags');
+  assert.equal(term.session.hostToken, null, 'a plain terminal has no tag');
+  assert.equal('SWITCHBOARD_TERMINAL_ID' in term.proc.options.env, false);
+  assert.equal(tagLines().length, 2, 'and no line');
+});
+
+test('main-pty-wiring: a terminal started again under the id of one that ended gets a tag of its own and a second log line; opening a running terminal again starts nothing and keeps its tag', async (t) => {
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const tagLines = (h, id) => h.log.lines.filter((line) => line.startsWith('info [terminal-tag] session=' + id + ' '));
+
+  await t.test('a session that ended and is started again under the same id (a resume): two tags, each in its own environment, and two lines', async () => {
+    const env = spawnFakes();
+    const h = boot({ blocks: ['resolve', 'open'], globals: env.globals });
+    const a = h.window();
+    const first = await start(h, env, a, 's1');
+    const firstTag = first.session.hostToken;
+    assert.match(firstTag, UUID);
+    first.proc.emitExit({ exitCode: 0, signal: undefined });
+    assert.equal(h.activeSessions.has('s1'), false, 'the first terminal has ended and left the list');
+
+    const second = await start(h, env, a, 's1', { isNew: false });
+    assert.match(second.session.hostToken, UUID);
+    assert.notEqual(second.session.hostToken, firstTag, 'the second terminal has a tag of its own');
+    assert.equal(second.proc.options.env.SWITCHBOARD_TERMINAL_ID, second.session.hostToken, 'the second tag in the environment of the second spawn');
+    assert.equal(first.proc.options.env.SWITCHBOARD_TERMINAL_ID, firstTag, "the first terminal's environment still has the first tag");
+    assert.equal(first.session.hostToken, firstTag, "and so has the first terminal's record");
+    assert.deepEqual(tagLines(h, 's1'),
+      [firstTag, second.session.hostToken].map((tag) => `info [terminal-tag] session=s1 tag=${tag.slice(0, 8)}`));
+  });
+
+  await t.test('open-terminal for a terminal that is already running (a window reload, another window): nothing is started, the tag stays, no second line', async () => {
+    const env = spawnFakes();
+    const h = boot({ blocks: ['resolve', 'open'], globals: env.globals });
+    const a = h.window();
+    const b = h.window();
+    const { session, proc } = await start(h, env, a, 's1');
+    const tag = session.hostToken;
+    assert.match(tag, UUID);
+    for (const win of [a, b]) {
+      const answer = await h.invoke('open-terminal', win, 's1', PROJECT, false, undefined);
+      assert.equal(answer.ok, true);
+      assert.equal(answer.reattached, true);
+    }
+    assert.equal(env.spawned.length, 1, 'one process in all');
+    assert.equal(h.activeSessions.get('s1'), session, 'the same record');
+    assert.equal(session.hostToken, tag, 'with the tag it started with');
+    assert.equal(proc.options.env.SWITCHBOARD_TERMINAL_ID, tag);
+    assert.equal(tagLines(h, 's1').length, 1, 'a reattach writes no [terminal-tag] line');
+  });
+});
+
+// --- /clear re-key: typing and resize follow a re-key for 5 seconds ---
+
+const NOW_MS = 1800000000000;
+/**
+ * Both handlers on a clock that stands at NOW_MS (a block's Date is its own global, so the fake goes in
+ * through globals). One session, shown by window `a`, stored under 'old-id' and moved to 'new-id'
+ * `agoMs` before. rekeyByHand is the move of before /clear and does not stamp it, so the stamp is set here.
+ */
+function movedBoot(agoMs, { blocks = ['input', 'resize'] } = {}) {
+  const h = boot({ blocks, globals: { Date: { now: () => NOW_MS } } });
+  const a = h.window();
+  const b = h.window();
+  const s = h.session('old-id', { owner: a, firstResize: false });
+  rekeyByHand(h, 'old-id', 'new-id');
+  s.rekeyedAtMs = NOW_MS - agoMs;
+  return { h, a, b, s };
+}
+
+test('main-pty-wiring: typing and resize under the id a session left at most 5 s ago reach its terminal, and the owner rule is asked under the live id', async (t) => {
+  await t.test('4 s after the move: typing under the earlier id is one write to the moved terminal', () => {
+    const { h, a, s } = movedBoot(4000);
+    h.emit('terminal-input', a, 'old-id', 'x');
+    assert.deepEqual(writes(s), ['x']);
+    assert.equal(s.pty.calls.length, 1);
+  });
+
+  await t.test('4 s after the move: a resize under the earlier id reaches the moved terminal once', () => {
+    const { h, a, s } = movedBoot(4000);
+    h.emit('terminal-resize', a, 'old-id', 100, 30);
+    assert.deepEqual(resizes(s), [[100, 30, 0]]);
+    h.timers.advance(1000);
+    assert.equal(s.pty.calls.length, 1);
+  });
+
+  await t.test('exactly 5 s is still followed; 5001 ms and 6 s are not', () => {
+    const edge = movedBoot(5000);
+    edge.h.emit('terminal-input', edge.a, 'old-id', 'x');
+    assert.deepEqual(writes(edge.s), ['x']);
+    for (const agoMs of [5001, 6000]) {
+      const late = movedBoot(agoMs);
+      late.h.emit('terminal-input', late.a, 'old-id', 'x');
+      late.h.emit('terminal-resize', late.a, 'old-id', 100, 30);
+      assert.deepEqual(late.s.pty.calls, [], agoMs + ' ms');
+    }
+  });
+
+  await t.test('the live id itself works as before, whatever the age of the move', () => {
+    const { h, a, s } = movedBoot(60000);
+    h.emit('terminal-input', a, 'new-id', 'x');
+    h.emit('terminal-resize', a, 'new-id', 100, 30);
+    assert.deepEqual(writes(s), ['x']);
+    assert.deepEqual(resizes(s), [[100, 30, 0]]);
+  });
+
+  await t.test('an older earlier id is never followed', () => {
+    const { h, a, s } = movedBoot(1000);
+    s.priorIds = ['first-id', 'old-id'];
+    h.emit('terminal-input', a, 'first-id', 'x');
+    h.emit('terminal-resize', a, 'first-id', 100, 30);
+    assert.deepEqual(s.pty.calls, []);
+  });
+
+  await t.test('a window that does not own the live id types and resizes under the earlier id: nothing reaches the pty', () => {
+    const { h, a, b, s } = movedBoot(4000);
+    assert.equal(h.registry.ownerId('old-id'), null, 'the earlier id has no owner any more');
+    assert.equal(h.registry.ownerId('new-id'), a.id);
+    h.emit('terminal-input', b, 'old-id', 'typed in the other window\r');
+    h.emit('terminal-resize', b, 'old-id', 100, 30);
+    h.emit('terminal-input', NO_WINDOW, 'old-id', 'typed in no window\r');
+    assert.deepEqual(s.pty.calls, []);
+  });
+
+  await t.test('the exact key wins: a second terminal stored under the earlier id gets what is addressed to it, the moved one gets none of it', () => {
+    const { h, a, b, s } = movedBoot(4000);
+    const resumed = h.session('old-id', { owner: b, firstResize: false });   // the cleared conversation, opened again
+    h.emit('terminal-input', b, 'old-id', 'r');
+    h.emit('terminal-resize', b, 'old-id', 90, 20);
+    assert.deepEqual(writes(resumed), ['r']);
+    assert.deepEqual(resizes(resumed), [[90, 20, 0]]);
+    h.emit('terminal-input', a, 'old-id', 'x');   // a does not own the terminal that is under 'old-id' now
+    assert.deepEqual(s.pty.calls, []);
+    assert.equal(resumed.pty.calls.length, 2);
+  });
+
+  await t.test('a moved terminal that has ended is not followed', () => {
+    const { h, a, s } = movedBoot(4000);
+    s.exited = true;
+    h.emit('terminal-input', a, 'old-id', 'x');
+    h.emit('terminal-resize', a, 'old-id', 100, 30);
+    assert.deepEqual(s.pty.calls, []);
+  });
+
+  // A guard, not a test of this commit: it passes before and after. Stop never follows (design change 26).
+  await t.test('stop-session under the earlier id, 4 s after the move, kills nothing and says where the session went', async () => {
+    const { h, a, s } = movedBoot(4000, { blocks: ['stop', 'input', 'resize'] });
+    const answer = await h.invoke('stop-session', a, 'old-id');
+    assert.deepEqual({ ...answer }, { ok: false, error: 'not running', rekeyedTo: 'new-id' });
+    assert.deepEqual(ptyCalls(s, 'kill'), []);
+    assert.notEqual(s.stopRequested, true);
+  });
+});
+
+// --- /clear re-key: what main.js hands the detector ---
+
+test('main-pty-wiring: main.js hands the detector copyStar, the note reader, broadcast and ownerId; the reader reads only <id>.origin.json of the claude-ctx folder', () => {
+  const path = require('path');
+  const ID = '11111111-2222-3333-4444-555555555555';
+  const ABSENT = '99999999-2222-3333-4444-555555555555';
+  const NOTE = { v: 1, session_id: ID };
+  // Two cuts joined: the id pattern main.js already has, then the detector's wiring.
+  const text = cut('main.js', 'const CTX_ID_RE = ', '// → { value, code }: code')
+    + cut('main.js', "const sessionTransitions = require('./session-transitions');", '// --- fs.watch on projects directory ---');
+  const run = (env) => {
+    let given = null;
+    const reads = [];
+    const lines = [];
+    const registry = { sendToOwner() {}, rekeyOwner() {}, broadcast() {}, ownerId() {} };
+    const dbModule = { rekeyScheduleSession() {}, copyStar() {} };
+    const fakes = { copySessionAssignment() {}, rekeyPlanLinks() {}, rekeyMcpServer() {} };
+    const logAt = (level) => (...args) => { lines.push(level + ' ' + args.join(' ')); };
+    load(text, { file: 'main.js', globals: {
+      // This one load is the test's own, not a boot of the harness: no other block shares these globals.
+      // It needs a stand-in that records what init is handed, and through `modules` the helper would
+      // hand the block the REAL ./session-transitions (the file exists), so the require is given here.
+      require: (name) => {
+        assert.equal(name, './session-transitions');
+        return { init: (ctx) => { given = ctx; }, detectSessionTransitions() {} };
+      },
+      PROJECTS_DIR: 'C:\\nowhere\\projects', activeSessions: new Map(),
+      log: { debug: logAt('debug'), info: logAt('info'), warn: logAt('warn'), error: logAt('error') },
+      registry, dbModule, ...fakes, path, os: { homedir: () => 'C:\\home' }, process: { env },
+      readCtxJson: (p) => {
+        reads.push(p);
+        return p.endsWith(ID + '.origin.json') ? { value: NOTE, code: null } : { value: null, code: 'ENOENT' };
+      },
+    } });
+    return { given, reads, lines, registry, dbModule, fakes };
+  };
+
+  const first = run({ LOCALAPPDATA: 'C:\\la' });
+  const dir = path.join('C:\\la', 'claude-ctx');
+  assert.equal(first.given.copyStar, first.dbModule.copyStar);
+  assert.equal(first.given.broadcast, first.registry.broadcast);
+  assert.equal(first.given.ownerId, first.registry.ownerId);
+  // What main.js handed over before this commit is still handed over.
+  assert.equal(first.given.sendToOwner, first.registry.sendToOwner);
+  assert.equal(first.given.rekeyOwner, first.registry.rekeyOwner);
+  assert.equal(first.given.rekeyMcpServer, first.fakes.rekeyMcpServer);
+  assert.equal(first.given.copySessionAssignment, first.fakes.copySessionAssignment);
+  assert.equal(first.given.rekeyPlanLinks, first.fakes.rekeyPlanLinks);
+  assert.equal(first.given.rekeyScheduleSession, first.dbModule.rekeyScheduleSession);
+  for (const name of ['now', 'setTimer', 'clearTimer']) assert.equal(name in first.given, false, name + " is left to the module's default");
+
+  assert.equal(first.given.readClearOrigin(ID), NOTE);
+  assert.equal(first.given.readClearOrigin(ABSENT), null, 'a note that is not there');
+  assert.deepEqual(first.reads, [path.join(dir, ID + '.origin.json'), path.join(dir, ABSENT + '.origin.json')]);
+  for (const bad of ['..\\..\\x', '', undefined, null, 7, 'not-an-id', ID + '.json', ID + '\\..\\x']) {
+    assert.equal(first.given.readClearOrigin(bad), null, JSON.stringify(bad));
+  }
+  assert.equal(first.reads.length, 2, 'what is not a session id touches no file');
+  assert.deepEqual(first.lines.filter((line) => line.includes('[clear-detect]')), ['info [clear-detect] notes dir=' + dir]);
+
+  const second = run({});   // no LOCALAPPDATA: the folder under the home folder, as read-ctx-state has it
+  second.given.readClearOrigin(ID);
+  assert.deepEqual(second.reads, [path.join('C:\\home', 'AppData', 'Local', 'claude-ctx', ID + '.origin.json')]);
+});
+
+test('main-pty-wiring: each of the two lookups of an earlier id names the other in its comment', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const live = main.indexOf('function resolveLiveSession(sessionId) {');
+  assert.ok(live > 0);
+  assert.match(main.slice(Math.max(0, live - 2500), live), /resolveInputSession/);
+  const transitions = fs.readFileSync(path.join(__dirname, '..', 'session-transitions.js'), 'utf8');
+  const input = transitions.indexOf('function resolveInputSession(');
+  assert.ok(input > 0);
+  assert.match(transitions.slice(Math.max(0, input - 1500), input), /resolveLiveSession/);
 });
