@@ -3279,7 +3279,7 @@ test('browser: a sibling whose terminal did not open is not remembered', async (
 const {
   ULTRACODE_TEXT, ULTRACODE_UNKNOWN_TITLE, ULTRACODE_NOT_CONFIRMED, ULTRACODE_NO_WORKFLOWS, ULTRACODE_NO_MODEL,
   STALE_AFTER_MS,
-  typingGate, ultracodeValue, draftOpen, ultracodeModel, ultracodeScreen, ultracodeOutcome,
+  typingGate, ultracodeValue, ultracodeModel, ultracodeScreen, ultracodeOutcome,
   parseStoredUltracode, staleReading, staleTitle,
 } = require(MODULE_PATH);
 
@@ -3437,46 +3437,6 @@ test('ultracodeModel: it asks first wherever the gate does, and the tooltip says
       ? 'Ultracode is on. This window has seen no busy or idle event for this session since it loaded. Click to switch it off anyway (asks first).'
       : 'Ultracode is on. This session has not reported the end of its turn. Click to switch it off anyway (asks first).');
   }
-});
-
-test('draftOpen: the last thing typed by hand was not Enter, whenever that was', () => {
-  assert.equal(draftOpen(null), false, 'nothing typed in this window');
-  assert.equal(draftOpen(undefined), false);
-  assert.equal(draftOpen({ atMs: STOP_MS + 1, enter: false }), true);
-  assert.equal(draftOpen({ atMs: STOP_MS + 1, enter: true }), false, 'the last of it was Enter');
-  // Only the boolean true is an Enter; a record without a time is no record.
-  assert.equal(draftOpen({ atMs: STOP_MS + 1, enter: 'yes' }), true);
-  assert.equal(draftOpen({ enter: false }), false);
-  assert.equal(draftOpen('typed'), false);
-});
-
-test('ultracodeModel: text typed ahead while the turn ran is still a draft when the turn has ended', () => {
-  // The end of a turn does not empty the input box. Typed before the hook's
-  // Stop, at it, or with no Stop on record: the click asks first all the same.
-  const stops = [hookState(), hookState({ last_stop_at: 5000 }), oldHookState(), null];
-  for (const state of stops) {
-    for (const atMs of [STOP_MS - 5000, STOP_MS, STOP_MS + 1]) {
-      const model = ultracodeModel(ultraArgs({ state, typed: { atMs, enter: false } }));
-      assert.equal(model.enabled, true);
-      assert.equal(model.override, true, JSON.stringify({ atMs, stop: state && state.last_stop_at }));
-    }
-  }
-});
-
-test('ultracodeModel: the draft rule turns a plain click into one that asks first, and nothing else', () => {
-  const draft = { atMs: STOP_MS + 1, enter: false };
-  const plain = ultracodeModel(ultraArgs({ ultracodeValue: false }));
-  const over = ultracodeModel(ultraArgs({ ultracodeValue: false, typed: draft }));
-  assert.equal(plain.override, false);
-  assert.equal(over.enabled, true);
-  assert.equal(over.override, true);
-  assert.equal(over.title, 'Ultracode is off. Click to switch it on (asks first).');
-  assert.equal(ultracodeModel(ultraArgs({ typed: { atMs: STOP_MS + 1, enter: true } })).override, false);
-  // A draft never makes a disabled button clickable.
-  assert.equal(ultracodeModel(ultraArgs({ typed: draft, busy: true })).enabled, false);
-  assert.equal(ultracodeModel(ultraArgs({ typed: draft, busy: true })).override, false);
-  // Hand off does not have the rule.
-  assert.equal(buttonModel(buttonArgs({ typed: draft })).primary.override, false);
 });
 
 // Where the hook's scan of the transcript stopped: its mark that it has looked.
@@ -3883,11 +3843,10 @@ test('browser: no confirmation after 5 s goes back to the look it had, with a no
   assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
   assert.equal(h.header().note, null);
   await h.advance(1);
-  // Back to the look it had; and the text may be sitting in the input box
-  // unsent, so the next click asks first.
+  // Back to the look it had.
   assert.deepEqual(ultraHeader(h), {
-    shown: true, label: 'Ultracode', enabled: true, asksFirst: true, look: 'off',
-    title: 'Ultracode is off. Click to switch it on (asks first).',
+    shown: true, label: 'Ultracode', enabled: true, asksFirst: false, look: 'off',
+    title: 'Ultracode is off. Click to switch it on.',
   });
   assert.equal(ULTRACODE_NOT_CONFIRMED, 'No confirmation seen');
   assert.equal(h.header().note, ULTRACODE_NOT_CONFIRMED);
@@ -3896,32 +3855,6 @@ test('browser: no confirmation after 5 s goes back to the look it had, with a no
   // The note does not stay for ever.
   await h.ticks(61);
   assert.equal(h.header().note, null);
-});
-
-test('browser: after "No confirmation seen" the next click asks first, until an Enter is typed there by hand', async () => {
-  const h = await bootUltra(false);
-  await clickUltra(h);
-  await h.advance(5250);
-  assert.equal(h.sent.length, 2);
-  h.knobs.confirmAnswer = false;
-  await clickUltra(h);
-  await h.advance(1000);
-  assert.deepEqual(h.confirms, [boxText('', '/effort ultracode')]);
-  assert.equal(h.sent.length, 2, 'not typed a second time onto the first');
-  assert.equal(h.header().primaryOverride, false, 'Hand off is as it was');
-  // He pressed Enter in the terminal: whatever was in the box has gone in.
-  h.run(`handoffNoteTyped('${SID}', true)`);
-  await h.tick();
-  assert.equal(ultraHeader(h).asksFirst, false);
-
-  // A refusal is the program answering, so the text did go in: no draft.
-  const refused = await bootUltra(false);
-  await clickUltra(refused);
-  await refused.advance(250);   // the Enter (B7): the looks count from it
-  refused.knobs.rows = promptScreenWith(['Ultracode isn\'t available on haiku']);
-  await refused.advance(5000);
-  assert.equal(refused.header().note, ULTRACODE_NO_MODEL);
-  assert.equal(ultraHeader(refused).asksFirst, false);
 });
 
 test('browser: a screen that cannot be read is never a confirmation', async () => {
@@ -4087,39 +4020,6 @@ test('browser: a value that changed while the question was open is not switched 
   await h.advance(6000);
   assert.deepEqual(h.sent, []);
   assert.equal(ultraHeader(h).look, 'off');
-});
-
-test('browser: something typed by hand since the last turn, not ended with Enter, makes the click ask first', async () => {
-  const h = await bootUltra(false);
-  assert.equal(ultraHeader(h).asksFirst, false);
-  h.run(`handoffNoteTyped('${SID}', false)`);
-  assert.equal(JSON.stringify(h.inputs().typed), JSON.stringify({ atMs: h.now, enter: false }), 'the time and the flag, never the text');
-  await h.tick();
-  assert.equal(ultraHeader(h).asksFirst, true);
-  assert.equal(h.header().primaryOverride, false, 'Hand off does not have the rule');
-  h.knobs.confirmAnswer = false;
-  await clickUltra(h);
-  await h.advance(1000);
-  assert.deepEqual(h.confirms, [boxText('', '/effort ultracode')]);
-  assert.deepEqual(h.sent, []);
-  // The last of it was Enter: no draft.
-  h.run(`handoffNoteTyped('${SID}', true)`);
-  await h.tick();
-  assert.equal(ultraHeader(h).asksFirst, false);
-  // An id that is not one is ignored, and nothing throws.
-  h.run(`handoffNoteTyped('../x', false); handoffNoteTyped(null, false)`);
-  assert.deepEqual(h.errors, []);
-});
-
-test('browser: the draft is asked about even when the click comes before the header has caught up', async () => {
-  const h = await bootUltra(false);
-  h.run(`handoffNoteTyped('${SID}', false)`);
-  // No tick: the button still looks plain. The click decides afresh.
-  assert.equal(ultraHeader(h).asksFirst, false);
-  h.knobs.confirmAnswer = false;
-  await clickUltra(h);
-  assert.equal(h.confirms.length, 1);
-  assert.deepEqual(h.sent, []);
 });
 
 test('browser: the hook\'s next report takes over from the confirmation', async () => {
@@ -4385,45 +4285,9 @@ test('staleReading: nothing is marked while the hook\'s own markers say a turn i
   assert.notEqual(staleReading(staleArgs({ state: oldHookState() })), null);
 });
 
-// ── where the draft rule hears about typing: terminal-manager.js ───────────
+// ── terminal-manager.js: what is typed by hand ─────────────────────────────
 
 const TERMINAL_MANAGER = path.join(__dirname, '..', 'public', 'terminal-manager.js');
-
-test('terminal-manager: what is typed by hand is passed on as "ended in Enter or not", never as text', () => {
-  const { noteTypedByHand } = require('../public/terminal-manager');
-  const seen = [];
-  global.handoffNoteTyped = (...args) => { seen.push(args); };
-  try {
-    noteTypedByHand('s1', 'a');
-    noteTypedByHand('s1', '\r');
-    noteTypedByHand('s1', 'pasted line\r');
-    noteTypedByHand('s1', '\x1b[200~pasted\r\x1b[201~');
-    noteTypedByHand('s1', '\x1b[13;2u');
-    noteTypedByHand('s1', undefined);
-    assert.deepEqual(seen, [['s1', false], ['s1', true], ['s1', true], ['s1', false], ['s1', false], ['s1', false]]);
-    // A hand-off file that throws must never cost the keystroke.
-    global.handoffNoteTyped = () => { throw new Error('boom'); };
-    assert.doesNotThrow(() => noteTypedByHand('s1', 'a'));
-  } finally {
-    delete global.handoffNoteTyped;
-  }
-  // ctx-handoff.js did not load: nothing to tell, nothing thrown.
-  assert.doesNotThrow(() => noteTypedByHand('s1', 'a'));
-});
-
-test('terminal-manager: every send of hand-typed input is noted first, with the same session and data', () => {
-  const lines = fs.readFileSync(TERMINAL_MANAGER, 'utf8').split(/\r?\n/);
-  let sends = 0;
-  lines.forEach((line, index) => {
-    const send = /^\s*window\.api\.sendInput\((.*)\);\s*$/.exec(line);
-    if (!send) return;
-    sends++;
-    assert.equal(lines[index - 1].trim(), `noteTypedByHand(${send[1]});`, `terminal-manager.js:${index + 1}`);
-  });
-  // The terminal's own input, the two newline keys, Space, and a dropped file.
-  assert.equal(sends, 5);
-  assert.equal(lines.filter((line) => line.includes('sendInput(')).length, sends, 'a send in a spelling this scan does not read');
-});
 
 // ── the click: whether the text goes in, and where ─────────────────────────
 
@@ -4515,106 +4379,7 @@ test('browser: Hand off types nothing while a switch is on its way in', async ()
   assert.equal(h.confirms.length, 0);
 });
 
-// ── the draft: typed ahead, and across a reload ────────────────────────────
 
-const { parseStoredTyped } = require(MODULE_PATH);
-const TYPED_KEY = 'handoff-typed:' + SID;
-
-test('browser: text typed ahead while the session worked is still there when the turn ends: the click asks first', async () => {
-  const h = await bootUltra(false);
-  // He sends a prompt, and while the session works types the start of the next.
-  h.run(`handoffNoteTyped('${SID}', true)`);
-  h.busyEvent(true);
-  await h.advance(5000);
-  h.run(`handoffNoteTyped('${SID}', false)`);
-  await h.advance(5000);
-  // The turn ends: a Stop LATER than the typing, then the idle event.
-  h.setState(endedState(h, { ultracode: false, last_prompt_at: h.sec - 10, last_stop_at: h.sec }));
-  h.busyEvent(false);
-  await h.refresh();
-  assert.equal(h.header().primaryOverride, false, 'the gate itself is plain');
-  assert.equal(ultraHeader(h).asksFirst, true);
-  assert.equal(ultraHeader(h).title, 'Ultracode is off. Click to switch it on (asks first).');
-  h.knobs.confirmAnswer = false;
-  await clickUltra(h);
-  await h.advance(6000);
-  assert.deepEqual(h.confirms, [boxText('', '/effort ultracode')]);
-  assert.deepEqual(h.sent, [], 'not typed onto the end of the half-written prompt');
-});
-
-test('browser: handoffNoteTyped keeps a time and a boolean, whatever it is handed', async () => {
-  const h = await bootUltra(false);
-  for (const given of ['\'the text itself\'', '1', '{}', 'undefined']) {
-    h.run(`handoffNoteTyped('${SID}', ${given})`);
-    assert.deepEqual(h.inputs().typed, { atMs: h.now, enter: false }, given);
-  }
-  h.run(`handoffNoteTyped('${SID}', true)`);
-  assert.deepEqual(h.inputs().typed, { atMs: h.now, enter: true });
-  assert.equal([...h.storage.values()].some((value) => value.includes('text itself')), false);
-});
-
-test('parseStoredTyped: a stored draft comes back as "not ended in Enter", and nothing else comes back at all', () => {
-  assert.deepEqual(parseStoredTyped(JSON.stringify({ atMs: 5000 })), { atMs: 5000, enter: false });
-  assert.deepEqual(parseStoredTyped(JSON.stringify({ atMs: 5000, enter: true, text: 'x' })), { atMs: 5000, enter: false });
-  const bad = [null, undefined, '', 'not json', 'null', '7', '[]', '{}', JSON.stringify({ atMs: 0 }), JSON.stringify({ atMs: '5' })];
-  for (const text of bad) assert.equal(parseStoredTyped(text), null, String(text));
-});
-
-test('browser: a draft is remembered across a reload of the window, where main\'s busy flag makes the click plain', async () => {
-  const storage = new Map();
-  const first = await bootUltra(false, { storage, readCtxState: true });
-  first.run(`handoffNoteTyped('${SID}', false)`);
-  assert.deepEqual(JSON.parse(storage.get(TYPED_KEY)), { atMs: first.now }, 'the time, and never the text');
-
-  // The same window, loaded again: no busy event yet, but main says "not busy",
-  // so the gate asks nothing. The text is still in the input box.
-  const second = await bootUltra(false, { storage, readCtxState: true, reloaded: true, startMs: first.now + 5000 });
-  assert.equal(second.inputs().busyKnown, true);
-  assert.equal(second.header().primaryOverride, false);
-  assert.deepEqual(second.inputs().typed, { atMs: first.now, enter: false });
-  assert.equal(ultraHeader(second).asksFirst, true);
-  second.knobs.confirmAnswer = false;
-  await clickUltra(second);
-  await second.advance(1000);
-  assert.equal(second.confirms.length, 1);
-  assert.deepEqual(second.sent, []);
-
-  // Enter typed by hand: no draft, and nothing left behind for the next reload.
-  second.run(`handoffNoteTyped('${SID}', true)`);
-  assert.equal(storage.has(TYPED_KEY), false);
-  const third = await bootUltra(false, { storage, readCtxState: true, reloaded: true, startMs: second.now + 5000 });
-  assert.equal(third.inputs().typed, null);
-  assert.equal(ultraHeader(third).asksFirst, false);
-});
-
-test('browser: the draft is written to storage when it starts and when its Enter comes, not on every key', async () => {
-  const h = await bootUltra(false);
-  const writes = [];
-  h.knobs.wrote = (what) => writes.push(what);
-  h.run(`{
-    const { setItem, removeItem } = sessionStorage;
-    sessionStorage.setItem = (key, value) => { __knobs.wrote('set ' + key); setItem(key, value); };
-    sessionStorage.removeItem = (key) => { __knobs.wrote('remove ' + key); removeItem(key); };
-  }`);
-  for (let key = 0; key < 20; key++) {
-    await h.advance(50);
-    h.run(`handoffNoteTyped('${SID}', false)`);
-  }
-  assert.deepEqual(writes, ['set ' + TYPED_KEY]);
-  assert.equal(h.inputs().typed.atMs, h.now, 'the time in memory follows every key');
-  h.run(`handoffNoteTyped('${SID}', true); handoffNoteTyped('${SID}', true)`);
-  assert.deepEqual(writes, ['set ' + TYPED_KEY, 'remove ' + TYPED_KEY]);
-});
-
-test('browser: a fork takes the draft with the session', async () => {
-  const h = await bootUltra(false);
-  h.run(`handoffNoteTyped('${SID}', false)`);
-  h.run(`activePtyIds = new Set(['${NEW_SID}']); activeSessionId = '${NEW_SID}';`);
-  h.listeners.fork(SID, NEW_SID);
-  await flush();
-  assert.equal(h.storage.has(TYPED_KEY), false);
-  assert.equal(h.storage.has('handoff-typed:' + NEW_SID), true);
-});
 
 // ── a session's first turn ─────────────────────────────────────────────────
 
@@ -5088,26 +4853,28 @@ test('ctx-handoff: the header note of buttonModel is the chooser\'s: the later o
     continueError: 'x', continueErrorAtMs: NOW - 50000 })).note, HANDOFF_NOT_LANDED);
 });
 
-test('ctx-handoff: the three buttons show the same of plain, asks first, cannot click, with the same reason (no hand-typed record in play)', () => {
+test('ctx-handoff: the three buttons show the same of plain, asks first, cannot click, with the same reason', () => {
   const kind = (part) => (!part.enabled ? 'cannot' : part.override ? 'asks' : 'plain');
   const screens = [scr('empty'), scr('draft'), scr('unknown'), scr('question'), undefined];
   let seen = { plain: 0, asks: 0, cannot: 0 };
   const check = (args, hand, plainTitle) => {
     const gate = typingGate(args);
-    for (const value of [true, false]) {
-      const ultra = ultracodeModel({ ...args, ultracodeValue: value, switching: false, typed: null, headerOff: false });
-      assert.equal(kind(ultra), kind(hand));
-      const word = value ? { prefix: 'Ultracode is on. ', action: 'Click to switch it off' } : { prefix: 'Ultracode is off. ', action: 'Click to switch it on' };
-      if (kind(hand) === 'cannot') {
-        assert.equal(hand.title, gateText(gate, 'tooltip'));
-        assert.equal(ultra.title, hand.title);
-      } else if (kind(hand) === 'asks') {
-        assert.equal(hand.title, gateText(gate, 'asks-first', { prefix: '', action: 'Click to type the request' }));
-        assert.equal(ultra.title, gateText(gate, 'asks-first', word));
-        assert.ok(gate.reason.length > 0, 'an asks-first always has its reason');
-      } else {
-        assert.equal(hand.title, plainTitle);
-        assert.equal(ultra.title, word.prefix + word.action + '.');
+    for (const typed of [null, { atMs: STOP_MS + 1, enter: false }, { atMs: STOP_MS + 1, enter: true }]) {
+      for (const value of [true, false]) {
+        const ultra = ultracodeModel({ ...args, ultracodeValue: value, switching: false, typed, headerOff: false });
+        assert.equal(kind(ultra), kind(hand));
+        const word = value ? { prefix: 'Ultracode is on. ', action: 'Click to switch it off' } : { prefix: 'Ultracode is off. ', action: 'Click to switch it on' };
+        if (kind(hand) === 'cannot') {
+          assert.equal(hand.title, gateText(gate, 'tooltip'));
+          assert.equal(ultra.title, hand.title);
+        } else if (kind(hand) === 'asks') {
+          assert.equal(hand.title, gateText(gate, 'asks-first', { prefix: '', action: 'Click to type the request' }));
+          assert.equal(ultra.title, gateText(gate, 'asks-first', word));
+          assert.ok(gate.reason.length > 0, 'an asks-first always has its reason');
+        } else {
+          assert.equal(hand.title, plainTitle);
+          assert.equal(ultra.title, word.prefix + word.action + '.');
+        }
       }
     }
     seen[kind(hand)]++;
@@ -6096,3 +5863,81 @@ test('browser: an Enter whose write throws does not leave the switch waiting: th
   assert.equal(h.header().primaryEnabled, true, 'Hand off does not wait for a reload (B12)');
   assert.equal(h.errors.length, 1);
 }));
+
+// ── the hand-typed record is gone (ready state, commit 4; decision 2) ──────
+
+test('ctx-handoff: the hand-typed record is gone from the window code', () => {
+  const gone = /draftOpen|handoffNoteTyped|handoffSetTyped|handoffStoreTyped|handoffRestoreTyped|parseStoredTyped|HANDOFF_TYPED_PREFIX|handoff-typed|noteTypedByHand/;
+  for (const file of ['ctx-handoff.js', 'terminal-manager.js']) {
+    const lines = fs.readFileSync(path.join(__dirname, '..', 'public', file), 'utf8').split(/\r?\n/);
+    lines.forEach((line, index) => assert.doesNotMatch(line, gone, `${file}:${index + 1}`));
+  }
+  const mod = require(MODULE_PATH);
+  for (const name of ['draftOpen', 'parseStoredTyped', 'handoffNoteTyped']) assert.equal(name in mod, false, name);
+  assert.equal('noteTypedByHand' in require('../public/terminal-manager'), false);
+});
+
+test('terminal-manager: what is typed by hand is still sent, from the same five places', () => {
+  const lines = fs.readFileSync(TERMINAL_MANAGER, 'utf8').split(/\r?\n/);
+  assert.equal(lines.filter(line => /^\s*window\.api\.sendInput\((.*)\);\s*$/.test(line)).length, 5);
+  assert.equal(lines.filter(line => line.includes('sendInput(')).length, 5, 'a send in a spelling this scan does not read');
+});
+
+test('ultracodeModel: a key typed by hand without Enter does not make it ask first (the screen decides)', () => {
+  const empty = { state: 'empty', why: '' };
+  const model = ultracodeModel(ultraArgs({ screen: empty, typed: { atMs: STOP_MS + 1, enter: false } }));
+  assert.equal(model.enabled, true);
+  assert.equal(model.override, false);
+  assert.equal(model.title, 'Ultracode is off. Click to switch it on.');
+  // What the screen shows still decides, for Ultracode as for Hand off.
+  const draft = { state: 'draft', why: '' };
+  assert.equal(ultracodeModel(ultraArgs({ screen: draft })).override, true);
+  assert.equal(buttonModel(buttonArgs({ screen: draft })).primary.override, true);
+});
+
+test('browser: no entry and no input carries a hand-typed record', async () => {
+  const h = await bootUltra(false);
+  assert.equal('typed' in h.inputs(), false);
+  assert.equal(h.run(`'typed' in handoffRt.cache.get('${SID}')`), false);
+  assert.equal(h.run('typeof handoffNoteTyped'), 'undefined');
+  assert.equal([...h.storage.keys()].some(key => key.startsWith('handoff-typed:')), false);
+});
+
+test('browser: after "No confirmation seen" or a refusal the next click follows the screen', async (t) => {
+  await t.test('an empty box: a plain click, for Ultracode and for Hand off', async () => {
+    const h = await bootUltra(false);
+    await clickUltra(h);
+    await h.advance(5250);   // the Enter at 250, the last look 5 s after it
+    assert.equal(h.header().note, ULTRACODE_NOT_CONFIRMED);
+    assert.deepEqual(ultraHeader(h), {
+      shown: true, label: 'Ultracode', enabled: true, asksFirst: false, look: 'off',
+      title: 'Ultracode is off. Click to switch it on.',
+    });
+    assert.equal(h.header().primaryOverride, false);
+    await clickUltra(h);
+    assert.equal(h.confirms.length, 0);
+    assert.deepEqual(h.sent[2], [SID, '/effort ultracode']);
+  });
+
+  await t.test('text in the box: both buttons ask first, with the same reason', async () => {
+    const h = await bootUltra(false);
+    h.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + '/effort ultracode';
+    await h.tick();
+    assert.equal(ultraHeader(h).asksFirst, true);
+    assert.equal(ultraHeader(h).title,
+      'Ultracode is off. There is text in this session\'s input box. Click to switch it on anyway (asks first).');
+    assert.equal(h.header().primaryOverride, true);
+    assert.equal(h.byId['handoff-primary-btn'].getAttribute('title'),
+      'There is text in this session\'s input box. Click to type the request anyway (asks first).');
+  });
+
+  await t.test('a refusal: a plain click', async () => {
+    const h = await bootUltra(false);
+    await clickUltra(h);
+    await h.advance(250);
+    h.knobs.rows[12] = 'Ultracode isn\'t available on haiku';
+    await h.advance(1000);
+    assert.equal(h.header().note, ULTRACODE_NO_MODEL);
+    assert.equal(ultraHeader(h).asksFirst, false);
+  });
+});

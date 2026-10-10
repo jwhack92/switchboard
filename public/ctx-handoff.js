@@ -56,8 +56,8 @@
 // onActiveSessionChanged() by app.js setActiveSession. Both are typeof-guarded
 // at the call site and checked once at load in app.js.
 // handoffBoltState() by the row builders of both tabs (sidebar.js
-// buildSessionItem, projects-view.js buildSessionRow) and handoffNoteTyped()
-// by terminal-manager.js, typeof-guarded at the call site too.
+// buildSessionItem, projects-view.js buildSessionRow),
+// typeof-guarded at the call site too.
 
 const REQUEST_LINE = 'Write the context handoff now. [ctx-handoff:request]';
 // Same thresholds as the status line: dim below WARN_AT, amber from it, red
@@ -567,31 +567,17 @@ function ultracodeValue(state, confirmed) {
   return stoppedSince ? hook : confirmed.value;
 }
 
-// A slash command typed onto the end of a half-written prompt is sent as part
-// of that prompt. `typed` is the last input typed by hand into the terminal,
-// { atMs, enter }: when the last of it was not Enter, it may still be sitting
-// in the input box. The end of a turn is NOT a bound on that: what is typed
-// ahead while the session works is still in the box when the turn ends, which
-// is exactly when the button is clicked. It errs towards asking (a draft
-// deleted again still counts, and so does a key that answered a permission
-// prompt, until the next Enter typed by hand), and it cannot see text the
-// program put there itself (dictation).
-function draftOpen(typed) {
-  return !!typed && typeof typed === 'object' && typeof typed.atMs === 'number' && typed.enter !== true;
-}
-
 /**
  * What the header's ultracode button shows and what a click may do. Takes
  * what buttonModel takes, and:
  *   ultracodeValue  true / false / null (see ultracodeValue)
  *   switching       a typed switch is waiting for the terminal to confirm it
- *   typed           the last input typed by hand (see draftOpen)
  *   headerOff       the header is not this session's just now
  * → { visible, label, look, enabled, override, target, title }
  *   look    'on' (filled), 'off' (outline) or 'unknown' (outline, dimmed)
  *   target  what a click switches to: 'off' when it is on, 'on' when it is off
  * It types under the same gate as Hand off, so it is disabled wherever Hand off
- * is and asks first wherever Hand off does, and it asks first over a draft too.
+ * is and asks first wherever Hand off does.
  * A value that is not known is never clickable: no guessing a direction.
  */
 function ultracodeModel(input) {
@@ -623,7 +609,7 @@ function ultracodeModel(input) {
     return model;
   }
   model.enabled = true;
-  model.override = gate.override || draftOpen(o.typed);
+  model.override = gate.override;
   model.target = value ? 'off' : 'on';
   const prefix = value ? 'Ultracode is on. ' : 'Ultracode is off. ';
   const action = value ? 'Click to switch it off' : 'Click to switch it on';
@@ -814,18 +800,6 @@ function parseStoredUltracode(text, nowMs) {
   return { value: value.value, atMs: value.atMs };
 }
 
-// A draft that may be open, as this file left it in sessionStorage, or null
-// for anything else. Only a draft is ever stored (handoffStoreTyped), so what
-// comes back is always "the last of it was not Enter".
-function parseStoredTyped(text) {
-  if (typeof text !== 'string' || !text) return null;
-  let value;
-  try { value = JSON.parse(text); } catch { return null; }
-  if (!value || typeof value !== 'object') return null;
-  if (typeof value.atMs !== 'number' || !isFinite(value.atMs) || value.atMs <= 0) return null;
-  return { atMs: value.atMs, enter: false };
-}
-
 // Which of the running sessions the 15 s poll reads on this tick: each one
 // once every POLL_EVERY_TICKS, on its own tick rather than all at once (every
 // read is synchronous work in the main process). Sorted, so a session keeps
@@ -861,8 +835,6 @@ const HANDOFF_ERROR_SHOWN_MS = 60000;
 const HANDOFF_STORE_PREFIX = 'handoff-request:';
 // ...and for the last ultracode switch its terminal confirmed.
 const HANDOFF_ULTRACODE_PREFIX = 'handoff-ultracode:';
-// ...and for a draft that may be open in its input box.
-const HANDOFF_TYPED_PREFIX = 'handoff-typed:';
 // When the terminal's screen is looked at after the switch text was typed. The
 // last look is the one that gives up.
 const HANDOFF_ULTRACODE_LOOK_MS = [1000, 2500, 5000];
@@ -944,7 +916,6 @@ function handoffForgetStored(id) {
     if (store && typeof id === 'string' && HANDOFF_ID_RE.test(id)) {
       store.removeItem(HANDOFF_STORE_PREFIX + id);
       store.removeItem(HANDOFF_ULTRACODE_PREFIX + id);
-      store.removeItem(HANDOFF_TYPED_PREFIX + id);
     }
   } catch {}
 }
@@ -981,38 +952,6 @@ function handoffRestoreUltracode(id) {
   }
 }
 
-// A draft that may be open in the session's input box (draftOpen), kept the
-// same way: main's own busy flag makes a click plain again straight after a
-// reload, when the text is still sitting there and this file's memory of it
-// would be gone. The key is there only while a draft may be.
-function handoffStoreTyped(entry) {
-  try {
-    const store = handoffStorage();
-    if (!store || !HANDOFF_ID_RE.test(entry.id)) return;
-    const key = HANDOFF_TYPED_PREFIX + entry.id;
-    if (draftOpen(entry.typed)) store.setItem(key, JSON.stringify({ atMs: entry.typed.atMs }));
-    else store.removeItem(key);
-  } catch {}
-}
-
-function handoffRestoreTyped(id) {
-  try {
-    const store = handoffStorage();
-    if (!store || typeof id !== 'string' || !HANDOFF_ID_RE.test(id)) return null;
-    return parseStoredTyped(store.getItem(HANDOFF_TYPED_PREFIX + id));
-  } catch {
-    return null;
-  }
-}
-
-// Stored only when "ended in Enter" CHANGES: this runs on every keystroke,
-// and a draft is one write when it starts and one when its Enter comes.
-function handoffSetTyped(entry, enter) {
-  const changed = !entry.typed || entry.typed.enter !== enter;
-  entry.typed = { atMs: Date.now(), enter };
-  if (changed) handoffStoreTyped(entry);
-}
-
 function handoffSetRequest(entry, request) {
   if (!request || entry.request === request) return;
   entry.request = request;
@@ -1046,9 +985,6 @@ function handoffEntry(id) {
       // across a reload either.
       turn: null,
       readAtMs: 0,
-      // The last input typed by hand into the terminal: { atMs, enter }. Never
-      // the text (handoffNoteTyped). An open draft is kept across a reload.
-      typed: handoffRestoreTyped(id),
       ultraConfirmed: handoffRestoreUltracode(id), // { value, atMs }: the last switch the terminal confirmed
       ultraSwitch: null,       // { target, atMs } while a typed switch waits for the terminal's line
       ultraNote: '',           // why the last switch came to nothing
@@ -1146,7 +1082,6 @@ function handoffInputs(id) {
     lineOnWay: !!entry && !!entry.ultraSwitch,
     screen: handoffScreenState(id),
     didNotStop: handoffDidNotStop(id),
-    typed: entry ? entry.typed : null,
     request: entry ? entry.request : handoffIdleRequest(),
     continueLocked: !!entry && nowMs < entry.continueLockUntil,
     continueError: entry ? entry.continueError : '',
@@ -1203,22 +1138,6 @@ function handoffBoltState(sessionId) {
   } catch (err) {
     handoffLogOnce('handoffBoltState failed', err);
     return null;
-  }
-}
-
-/**
- * Called by terminal-manager.js (noteTypedByHand) each time something typed,
- * pasted or dropped by hand goes to a session's terminal: when, and whether it
- * ended in Enter. Never the text. On every keystroke, so it only writes the
- * two values down (handoffSetTyped): the header catches up at the next tick,
- * and a click decides from them afresh.
- */
-function handoffNoteTyped(sessionId, enter) {
-  try {
-    if (!handoffRt.started || typeof sessionId !== 'string' || !HANDOFF_ID_RE.test(sessionId)) return;
-    handoffSetTyped(handoffEntry(sessionId), enter === true);
-  } catch (err) {
-    handoffLogOnce('handoffNoteTyped failed', err);
   }
 }
 
@@ -2061,11 +1980,6 @@ function handoffUltracodeLook(entry, pending, before, last) {
     handoffStoreUltracode(entry);
   } else {
     handoffSetClickNote(entry, result.outcome === 'refused' ? result.reason : ULTRACODE_NOT_CONFIRMED);
-    // Nothing came back: the text may be sitting in the input box unsent (an
-    // Enter that only closed the command menu). That is a draft like any
-    // other, so the next click asks first, until an Enter is typed there by
-    // hand. A refusal is the program answering: the text went in.
-    if (result.outcome !== 'refused') handoffSetTyped(entry, false);
   }
   handoffPaint(entry.id);
 }
@@ -2262,7 +2176,6 @@ function handoffInit() {
         handoffRt.cache.set(newId, entry);
         handoffStoreRequest(entry);
         handoffStoreUltracode(entry);
-        handoffStoreTyped(entry);
       }
       return handoffRefresh(newId);
     }));
@@ -2285,8 +2198,8 @@ if (typeof module !== 'undefined' && module.exports) {
     parseStoredRequest, pollDue, launchFolder,
     ULTRACODE_TEXT, ULTRACODE_UNKNOWN_TITLE, ULTRACODE_NOT_CONFIRMED, ULTRACODE_NO_WORKFLOWS, ULTRACODE_NO_MODEL,
     STALE_AFTER_MS,
-    typingGate, gateText, chooseHeaderNote, ultracodeValue, draftOpen, ultracodeModel, ultracodeScreen, ultracodeOutcome,
-    parseStoredUltracode, parseStoredTyped, staleReading, staleTitle,
-    handoffChipState, handoffBoltState, handoffNoteTyped, onActiveSessionChanged,
+    typingGate, gateText, chooseHeaderNote, ultracodeValue, ultracodeModel, ultracodeScreen, ultracodeOutcome,
+    parseStoredUltracode, staleReading, staleTitle,
+    handoffChipState, handoffBoltState, onActiveSessionChanged,
   };
 }
