@@ -87,7 +87,7 @@ mainFaults.installListeners(process);
 // Code session markers stripped, and a UTF-8 LC_CTYPE guaranteed when the
 // parent handed us no locale. See pty-env.js for why each of those matters;
 // the Claude-marker strip in particular is ours and has no upstream equivalent.
-const { buildPtyEnv } = require('./pty-env');
+const { buildPtyEnv, TERMINAL_IDENTITY_ENV, statsPtyEnv } = require('./pty-env');
 
 const cleanPtyEnv = buildPtyEnv(process.env);
 
@@ -1469,9 +1469,16 @@ try {
 //   back to whatever was on disk and rendered it without comment, which is how
 //   the stats page showed April data for five months without complaining.
 //
-// NOTE: accepting the trust prompt writes a persistent decision into
+// NOTE (not verified): accepting the trust prompt writes a persistent decision into
 // ~/.claude.json for the directory it runs in. That is a real state change and
 // was taken deliberately.
+//
+// The run keeps its argument. Git Bash rewrites an argument that starts with a
+// slash into a Windows path, so Claude was handed "C:/Program Files/Git/stats"
+// as a prompt in place of the command /stats. statsPtyEnv (pty-env.js) exempts
+// that one argument, for this run only. Measured 2026-10-06 with Git Bash:
+// /stats arrives unchanged and /c/Users is still converted. NOT measured:
+// whether Stats > Activity then finishes inside the 10 second limit.
 let statsRefreshInFlight = null;
 ipcMain.handle('refresh-stats', async () => {
   if (statsRefreshInFlight) return statsRefreshInFlight;
@@ -1487,12 +1494,7 @@ ipcMain.handle('refresh-stats', async () => {
         args: shellArgs(profile.path, 'claude "/stats"', profile.args || []),
         options: {
           name: 'xterm-256color', cols: 120, rows: 40, cwd: os.homedir(),
-          env: {
-            ...cleanPtyEnv,
-            TERM: 'xterm-256color', COLORTERM: 'truecolor',
-            TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6',
-            FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
-          },
+          env: statsPtyEnv(cleanPtyEnv),
         },
       });
     });
@@ -2308,7 +2310,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         cwd: isWsl ? os.homedir() : projectPath,
         env: {
           ...cleanPtyEnv,
-          TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
+          ...TERMINAL_IDENTITY_ENV,
           CLAUDECODE: '1',
           // ZDOTDIR trick won't work reliably; instead inject via ENV (sh/bash) or precmd
           ENV: claudeShim,
@@ -2357,8 +2359,7 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
 
       const ptyEnv = {
         ...cleanPtyEnv,
-        TERM: 'xterm-256color', COLORTERM: 'truecolor',
-        TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.6.6', FORCE_COLOR: '3', ITERM_SESSION_ID: '1',
+        ...TERMINAL_IDENTITY_ENV,
         // Empty unless this is a project session with extra directories;
         // then it is what makes each added directory's CLAUDE.md load.
         ...projectEnv,
@@ -2372,9 +2373,6 @@ ipcMain.handle('open-terminal', async (event, sessionId, projectPath, isNew, ses
         cols: 120,
         rows: 30,
         cwd: isWsl ? os.homedir() : projectPath,
-        // TERM_PROGRAM=iTerm.app: Claude Code checks this to decide whether to emit
-        // OSC 9 notifications (e.g. "needs your attention"). Without it, the packaged
-        // app's minimal Electron environment won't trigger those sequences.
         env: ptyEnv,
       });
 

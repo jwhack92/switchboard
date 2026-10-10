@@ -383,3 +383,27 @@ test('stats refresh wiring (pin): one run at a time; the home folder; the comman
     assert.equal(noUsage.seen.warns.length, 0);
   });
 });
+
+test('stats-refresh: the refresh-stats handler uses statsPtyEnv (wiring only)', async () => {
+  // What the VALUE is, test/pty-env.test.js proves. This proves main.js uses it.
+  const block = sourceCut.cut('main.js', '// --- IPC: refresh-stats', '// --- IPC: get-usage');
+  assert.ok(block.includes('env: statsPtyEnv(cleanPtyEnv),'), 'the handler asks pty-env.js for its environment');
+  assert.equal(block.includes('...cleanPtyEnv'), false, 'and builds no environment of its own');
+  assert.ok(block.includes('// NOTE (not verified): accepting the trust prompt writes a persistent decision into'), 'the trust note says it was not verified');
+
+  // Through the block itself: the hidden command gets the base, the six values and the one exemption.
+  const { refresh, seen } = bootRefreshStats({ base: { PATH: 'C:\\fake\\bin' } });
+  const pending = refresh();
+  const { env } = seen.runs[0].opts.options;
+  assert.deepEqual({ ...env }, { PATH: 'C:\\fake\\bin', ...SIX_TERMINAL_VALUES, MSYS2_ARG_CONV_EXCL: '/stats' });
+  assert.equal('MSYS_NO_PATHCONV' in env, false);
+  seen.runs[0].finish({ error: null });
+  await pending;
+
+  // A base that already exempts something keeps it.
+  const kept = bootRefreshStats({ base: { MSYS2_ARG_CONV_EXCL: '/foo' } });
+  const keptPending = kept.refresh();
+  assert.equal(kept.seen.runs[0].opts.options.env.MSYS2_ARG_CONV_EXCL, '/foo;/stats');
+  kept.seen.runs[0].finish({ error: null });
+  await keptPending;
+});

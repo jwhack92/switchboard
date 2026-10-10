@@ -1,4 +1,5 @@
 // Environment for PTY children.
+// main.js loads this file after its reloader line: a change here needs an app restart.
 //
 // Three jobs:
 //
@@ -97,4 +98,38 @@ function buildPtyEnv(sourceEnv, platform = process.platform) {
   return env;
 }
 
-module.exports = { buildPtyEnv, CLAUDE_SESSION_VARS };
+// The values every terminal child is given so that programs draw as in a real
+// terminal. Spread AFTER the base at each site, so they win over what the base
+// holds.
+//
+// TERM_PROGRAM=iTerm.app: Claude Code checks this to decide whether to emit
+// OSC 9 notifications (e.g. "needs your attention"). Without it, the packaged
+// app's minimal Electron environment won't trigger those sequences.
+const TERMINAL_IDENTITY_ENV = Object.freeze({
+  TERM: 'xterm-256color',
+  COLORTERM: 'truecolor',
+  TERM_PROGRAM: 'iTerm.app',
+  TERM_PROGRAM_VERSION: '3.6.6',
+  FORCE_COLOR: '3',
+  ITERM_SESSION_ID: '1',
+});
+
+// Environment of the hidden `claude "/stats"` run (main.js, refresh-stats).
+//
+// Git Bash rewrites an argument that starts with a slash into a Windows path,
+// so Claude was handed "C:/Program Files/Git/stats" as a prompt in place of
+// the command /stats. MSYS2_ARG_CONV_EXCL exempts arguments that START with
+// the listed prefixes: this adds /stats and nothing else. Not MSYS_NO_PATHCONV:
+// this environment is inherited by the login shell's profile scripts, by
+// Claude and by every hook it starts, and the wide switch would stop path
+// conversion for all of them. A shell that is not MSYS ignores the variable.
+function statsPtyEnv(baseEnv) {
+  const held = baseEnv.MSYS2_ARG_CONV_EXCL;
+  return {
+    ...baseEnv,
+    ...TERMINAL_IDENTITY_ENV,
+    MSYS2_ARG_CONV_EXCL: typeof held === 'string' && held !== '' ? held + ';/stats' : '/stats',
+  };
+}
+
+module.exports = { buildPtyEnv, CLAUDE_SESSION_VARS, TERMINAL_IDENTITY_ENV, statsPtyEnv };

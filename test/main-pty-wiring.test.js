@@ -1288,6 +1288,7 @@ function spawnFakes() {
     PROJECTS_DIR: 'C:\\nowhere\\projects',
     MAX_BUFFER_SIZE: 256 * 1024,
     cleanPtyEnv: {},
+    TERMINAL_IDENTITY_ENV: require('../pty-env').TERMINAL_IDENTITY_ENV,
     getMeta: () => null,
     getCachedSession: () => ({}),
     projects: {},
