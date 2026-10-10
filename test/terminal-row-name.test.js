@@ -248,3 +248,83 @@ test('terminal-row-name (pin): a live plain terminal\'s row has every field as t
     }
   });
 });
+
+// --- The small fix "a plain terminal keeps its name and its pin" (entry D1) ---
+//
+// The pin above never reads the VALUE of name or starred. These do.
+
+test('terminal-row-name: a renamed live plain terminal is listed with its saved name', (t) => {
+  boot(t, {
+    active: [['t-1', terminal(P_ONLY)]],
+    meta: [['t-1', { name: 'My build shell' }]],
+  });
+  for (const showArchived of [false, true]) {
+    const row = rowsOf(sessionCache.buildProjectsFromCache(showArchived), 't-1')[0];
+    assertTerminalRow(row, { sessionId: 't-1', projectPath: P_ONLY }, `showArchived ${showArchived}`);
+    assert.equal(row.name, 'My build shell', `showArchived ${showArchived}: the saved name`);
+    assert.equal(row.starred, 0, `showArchived ${showArchived}: not pinned`);
+  }
+});
+
+test('terminal-row-name: a pinned live plain terminal is listed with starred 1', (t) => {
+  boot(t, {
+    active: [['t-1', terminal(P_ONLY)]],
+    meta: [['t-1', { starred: 1 }]],
+  });
+  for (const showArchived of [false, true]) {
+    const row = rowsOf(sessionCache.buildProjectsFromCache(showArchived), 't-1')[0];
+    assertTerminalRow(row, { sessionId: 't-1', projectPath: P_ONLY }, `showArchived ${showArchived}`);
+    assert.equal(row.starred, 1, `showArchived ${showArchived}: the saved pin`);
+    assert.equal(row.name, null, `showArchived ${showArchived}: no name was saved`);
+  }
+});
+
+test('terminal-row-name: a plain terminal with no saved row has name null and starred 0', (t) => {
+  // A saved row under ANOTHER id is there, so "no saved row" is not "no saved rows at all".
+  boot(t, {
+    active: [['t-1', terminal(P_ONLY)]],
+    meta: [['someone-else', { name: 'Not mine', starred: 1 }]],
+  });
+  const row = rowsOf(sessionCache.buildProjectsFromCache(false), 't-1')[0];
+  assertTerminalRow(row, { sessionId: 't-1', projectPath: P_ONLY }, 'no saved row');
+  assert.equal(row.name, null);
+  assert.equal(row.starred, 0);
+});
+
+test('terminal-row-name: an empty saved name, or a saved row that holds only an archived mark, gives name null and starred 0', (t) => {
+  for (const saved of [{ name: '', starred: 0 }, { name: null, starred: null }, { archived: 1 }]) {
+    boot(t, { active: [['t-1', terminal(P_ONLY)]], meta: [['t-1', saved]] });
+    const row = rowsOf(sessionCache.buildProjectsFromCache(false), 't-1')[0];
+    assertTerminalRow(row, { sessionId: 't-1', projectPath: P_ONLY }, JSON.stringify(saved));
+    assert.equal(row.name, null, JSON.stringify(saved));
+    assert.equal(row.starred, 0, JSON.stringify(saved));
+  }
+});
+
+test('terminal-row-name: a saved name, pin and archived mark together: the name and the pin are read, archived stays 0 and the row stays listed', (t) => {
+  boot(t, {
+    active: [['t-1', terminal(P_ONLY)]],
+    meta: [['t-1', { name: 'Deploy shell', starred: 1, archived: 1 }]],
+  });
+  const projects = sessionCache.buildProjectsFromCache(false); // archived sessions are NOT shown
+  assert.equal(rowsOf(projects, 't-1').length, 1, 'still listed');
+  const row = rowsOf(projects, 't-1')[0];
+  assertTerminalRow(row, { sessionId: 't-1', projectPath: P_ONLY }, 'named, pinned and marked archived'); // holds archived 0
+  assert.equal(row.name, 'Deploy shell');
+  assert.equal(row.starred, 1);
+});
+
+test('terminal-row-name: two plain terminals in one folder, one with saved marks: each row has its own, and the other is untouched', (t) => {
+  boot(t, {
+    dirs: [{ folder: 'f-busy', projectPath: P_BUSY }],
+    active: [['t-named', terminal(P_BUSY)], ['t-plain', terminal(P_BUSY)]],
+    meta: [['t-named', { name: 'Logs', starred: 1 }]],
+  });
+  const projects = sessionCache.buildProjectsFromCache(false);
+  const named = rowsOf(projects, 't-named')[0];
+  const plain = rowsOf(projects, 't-plain')[0];
+  assertTerminalRow(named, { sessionId: 't-named', projectPath: P_BUSY }, 't-named');
+  assertTerminalRow(plain, { sessionId: 't-plain', projectPath: P_BUSY }, 't-plain');
+  assert.deepEqual([named.name, named.starred], ['Logs', 1]);
+  assert.deepEqual([plain.name, plain.starred], [null, 0]);
+});

@@ -10,6 +10,7 @@ const { encodeProjectPath } = require('./encode-project-path');
 /**
  * Session cache module.
  * Call init(ctx) once with the shared context object.
+ * main.js loads this file after its reloader line: a change here needs an app restart.
  */
 let PROJECTS_DIR, activeSessions, broadcast, log;
 let deleteCachedFolder, getCachedByFolder, getCachedSession, upsertCachedSessions, deleteCachedSession;
@@ -292,9 +293,10 @@ function buildProjectsFromCache(showArchived) {
     }
     const proj = projectMap.get(session.projectPath);
     if (!proj.sessions.some(s => s.sessionId === sessionId)) {
+      const meta = metaMap.get(sessionId);
       proj.sessions.push({
         sessionId, summary: 'Terminal', firstPrompt: '', projectPath: session.projectPath,
-        name: null, starred: 0, archived: 0, messageCount: 0,
+        name: meta?.name || null, starred: meta?.starred || 0, archived: 0, messageCount: 0,
         modified: new Date(session._openedAt).toISOString(),
         created: new Date(session._openedAt).toISOString(),
         type: 'terminal',
