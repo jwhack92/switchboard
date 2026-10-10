@@ -29,6 +29,20 @@
   const blank = (row) => row.trim() === '';
   const isQuestion = (row) => PROMPT_MARKS.QUESTION.some((mark) => mark.test(row));
 
+  function panelAbove(rows, P) {
+    for (let y = P - 2; y >= Math.max(0, P - 16); y--) {
+      const row = rows[y];
+      if (PROMPT_MARKS.FULL_RULE.test(row)) {
+        for (let z = y + 1; z < P - 1; z++) {
+          if (!blank(rows[z])) return y;
+        }
+        return -1;
+      }
+      if (!blank(row) && row[0] !== ' ') return -1;
+    }
+    return -1;
+  }
+
   function promptScreen(read) {
     try {
       if (!read || typeof read !== 'object' || !Array.isArray(read.rows) || read.rows.length < 3) {
@@ -54,17 +68,7 @@
       }
 
       const P = boxes[0];
-      let panelTop = -1;
-      for (let y = P - 2; y >= Math.max(0, P - 16); y--) {
-        const row = rows[y];
-        if (PROMPT_MARKS.FULL_RULE.test(row)) {
-          for (let z = y + 1; z < P - 1; z++) {
-            if (!blank(rows[z])) { panelTop = y; break; }
-          }
-          break;
-        }
-        if (!blank(row) && row[0] !== ' ') break;
-      }
+      const panelTop = panelAbove(rows, P);
 
       const cursorY = read.cursorY;
       const cursorKnown = typeof cursorY === 'number';
@@ -90,7 +94,32 @@
     }
   }
 
-  const api = { PROMPT_MARKS, promptScreen };
+  function echoSeen(read, text) {
+    try {
+      if (!read || typeof read !== 'object' || !Array.isArray(read.rows) || typeof text !== 'string') return false;
+      const rows = read.rows;
+      const cursorY = read.cursorY;
+      if (!Number.isInteger(cursorY) || cursorY < 0 || cursorY >= rows.length) return false;
+      const typed = text.replace(/\s/g, '');
+      if (typed === '') return false;
+
+      let top = -1;
+      for (let y = cursorY; y >= Math.max(1, cursorY - 3); y--) {
+        if (rows[y].startsWith(PROMPT_MARKS.POINTER) && PROMPT_MARKS.RULE.test(rows[y - 1])) { top = y; break; }
+      }
+      if (top < 0) return false;
+
+      const box = rows.slice(top, cursorY + 1).join('').slice(PROMPT_MARKS.POINTER.length).replace(/\s/g, '');
+      if (!box.startsWith(typed)) return false;
+      if (panelAbove(rows, top) >= 0) return false;
+      if (box.slice(typed.length).startsWith(typed)) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const api = { PROMPT_MARKS, promptScreen, echoSeen };
 
   // Expose globally. Guarded, and mirrored onto module.exports, so this file
   // can be required under Node, where `window` does not exist.

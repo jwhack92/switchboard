@@ -89,6 +89,10 @@ const STALE_AFTER_MS = 2500;
 const HANDOFF_NOT_LANDED = 'The session has not picked up the request yet. It may be queued behind the current turn; if the line is sitting in the input box, press Enter there.';
 const HANDOFF_NOT_WRITTEN = 'No handoff was written after 10 minutes.';
 const HANDOFF_SESSION_ENDED = 'The session ended before the handoff was written.';
+const HANDOFF_NOT_SENT = 'Typed but not sent. Look at the session\'s input box.';
+// T1's switch. false = Enter 250 ms after the text, always, and the box shows
+// T1's line.
+const ENTER_HOLD = true;
 // The hook drops an unwritten request 30 minutes after it was made
 // (MANUAL_EXPIRY), but only when an event comes along: an idle session never
 // says so, and the reader contract asks the reader to time it out itself.
@@ -317,7 +321,7 @@ function typingGate(input) {
   // The turn marker fails open on the prompt side (a failed userprompt write
   // leaves the old Stop in place), so a Stop only counts when it is later than
   // the last line this file typed. atMs survives the request going back to idle.
-  const sentAtMs = typeof request.atMs === 'number' && request.atMs > 0 ? request.atMs : null;
+  const sentAtMs = request.unsent !== true && typeof request.atMs === 'number' && request.atMs > 0 ? request.atMs : null;
   const stopAfterSent = sentAtMs === null || (lastStopMs !== null && lastStopMs > sentAtMs);
   const ended = turnEnded(state) && !busyAfterStop && stopAfterSent;
   const screenState = o.screen && typeof o.screen === 'object'
@@ -506,7 +510,9 @@ function buttonModel(input) {
   }
   // The later of the things that went wrong is the one on screen.
   const notes = [];
-  if (request.phase === 'timeout' && request.reason != null) {
+  if (request.phase === 'timeout' && request.unsent === true) {
+    notes.push({ text: HANDOFF_NOT_SENT, atMs: request.atMs, open: false });
+  } else if (request.phase === 'timeout' && request.reason != null) {
     notes.push({ text: request.reason, atMs: typeof request.atMs === 'number' ? request.atMs : 0, open: true });
   }
   if (typeof o.continueError === 'string' && o.continueError) {
@@ -770,6 +776,7 @@ function nextRequest(input) {
 
   const tie = requestTie(request, state);
   if (tie.forThisRequest && state.pending === false) return idle;
+  if (request.unsent === true) return tie.acknowledged ? { phase: 'requested', atMs, reason: '' } : request;
   if (request.reason === HANDOFF_SESSION_ENDED) return o.running === true ? idle : request;
   if (request.reason === HANDOFF_NOT_LANDED) {
     if (outcome === 'waiting') return { phase: 'requested', atMs, reason: '' };
@@ -791,7 +798,7 @@ function parseStoredRequest(text, nowMs) {
   if (typeof value.atMs !== 'number' || !isFinite(value.atMs) || value.atMs <= 0) return null;
   if (typeof nowMs === 'number' && value.atMs > nowMs + 1000) return null;
   const reason = value.phase === 'timeout' && typeof value.reason === 'string' ? value.reason.slice(0, 300) : '';
-  return { phase: value.phase, atMs: value.atMs, reason };
+  return { phase: value.phase, atMs: value.atMs, reason, ...(value.phase === 'timeout' && value.unsent === true ? { unsent: true } : {}) };
 }
 
 // A confirmed ultracode switch as this file left it in sessionStorage, or null
@@ -859,6 +866,9 @@ const HANDOFF_TYPED_PREFIX = 'handoff-typed:';
 // When the terminal's screen is looked at after the switch text was typed. The
 // last look is the one that gives up.
 const HANDOFF_ULTRACODE_LOOK_MS = [1000, 2500, 5000];
+// When the screen is looked at for the typed line, counted from the text. The
+// last look is the one that gives up.
+const HANDOFF_ENTER_LOOK_MS = [250, 400, 600, 900, 1300];
 // Every this many ticks, entries nobody needs any more are dropped.
 const HANDOFF_PRUNE_EVERY_TICKS = 60;
 
@@ -924,7 +934,7 @@ function handoffStoreRequest(entry) {
     const key = HANDOFF_STORE_PREFIX + entry.id;
     const request = entry.request;
     if (request.phase === 'idle' && !(request.atMs > 0)) store.removeItem(key);
-    else store.setItem(key, JSON.stringify({ phase: request.phase, atMs: request.atMs, reason: request.reason || '' }));
+    else store.setItem(key, JSON.stringify({ phase: request.phase, atMs: request.atMs, reason: request.reason || '', ...(request.unsent === true ? { unsent: true } : {}) }));
   } catch {}
 }
 
@@ -1688,18 +1698,57 @@ function handoffDelay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function handoffTypeLine(entry, text, opts) {
+  const { onSent, onUnsent, blindOk } = opts || {};
+  window.api.sendInput(entry.id, text);
+  let done = false;
+  const enter = () => {
+    done = true;
+    try {
+      window.api.sendInput(entry.id, '\r');
+    } finally {
+      if (typeof onSent === 'function') onSent();
+    }
+  };
+  if (!ENTER_HOLD || blindOk === true) {
+    setTimeout(handoffGuard('sending Enter failed', enter), 250);
+    return;
+  }
+  const lastLook = HANDOFF_ENTER_LOOK_MS[HANDOFF_ENTER_LOOK_MS.length - 1];
+  for (const delay of HANDOFF_ENTER_LOOK_MS) {
+    setTimeout(handoffGuard('sending Enter failed', () => {
+      if (done) return;
+      const read = handoffScreenRead(entry.id);
+      const screen = typeof window.PromptScreen !== 'undefined' ? window.PromptScreen : null;
+      const seen = !!read && !!screen && typeof screen.echoSeen === 'function' && screen.echoSeen(read, text) === true;
+      if (seen) {
+        enter();
+      } else if (delay === lastLook) {
+        done = true;
+        if (typeof onUnsent === 'function') onUnsent();
+      }
+    }), delay);
+  }
+}
+
 // Types the request into the session. The Enter goes as a SEPARATE write a
 // moment later: in the same write the CLI takes the carriage return as part of
 // a paste and leaves the line sitting in the input box.
-function handoffSendRequest(id) {
+function handoffSendRequest(id, opts = {}) {
   if (typeof window.api.sendInput !== 'function') return;
   const entry = handoffEntry(id);
-  window.api.sendInput(id, REQUEST_LINE);
-  setTimeout(handoffGuard('sending Enter failed', () => {
-    // entry.id, not id: it follows the session through a fork.
-    window.api.sendInput(entry.id, '\r');
-  }), 250);
-  handoffSetRequest(entry, { phase: 'requested', atMs: Date.now(), reason: '' });
+  let atMs = 0;
+  handoffTypeLine(entry, REQUEST_LINE, {
+    blindOk: opts.blindOk,
+    onUnsent: () => {
+      const now = entry.request;
+      if (!now || now.phase !== 'requested' || now.atMs !== atMs) return;
+      handoffSetRequest(entry, { phase: 'timeout', atMs, reason: '', unsent: true });
+      handoffPaint(entry.id);
+    },
+  });
+  atMs = Date.now();
+  handoffSetRequest(entry, { phase: 'requested', atMs, reason: '' });
   handoffRenderHeader();
 }
 
@@ -1874,7 +1923,7 @@ function handoffTypingControl(id, which) {
 // included.
 async function handoffConfirmTyping(gate, line) {
   try {
-    const text = gateText(gate, 'box', { line, hold: false });
+    const text = gateText(gate, 'box', { line, hold: ENTER_HOLD });
     return typeof confirmDialog === 'function'
       && (await confirmDialog(text, { confirm: 'Type it anyway' })) === true;
   } catch { return false; }
@@ -1901,6 +1950,8 @@ async function handoffTypeRequest(id, which) {
   const entry = handoffEntry(id);
   let control = handoffTypingControl(entry.id, which);
   if (!control || !control.enabled) return;
+  const unreadable = handoffScreenRead(entry.id) === null;
+  let blindOk = false;
   if (control.override) {
     if (!await handoffConfirmTyping(control.gate, REQUEST_LINE)) return;
     // The question was open for as long as the user took: the session may have
@@ -1921,9 +1972,10 @@ async function handoffTypeRequest(id, which) {
       handoffSetClickNote(entry, note);
       return;
     }
+    blindOk = unreadable;
   }
   handoffSetClickNote(entry, '');
-  handoffSendRequest(entry.id);
+  handoffSendRequest(entry.id, { blindOk });
 }
 
 function handoffOnPrimaryClick() {
@@ -2008,8 +2060,7 @@ function handoffUltracodeLook(entry, pending, before, last) {
     entry.ultraConfirmed = { value: pending.target === 'on', atMs: Date.now() };
     handoffStoreUltracode(entry);
   } else {
-    entry.ultraNote = result.outcome === 'refused' ? result.reason : ULTRACODE_NOT_CONFIRMED;
-    entry.ultraNoteAtMs = Date.now();
+    handoffSetClickNote(entry, result.outcome === 'refused' ? result.reason : ULTRACODE_NOT_CONFIRMED);
     // Nothing came back: the text may be sitting in the input box unsent (an
     // Enter that only closed the command menu). That is a draft like any
     // other, so the next click asks first, until an Enter is typed there by
@@ -2021,24 +2072,30 @@ function handoffUltracodeLook(entry, pending, before, last) {
 
 // Types the switch the way handoffSendRequest types its line: the text, then
 // Enter as a separate write. The screen is counted BEFORE the text goes in.
-function handoffSendUltracode(id, target) {
+function handoffSendUltracode(id, target, opts = {}) {
   if (typeof window.api.sendInput !== 'function') return;
   const entry = handoffEntry(id);
   const before = ultracodeScreen(handoffScreenRows(id));
   const pending = { target, atMs: Date.now() };
   entry.ultraSwitch = pending;
-  entry.ultraNote = '';
-  window.api.sendInput(id, ULTRACODE_TEXT[target]);
-  setTimeout(handoffGuard('sending Enter failed', () => {
-    // entry.id, not id: it follows the session through a fork.
-    window.api.sendInput(entry.id, '\r');
-  }), 250);
+  handoffSetClickNote(entry, '');
   const lastLook = HANDOFF_ULTRACODE_LOOK_MS[HANDOFF_ULTRACODE_LOOK_MS.length - 1];
-  for (const delay of HANDOFF_ULTRACODE_LOOK_MS) {
-    setTimeout(handoffGuard('ultracode look failed', () => {
-      handoffUltracodeLook(entry, pending, before, delay === lastLook);
-    }), delay);
-  }
+  handoffTypeLine(entry, ULTRACODE_TEXT[target], {
+    blindOk: opts.blindOk,
+    onSent: () => {
+      for (const delay of HANDOFF_ULTRACODE_LOOK_MS) {
+        setTimeout(handoffGuard('ultracode look failed', () => {
+          handoffUltracodeLook(entry, pending, before, delay === lastLook);
+        }), delay);
+      }
+    },
+    onUnsent: () => {
+      if (entry.ultraSwitch !== pending) return;
+      entry.ultraSwitch = null;
+      handoffSetClickNote(entry, HANDOFF_NOT_SENT);
+      handoffPaint(entry.id);
+    },
+  });
   handoffRenderHeader();
 }
 
@@ -2048,6 +2105,8 @@ async function handoffToggleUltracode(id) {
   if (!control || !control.enabled) return;
   // The direction is the click's: what the button said when it was pressed.
   const target = control.target;
+  const unreadable = handoffScreenRead(entry.id) === null;
+  let blindOk = false;
   if (control.override) {
     if (!await handoffConfirmTyping(control.gate, ULTRACODE_TEXT[target])) return;
     // As in handoffTypeRequest: the question was open for as long as the user
@@ -2064,8 +2123,9 @@ async function handoffToggleUltracode(id) {
       handoffSetClickNote(entry, note);
       return;
     }
+    blindOk = unreadable;
   }
-  handoffSendUltracode(entry.id, target);
+  handoffSendUltracode(entry.id, target, { blindOk });
 }
 
 function handoffOnUltracodeClick() {
@@ -2218,6 +2278,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     REQUEST_LINE, WARN_AT, DUE_AT, OVERRIDE_TITLE, OVERRIDE_TITLE_UNSEEN,
     HANDOFF_NOT_LANDED, HANDOFF_NOT_WRITTEN, HANDOFF_SESSION_ENDED,
+    HANDOFF_NOT_SENT, ENTER_HOLD,
     REQUEST_EXPIRY_MS, POLL_EVERY_TICKS,
     fmtTokens, chipLevel, deriveCtxDir, meterModel, meterWidth, turnEnded, handoffInfo,
     canContinue, chipState, buttonModel, continuePrompt, requestOutcome, nextRequest,

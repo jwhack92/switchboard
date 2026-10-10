@@ -1974,6 +1974,7 @@ const titleOf = (h, id) => h.byId[id].getAttribute('title');
 // (fakeTerminal, further down), as app.js's window._openSessions gives it. Its
 // screen is knobs.rows, which starts as emptyPromptScreen() with the cursor in
 // the input box, and what the page types into the session shows up there.
+let sourceOverride = null;   // the text boot runs in place of SOURCE (withHold)
 function boot(opts = {}) {
   let now = opts.startMs || 2000000000;
   const files = new Map();
@@ -2091,7 +2092,7 @@ function boot(opts = {}) {
   if (opts.localStorage) context.window.localStorage = opts.localStorage;
   if (opts.names) run(NAMES_SOURCE);
   if (PROMPT_SCREEN_SOURCE !== null && opts.promptScreen !== false) run(PROMPT_SCREEN_SOURCE);
-  run(SOURCE);
+  run(sourceOverride || SOURCE);
   const globals = opts.globals || 'app';
   if (globals === 'app') {
     run(`
@@ -3719,6 +3720,7 @@ function fakeTerminal(knobs) {
       },
     },
     fakeTyped(data) {
+      if (knobs.echo === false) return;
       const row = knobs.rows[knobs.cursorY];
       if (typeof row !== 'string' || !row.startsWith(PROMPT_POINTER)) return;
       knobs.rows[knobs.cursorY] = data === '\r' ? PROMPT_BOX_EMPTY : row + data;
@@ -3829,8 +3831,8 @@ test('browser: a plain click types the text, then Enter separately, and shows th
   assert.equal(h.sent.length, 2);
 
   h.knobs.rows = promptScreenWith(['> /effort ultracode', '  ' + ON_LINE]);
-  await h.advance(749);
-  assert.equal(ultraHeader(h).look, 'off', 'the first look is a second after the text');
+  await h.advance(999);
+  assert.equal(ultraHeader(h).look, 'off', 'the first look is a second after the Enter');
   await h.advance(1);
   assert.deepEqual(ultraHeader(h), {
     shown: true, label: 'Ultracode', enabled: true, asksFirst: false, look: 'on',
@@ -3850,6 +3852,7 @@ test('browser: switching off types the off text and is confirmed by the off line
   const h = await bootUltra(true);
   await clickUltra(h);
   assert.deepEqual(h.sent, [[SID, '/effort ultracode off']]);
+  await h.advance(250);   // the Enter (B7): the looks count from it
   h.knobs.rows = promptScreenWith(['> /effort ultracode off', '  ' + OFF_LINE]);
   // Seen at the second look, not the first: the line came late.
   await h.advance(1000);
@@ -3861,6 +3864,7 @@ test('browser: switching off types the off text and is confirmed by the off line
 test('browser: a line that arrives late is still seen, up to the last look', async () => {
   const h = await bootUltra(false);
   await clickUltra(h);
+  await h.advance(250);   // the Enter (B7): the looks count from it
   await h.advance(2600);
   assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
   h.knobs.rows = [OLD_ON_LINE];
@@ -3874,6 +3878,7 @@ test('browser: no confirmation after 5 s goes back to the look it had, with a no
   // The line of an earlier switch is on screen already: it settles nothing.
   h.knobs.rows = promptScreenWith(['  ' + ON_LINE, '> something else']);
   await clickUltra(h);
+  await h.advance(250);   // the Enter (B7): the looks count from it
   await h.advance(4999);
   assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
   assert.equal(h.header().note, null);
@@ -3896,7 +3901,7 @@ test('browser: no confirmation after 5 s goes back to the look it had, with a no
 test('browser: after "No confirmation seen" the next click asks first, until an Enter is typed there by hand', async () => {
   const h = await bootUltra(false);
   await clickUltra(h);
-  await h.advance(5000);
+  await h.advance(5250);
   assert.equal(h.sent.length, 2);
   h.knobs.confirmAnswer = false;
   await clickUltra(h);
@@ -3912,6 +3917,7 @@ test('browser: after "No confirmation seen" the next click asks first, until an 
   // A refusal is the program answering, so the text did go in: no draft.
   const refused = await bootUltra(false);
   await clickUltra(refused);
+  await refused.advance(250);   // the Enter (B7): the looks count from it
   refused.knobs.rows = promptScreenWith(['Ultracode isn\'t available on haiku']);
   await refused.advance(5000);
   assert.equal(refused.header().note, ULTRACODE_NO_MODEL);
@@ -3929,7 +3935,7 @@ test('browser: a screen that cannot be read is never a confirmation', async () =
   // because nobody counted before the text was typed.
   h.run(`window._openSessions = new Map([['${SID}', { terminal: __knobs.terminal }]])`);
   h.knobs.rows = [ON_LINE];
-  await h.advance(5000);
+  await h.advance(5250);
   assert.equal(ultraHeader(h).look, 'off');
   assert.equal(h.header().note, ULTRACODE_NOT_CONFIRMED);
 });
@@ -3948,7 +3954,7 @@ test('browser: a screen read as no rows, or one whose buffer throws, is not a co
     // Readable again, with the line on it. Zero before would make this "more".
     h.run(`window._openSessions = new Map([['${SID}', { terminal: __knobs.terminal }]])`);
     h.knobs.rows = ['> /effort ultracode', ON_LINE];
-    await h.advance(5000);
+    await h.advance(5250);
     assert.equal(ultraHeader(h).look, 'off', name);
     assert.equal(h.header().note, ULTRACODE_NOT_CONFIRMED, name);
     assert.equal(h.storage.has(ULTRA_KEY), false, name);
@@ -3961,6 +3967,7 @@ test('browser: with the view scrolled up, the line printed below it still confir
   h.knobs.scrollback = ['earlier output 1', 'earlier output 2', 'earlier output 3'];
   h.knobs.viewTop = 0;   // reading earlier output; the live screen is below
   await clickUltra(h);
+  await h.advance(250);   // the Enter (B7): the looks count from it
   h.knobs.rows = ['> /effort ultracode', '  ' + ON_LINE];
   await h.advance(1000);
   assert.equal(ultraHeader(h).look, 'on');
@@ -3975,6 +3982,7 @@ test('browser: a line of an earlier switch that scrolls into view is not this sw
   h.knobs.viewTop = 2;
   await clickUltra(h);
   // The program refuses, on the live screen; and the view moves to the old line.
+  await h.advance(250);   // the Enter (B7): the looks count from it
   h.knobs.rows = ['> /effort ultracode', 'Ultracode needs dynamic workflows enabled (see /config) first'];
   h.knobs.viewTop = 0;
   await h.advance(1000);
@@ -3989,7 +3997,7 @@ test('browser: a line of an earlier switch that scrolls into view is not this sw
   quiet.knobs.viewTop = 2;
   await clickUltra(quiet);
   quiet.knobs.viewTop = 0;
-  await quiet.advance(5000);
+  await quiet.advance(5250);
   assert.equal(ultraHeader(quiet).look, 'off');
   assert.equal(quiet.header().note, ULTRACODE_NOT_CONFIRMED);
   assert.equal(quiet.storage.has(ULTRA_KEY), false);
@@ -4003,6 +4011,7 @@ test('browser: a refusal is the note, and the button goes back', async () => {
   for (const [line, reason] of cases) {
     const h = await bootUltra(false);
     await clickUltra(h);
+    await h.advance(250);   // the Enter (B7): the looks count from it
     h.knobs.rows = ['> /effort ultracode', line];
     await h.advance(1000);
     assert.equal(ultraHeader(h).look, 'off', line);
@@ -4116,6 +4125,7 @@ test('browser: the draft is asked about even when the click comes before the hea
 test('browser: the hook\'s next report takes over from the confirmation', async () => {
   const h = await bootUltra(false);
   await clickUltra(h);
+  await h.advance(250);   // the Enter (B7): the looks count from it
   h.knobs.rows = [ON_LINE];
   await h.advance(1000);
   assert.equal(h.inputs().ultracodeValue, true);
@@ -4142,6 +4152,7 @@ test('browser: the confirmation survives a reload of the window, and follows the
   const storage = new Map();
   const first = await bootUltra(false, { storage });
   await clickUltra(first);
+  await first.advance(250);   // the Enter (B7): the looks count from it
   first.knobs.rows = [ON_LINE];
   await first.advance(1000);
   assert.equal(storage.has(ULTRA_KEY), true);
@@ -4227,6 +4238,7 @@ test('browser: the rows on screen get the bolt in the same pass as the chip, and
   // Switched on from the header: the row follows at the confirmation, with no
   // read of the hook's files in between.
   await clickUltra(h);
+  await h.advance(250);   // the Enter (B7): the looks count from it
   h.knobs.rows = [ON_LINE];
   await h.advance(1000);
   assert.equal(boltEl.innerHTML, '<svg data-bolt="11"></svg>');
@@ -4455,6 +4467,7 @@ test('browser: a fork between the text and its Enter sends the Enter to the sess
 test('browser: once a switch is settled the later looks leave it alone', async () => {
   const h = await bootUltra(false);
   await clickUltra(h);
+  await h.advance(250);   // the Enter (B7): the looks count from it
   h.knobs.rows = promptScreenWith(['> /effort ultracode', '  ' + ON_LINE]);
   await h.advance(1000);
   assert.equal(ultraHeader(h).look, 'on');
@@ -4470,14 +4483,14 @@ test('browser: once a switch is settled the later looks leave it alone', async (
 test('browser: the screen is counted before the text goes in, so a line that is there straight after it is new', async () => {
   const h = await bootUltra(false);
   h.knobs.onSend = (data) => {
-    if (data === ULTRACODE_TEXT.on) h.knobs.rows = ['> /effort ultracode', '  ' + ON_LINE];
+    if (data === ULTRACODE_TEXT.on) h.knobs.rows[12] = '  ' + ON_LINE;
   };
   h.run(`{
     const send = window.api.sendInput;
     window.api.sendInput = (id, data) => { __knobs.onSend(data); send(id, data); };
   }`);
   await clickUltra(h);
-  await h.advance(1000);
+  await h.advance(1250);
   assert.equal(ultraHeader(h).look, 'on');
 });
 
@@ -4495,7 +4508,7 @@ test('browser: Hand off types nothing while a switch is on its way in', async ()
   assert.equal(h.sent.length, 2);
   // Settled: Hand off types as it always did.
   h.knobs.rows = promptScreenWith(['  ' + ON_LINE]);
-  await h.advance(600);
+  await h.advance(750);
   assert.equal(ultraHeader(h).look, 'on');
   await h.click('primary');
   assert.deepEqual(h.sent[2], [SID, REQUEST_LINE]);
@@ -5204,7 +5217,7 @@ test('browser: with the recorded question on screen, Hand off, the update button
   assert.equal(ultraHeader(h).title, 'Ultracode is off. Click to switch it on.');
 });
 
-test('browser: Hand off asks first over text in the input box', async () => {
+test('browser: Hand off asks first over text in the input box', () => withHold(true, async () => {
   const h = await bootUltra(false);
   h.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + 'half a thought';
   await h.tick();
@@ -5217,11 +5230,11 @@ test('browser: Hand off asks first over text in the input box', async () => {
   h.knobs.confirmAnswer = false;   // Cancel
   await h.click('primary');
   await h.advance(1000);
-  // The one box. Its last line is T1's in this commit; task 08 changes it to "... is not sent".
+  // The one box. With the Enter hold its last line is B6's.
   assert.deepEqual(h.confirms, [
     "There is text in this session's input box.\n\n"
     + 'Type "Write the context handoff now. [ctx-handoff:request]" into this session anyway?\n\n'
-    + 'If your own text is there, it is sent together with this line.',
+    + 'If your own text is there, the line is typed after it and is not sent.',
   ]);
   assert.deepEqual(confirmOptions(h), [{ confirm: 'Type it anyway' }], 'a plain button: no danger flag');
   assert.deepEqual(h.sent, []);
@@ -5233,18 +5246,19 @@ test('browser: Hand off asks first over text in the input box', async () => {
   assert.deepEqual(h.sent, []);
   await h.advance(1);
   assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
-  await h.advance(250);
-  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+  await h.advance(1300);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]], 'typed after his own text, and not sent');
+  assert.equal(h.header().note, NOT_SENT);
 
   // Ultracode over the same text: the same box with its own line.
   const u = await bootUltra(false);
   u.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + 'half a thought';
   u.knobs.confirmAnswer = false;
   await clickUltra(u);   // no tick: the click decides afresh
-  assert.deepEqual(u.confirms, [boxText(TEXT_IN_BOX, '/effort ultracode', BOX_SENT_LINE)]);
+  assert.deepEqual(u.confirms, [boxText(TEXT_IN_BOX, '/effort ultracode', BOX_HELD_LINE)]);
   assert.deepEqual(confirmOptions(u), [{ confirm: 'Type it anyway' }]);
   assert.deepEqual(u.sent, []);
-});
+}));
 
 test('browser: a screen that cannot be read asks first, and still types after a yes', async () => {
   const B4 = "Switchboard cannot see an empty prompt on this session's screen. Click to type the request anyway (asks first).";
@@ -5271,7 +5285,7 @@ test('browser: a screen that cannot be read asks first, and still types after a 
   assert.equal(titleOf(working, PRIMARY_BTN), B4);
 });
 
-test('browser: without prompt-screen.js every click asks first', async () => {
+test('browser: without prompt-screen.js every click asks first', () => withHold(true, async () => {
   const h = await bootEnded({ promptScreen: false });
   assert.equal(h.inputs().screen.state, 'unknown');
   assert.equal(h.header().primaryOverride, true);
@@ -5279,9 +5293,9 @@ test('browser: without prompt-screen.js every click asks first', async () => {
   await h.click('primary');
   assert.equal(h.confirms.length, 1);
   await h.advance(750);
-  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]], 'the line is typed; without the screen check its Enter is held');
   assert.deepEqual(h.errors, []);
-});
+}));
 
 test('browser: a question that opens while the in-page box is up stops the typing', async () => {
   const NOTE = 'Not typed. Session is asking you something. Answer it in the terminal first.';
@@ -5388,7 +5402,7 @@ test('browser: the session gets a new id while the box is open: the yes still ty
 test('browser: of two live header notes the later one shows', async () => {
   const h = await bootUltraWritten();
   await clickUltra(h);
-  await h.advance(5000);
+  await h.advance(5250);
   assert.equal(h.header().note, ULTRACODE_NOT_CONFIRMED);
   // Ten seconds later a Continue comes to nothing: that is the later news.
   await h.advance(10000);
@@ -5415,7 +5429,7 @@ test('browser: Hand off and Update are dimmed while an Ultracode switch is on it
   assert.equal(h.header().note, null, 'a click on a dimmed button leaves no note');
   // Confirmed: Hand off is back.
   h.knobs.rows = promptScreenWith(['  ' + ON_LINE]);
-  await h.advance(600);
+  await h.advance(850);
   assert.equal(h.header().primaryEnabled, true);
   assert.equal(titleOf(h, PRIMARY_BTN), 'Ask this session to write its context handoff');
 
@@ -5424,7 +5438,7 @@ test('browser: Hand off and Update are dimmed while an Ultracode switch is on it
   assert.equal(w.byId[UPDATE_BTN].getAttribute('aria-disabled'), 'true');
   assert.equal(titleOf(w, UPDATE_BTN), 'Waiting for the session to confirm the Ultracode switch');
   // Given up after the last look: back as well.
-  await w.advance(5000);
+  await w.advance(5250);
   assert.equal(w.byId[UPDATE_BTN].getAttribute('aria-disabled'), 'false');
 });
 
@@ -5507,3 +5521,578 @@ test('browser: a screen check that throws reads as "not recognised": the click a
   assert.deepEqual(h.sent, []);
   assert.deepEqual(h.errors, [], 'the reader answers "unknown" itself; nothing reaches the console');
 });
+
+test('browser: a Hand off\'s Enter goes to the session that was clicked when another session is in view', async (t) => {
+  await t.test('another session is in view when the Enter is due', async () => {
+    const h = await bootEnded();
+    await h.click('primary');
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+    await h.advance(100);
+    h.run(`activeSessionId = '${NEW_SID}'`);
+    await h.advance(150);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+    await h.advance(2000);
+    assert.equal(h.sent.length, 2);
+  });
+
+  await t.test('the session in view has a terminal of its own, with an empty box', async () => {
+    const h = await bootEnded();
+    h.knobs.other = fakeTerminal({ rows: emptyPromptScreen(), scrollback: [], viewTop: null, cursorY: PROMPT_CURSOR_ROW });
+    h.run(`window._openSessions.set('${NEW_SID}', { terminal: __knobs.other })`);
+    await h.click('primary');
+    await h.advance(100);
+    h.run(`activeSessionId = '${NEW_SID}'`);
+    await h.advance(150);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+  });
+});
+
+// ── the Enter hold (ready state, commit 3) ─────────────────────────────────
+const NOT_SENT = 'Typed but not sent. Look at the session\'s input box.';            // B8
+const ENTER_HOLD_LINE = /^const ENTER_HOLD = (?:true|false);/m;
+const SOURCE_HOLD = {
+  on: SOURCE.replace(ENTER_HOLD_LINE, 'const ENTER_HOLD = true;'),
+  off: SOURCE.replace(ENTER_HOLD_LINE, 'const ENTER_HOLD = false;'),
+};
+// Runs fn with the page loaded with the hold on or off, whatever the file ships.
+async function withHold(on, fn) {
+  sourceOverride = on ? SOURCE_HOLD.on : SOURCE_HOLD.off;
+  try { return await fn(); } finally { sourceOverride = null; }
+}
+
+test('ctx-handoff: the Enter hold ships switched on, and its switch is one line', () => {
+  const mod = require(MODULE_PATH);
+  assert.equal(mod.ENTER_HOLD, true);
+  assert.equal(mod.HANDOFF_NOT_SENT, NOT_SENT);
+  assert.equal(SOURCE.split(/\r?\n/).filter(line => ENTER_HOLD_LINE.test(line)).length, 1);
+  assert.notEqual(SOURCE_HOLD.on, SOURCE_HOLD.off);
+});
+
+test('nextRequest: a typed-but-not-sent request goes back to "Writing…" only on the hook\'s acknowledgement', () => {
+  const atMs = 5000000;
+  const atS = atMs / 1000;
+  const unsent = { phase: 'timeout', atMs, reason: '', unsent: true };
+  const look = (state, afterMs) => nextRequest({ request: unsent, state, nowMs: atMs + afterMs, running: true });
+  assert.equal(look(null, 5000), unsent, 'nothing known: unchanged, the same object');
+  assert.equal(look(null, 25000), unsent, 'not "not picked up": the app knows it did not send it');
+  assert.equal(look({ crossed_at: atS - 60, manual: true, pending: true }, 5000), unsent, 'an acknowledgement of an older request');
+  assert.deepEqual(look({ crossed_at: atS + 2, manual: true, pending: true }, 30000), { phase: 'requested', atMs, reason: '' });
+  assert.deepEqual(look({ crossed_at: atS + 2, manual: false, pending: false, written_at: atS + 40 }, 50000), { phase: 'idle', atMs, reason: '' });
+  assert.deepEqual(look({ crossed_at: atS + 2, manual: false, pending: false, written_at: null }, 50000), { phase: 'idle', atMs, reason: '' });
+  assert.deepEqual(look(null, REQUEST_EXPIRY_MS + 1), { phase: 'idle', atMs, reason: '' });
+});
+
+test('parseStoredRequest: the unsent flag comes back only as true, and only on a timeout record', () => {
+  const at = AT_MS;
+  assert.deepEqual(parseStoredRequest(JSON.stringify({ phase: 'timeout', atMs: at, reason: '', unsent: true }), at + 5000),
+    { phase: 'timeout', atMs: at, reason: '', unsent: true });
+  const without = [
+    { phase: 'timeout', atMs: at, reason: '', unsent: 'yes' },
+    { phase: 'timeout', atMs: at, reason: '', unsent: false },
+    { phase: 'requested', atMs: at, reason: '', unsent: true },
+    { phase: 'idle', atMs: at, unsent: true },
+  ];
+  for (const stored of without) assert.equal('unsent' in parseStoredRequest(JSON.stringify(stored), at + 5000), false, JSON.stringify(stored));
+});
+
+test('typingGate: a line that was typed and not sent is not "the last line typed" for the Stop rule', () => {
+  const screen = { state: 'empty', why: '' };
+  const sent = { phase: 'timeout', atMs: STOP_MS + 5, reason: 'x' };
+  assert.equal(typingGate(buttonArgs({ screen, request: sent })).override, true, 'no Stop since a line that was sent');
+  assert.equal(typingGate(buttonArgs({ screen, request: { phase: 'timeout', atMs: STOP_MS + 5, reason: '', unsent: true } })).override, false);
+});
+
+test('browser: Enter is held until the typed text is seen (only with the Enter hold)', async (t) => {
+  await t.test('the text never shows: no Enter, the note for 60 seconds, Hand off again', () => withHold(true, async () => {
+    const h = await bootEnded();
+    h.knobs.echo = false;
+    const clickMs = h.now;
+    await h.click('primary');
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+    assert.equal(h.header().primary, `Writing${ELLIPSIS}`);
+    await h.advance(1299);
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.request().phase, 'requested');
+    assert.equal(h.header().note, null);
+    await h.advance(1);   // the last look, at 1300
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]], 'no Enter');
+    assert.deepEqual(h.request(), { phase: 'timeout', atMs: clickMs, reason: '', unsent: true });
+    assert.equal(h.header().primary, 'Hand off');
+    assert.equal(h.header().primaryEnabled, true);
+    assert.equal(h.header().primaryOverride, false, 'this fake box is empty, and the next click follows the screen');
+    assert.equal(h.header().note, NOT_SENT);
+    assert.equal(h.byId['handoff-note'].getAttribute('title'), NOT_SENT);
+    await h.advance(700);
+    assert.equal(h.sent.length, 1, 'no Enter 2 s after the click either');
+    // 25 s on with nothing from the hook: still "typed but not sent", not "not picked up".
+    await h.ticks(25);
+    assert.deepEqual(h.request(), { phase: 'timeout', atMs: clickMs, reason: '', unsent: true });
+    assert.equal(h.header().note, NOT_SENT);
+    await h.ticks(32);    // 59 s after the click
+    assert.equal(h.header().note, NOT_SENT);
+    await h.ticks(2);     // 61 s
+    assert.equal(h.header().note, null);
+    assert.equal(h.request().unsent, true, 'only the note ages out');
+    assert.deepEqual(h.errors, []);
+  }));
+
+  await t.test('a late acknowledgement turns it into "Writing…"', () => withHold(true, async () => {
+    const h = await bootEnded();
+    h.knobs.echo = false;
+    const clickMs = h.now;
+    await h.click('primary');
+    await h.advance(1300);
+    assert.equal(h.request().unsent, true);
+    // He pressed Enter there himself, and the hook saw the request.
+    h.setState(endedState(h, { manual: true, pending: true, crossed_at: clickMs / 1000 + 3 }));
+    await h.refresh();
+    assert.deepEqual(h.request(), { phase: 'requested', atMs: clickMs, reason: '' });
+    assert.equal(h.header().primary, `Writing${ELLIPSIS}`);
+    assert.equal(h.header().note, null);
+  }));
+
+  await t.test('the text shows at a later look: Enter once, at that look', () => withHold(true, async () => {
+    const h = await bootEnded();
+    h.knobs.echo = false;
+    const clickMs = h.now;
+    await h.click('primary');
+    await h.advance(450);   // the looks at 250 and 400 saw an empty box
+    assert.equal(h.sent.length, 1);
+    h.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + REQUEST_LINE;
+    await h.advance(149);
+    assert.equal(h.sent.length, 1, 'not between two looks');
+    await h.advance(1);     // the look at 600
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+    // The text stays on this fake screen: a look that was not called off would press Enter again.
+    await h.advance(2000);
+    assert.equal(h.sent.length, 2);
+    assert.deepEqual(h.request(), { phase: 'requested', atMs: clickMs, reason: '' });
+    assert.equal(h.header().note, null);
+  }));
+
+  await t.test('a wrapped input row counts as seen', () => withHold(true, async () => {
+    const h = await bootEnded();
+    h.knobs.echo = false;
+    await h.click('primary');
+    h.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + REQUEST_LINE.slice(0, 30);
+    h.knobs.rows[PROMPT_CURSOR_ROW + 1] = REQUEST_LINE.slice(30);
+    h.knobs.rows[PROMPT_CURSOR_ROW + 2] = PROMPT_RULE;
+    h.knobs.cursorY = PROMPT_CURSOR_ROW + 1;
+    await h.advance(250);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+  }));
+
+  await t.test('a slash-command menu under the box does not stand in for the box, and does not stop the Enter', () => withHold(true, async () => {
+    const h = await bootUltra(false);
+    await clickUltra(h);
+    h.knobs.rows[PROMPT_CURSOR_ROW + 2] = PROMPT_POINTER + ' /effort ultracode   Turn ultracode on';
+    h.knobs.rows[PROMPT_CURSOR_ROW + 3] = '  /effort high';
+    await h.advance(250);
+    assert.deepEqual(h.sent, [[SID, '/effort ultracode'], [SID, '\r']]);
+  }));
+
+  await t.test('a question that opens between the text and its Enter is not answered', () => withHold(true, async () => {
+    const h = await bootEnded();
+    await h.click('primary');
+    await h.advance(100);
+    h.knobs.rows[40] = PROMPT_RULE;
+    h.knobs.rows[41] = '  Do you want to proceed?';
+    h.knobs.rows[42] = '  ' + PROMPT_POINTER + ' 1. Yes';
+    h.knobs.rows[43] = '    2. No';
+    h.knobs.rows[45] = '  Enter to confirm \u00b7 Esc to cancel';
+    h.knobs.cursorY = 53;
+    await h.advance(1200);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]], 'the typed line is in the box; the Enter is not sent');
+    assert.equal(h.request().unsent, true);
+  }));
+
+  await t.test('the line showing on another session\'s screen is not this session\'s', () => withHold(true, async () => {
+    const h = await bootEnded();
+    const otherKnobs = { rows: emptyPromptScreen(), scrollback: [], viewTop: null, cursorY: PROMPT_CURSOR_ROW };
+    h.knobs.other = fakeTerminal(otherKnobs);
+    h.run(`window._openSessions.set('${NEW_SID}', { terminal: __knobs.other })`);
+    h.knobs.echo = false;
+    await h.click('primary');
+    otherKnobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + REQUEST_LINE;
+    h.run(`activeSessionId = '${NEW_SID}'`);
+    await h.advance(1300);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+  }));
+
+  await t.test('typed over your own text: the box says so, the line is not sent, and the next click asks first', () => withHold(true, async () => {
+    const h = await bootEnded();
+    h.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + 'my own text';
+    await h.tick();
+    assert.equal(h.header().primaryOverride, true);
+    await h.click('primary');
+    assert.equal(h.confirms.length, 1);
+    assert.ok(h.confirms[0].startsWith('There is text in this session\'s input box.'), h.confirms[0]);
+    assert.ok(h.confirms[0].includes('Type "Write the context handoff now. [ctx-handoff:request]" into this session anyway?'), h.confirms[0]);
+    assert.ok(h.confirms[0].endsWith(BOX_HELD_LINE), h.confirms[0]);
+    await h.advance(500);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+    await h.advance(1300);
+    assert.equal(h.sent.length, 1, 'no Enter: the box does not start with the line');
+    assert.equal(h.knobs.rows[PROMPT_CURSOR_ROW], PROMPT_BOX_EMPTY + 'my own text' + REQUEST_LINE);
+    assert.equal(h.request().unsent, true);
+    assert.equal(h.header().note, NOT_SENT);
+    assert.equal(h.header().primary, 'Hand off');
+    assert.equal(h.header().primaryOverride, true);
+    assert.equal(h.byId['handoff-primary-btn'].getAttribute('title'),
+      'There is text in this session\'s input box. Click to type the request anyway (asks first).');
+  }));
+});
+
+test('browser: an unsent Hand off goes with the session through a fork and through a reload', async (t) => {
+  await t.test('a fork between two looks: the Enter goes to the new id', () => withHold(true, async () => {
+    const h = await bootEnded();
+    h.knobs.echo = false;
+    await h.click('primary');
+    await h.advance(300);
+    await forkEvent(h, SID, NEW_SID);
+    h.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + REQUEST_LINE;   // the same terminal, now under the new id
+    await h.advance(100);   // the look at 400
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [NEW_SID, '\r']]);
+  }));
+
+  await t.test('a fork, and the text never shows: the flag is on the record under the new id', () => withHold(true, async () => {
+    const h = await bootEnded();
+    h.knobs.echo = false;
+    await h.click('primary');
+    await h.advance(300);
+    await forkEvent(h, SID, NEW_SID);
+    await h.advance(1000);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+    assert.equal(JSON.parse(h.run(`JSON.stringify(handoffRt.cache.get('${NEW_SID}').request)`)).unsent, true);
+    assert.equal(JSON.parse(h.storage.get('handoff-request:' + NEW_SID)).unsent, true);
+    assert.equal(h.storage.has('handoff-request:' + SID), false);
+  }));
+
+  await t.test('a reload of the window keeps the flag', () => withHold(true, async () => {
+    const storage = new Map();
+    const first = await bootEnded({ storage });
+    first.knobs.echo = false;
+    const clickMs = first.now;
+    await first.click('primary');
+    await first.advance(1300);
+    assert.deepEqual(JSON.parse(storage.get('handoff-request:' + SID)), { phase: 'timeout', atMs: clickMs, reason: '', unsent: true });
+    const second = boot({ storage, startMs: first.now + 1000 });
+    second.setSidecar(VM_SIDECAR);
+    second.setState(endedState(first));
+    await second.refresh();
+    assert.deepEqual(second.request(), { phase: 'timeout', atMs: clickMs, reason: '', unsent: true });
+    assert.equal(second.header().note, NOT_SENT);
+    assert.equal(second.header().primary, 'Hand off');
+  }));
+});
+
+test('browser: an Ultracode line whose Enter was held back says "Typed but not sent", not "No confirmation seen"', () => withHold(true, async () => {
+  const h = await bootUltra(false);
+  h.knobs.echo = false;
+  await clickUltra(h);
+  assert.deepEqual(h.sent, [[SID, '/effort ultracode']]);
+  assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
+  await h.advance(1299);
+  assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
+  assert.equal(h.header().primaryEnabled, false, 'Hand off waits for the switch (B12)');
+  await h.advance(1);
+  assert.equal(h.sent.length, 1, 'no Enter');
+  assert.deepEqual(ultraHeader(h), {
+    shown: true, label: 'Ultracode', enabled: true, asksFirst: false, look: 'off',
+    title: 'Ultracode is off. Click to switch it on.',
+  });
+  assert.equal(h.header().note, NOT_SENT);
+  assert.equal(h.header().primaryEnabled, true, 'Hand off is back');
+  // The looks for the program's answer were dropped with it.
+  h.knobs.rows[12] = '  ' + ON_LINE;
+  await h.advance(6000);
+  assert.equal(ultraHeader(h).look, 'off');
+  assert.equal(h.header().note, NOT_SENT, 'never replaced by "No confirmation seen"');
+  assert.equal(h.storage.has(ULTRA_KEY), false);
+  await h.ticks(55);    // 61 s after the note was set
+  assert.equal(h.header().note, null);
+  assert.deepEqual(h.errors, []);
+}));
+
+test('browser: the Ultracode looks count from the Enter: with an Enter held 1.3 s the confirmation is still seen', () => withHold(true, async () => {
+  const h = await bootUltra(false);
+  h.knobs.echo = false;
+  await clickUltra(h);
+  await h.advance(1000);
+  h.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + '/effort ultracode';   // the text shows late
+  await h.advance(300);   // the look at 1300 sends the Enter
+  assert.deepEqual(h.sent, [[SID, '/effort ultracode'], [SID, '\r']]);
+  await h.advance(4900);  // 6200 after the click: later than every look counted from the click
+  assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
+  h.knobs.rows[12] = '  ' + ON_LINE;
+  await h.advance(99);
+  assert.equal(ultraHeader(h).look, 'off');
+  await h.advance(1);     // 5000 after the Enter
+  assert.equal(ultraHeader(h).look, 'on');
+  assert.equal(h.header().note, null);
+}));
+
+test('browser: Enter goes without a look only after a yes on a screen that could not be read at the click', async (t) => {
+  await t.test('no terminal in this window, asked first, yes: Enter 250 ms after the text', () => withHold(true, async () => {
+    const h = await bootEnded();
+    h.run('window._openSessions = new Map()');
+    await h.tick();
+    assert.equal(h.header().primaryOverride, true);
+    assert.equal(h.byId['handoff-primary-btn'].getAttribute('title'),
+      'Switchboard cannot see an empty prompt on this session\'s screen. Click to type the request anyway (asks first).');
+    await h.click('primary');
+    assert.equal(h.confirms.length, 1);
+    await h.advance(500);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+    await h.advance(249);
+    assert.equal(h.sent.length, 1);
+    await h.advance(1);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+    await h.advance(2000);
+    assert.equal(h.sent.length, 2);
+    assert.equal(h.request().phase, 'requested');
+    assert.ok(!h.request().unsent);
+  }));
+
+  await t.test('a screen that can be read but is not recognised, asked first, yes: the Enter is held', () => withHold(true, async () => {
+    const h = await bootEnded();
+    h.knobs.rows[PROMPT_CURSOR_ROW - 1] = '';   // no rule row above the pointer: not an input box
+    await h.tick();
+    assert.equal(h.header().primaryOverride, true);
+    await h.click('primary');
+    await h.advance(500);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+    await h.advance(1300);
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.request().unsent, true);
+  }));
+
+  await t.test('a plain click, and the screen cannot be read at the looks: not sent', () => withHold(true, async () => {
+    const h = await bootEnded();
+    await h.click('primary');
+    assert.equal(h.confirms.length, 0);
+    h.run('window._openSessions = new Map()');
+    await h.advance(1300);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+    assert.equal(h.request().unsent, true);
+  }));
+
+  await t.test('the page loaded without prompt-screen.js: asked first, and the Enter is held', () => withHold(true, async () => {
+    const h = await bootEnded({ promptScreen: false });
+    assert.equal(h.header().primaryOverride, true);
+    await h.click('primary');
+    assert.equal(h.confirms.length, 1);
+    await h.advance(500);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+    await h.advance(1300);
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.request().unsent, true);
+  }));
+});
+
+test('browser: with ENTER_HOLD off the Enter follows 250 ms after the text whatever the screen shows, and the box shows T1\'s line', async (t) => {
+  await t.test('Hand off', () => withHold(false, async () => {
+    const h = await bootEnded();
+    h.knobs.echo = false;
+    const clickMs = h.now;
+    await h.click('primary');
+    await h.advance(249);
+    assert.equal(h.sent.length, 1);
+    await h.advance(1);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+    await h.advance(2000);
+    assert.equal(h.sent.length, 2);
+    assert.deepEqual(h.request(), { phase: 'requested', atMs: clickMs, reason: '' });
+    assert.equal(h.header().note, null);
+  }));
+
+  await t.test('Ultracode: no "Typed but not sent"; the looks still count from the Enter', () => withHold(false, async () => {
+    const h = await bootUltra(false);
+    h.knobs.echo = false;
+    await clickUltra(h);
+    await h.advance(250);
+    assert.deepEqual(h.sent, [[SID, '/effort ultracode'], [SID, '\r']]);
+    await h.advance(4999);
+    assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
+    await h.advance(1);
+    assert.equal(h.header().note, ULTRACODE_NOT_CONFIRMED);
+  }));
+
+  await t.test('the box over your own text', () => withHold(false, async () => {
+    const h = await bootEnded();
+    h.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + 'my own text';
+    await h.tick();
+    await h.click('primary');
+    assert.ok(h.confirms[0].startsWith('There is text in this session\'s input box.'), h.confirms[0]);
+    assert.ok(h.confirms[0].endsWith(BOX_SENT_LINE), h.confirms[0]);
+    await h.advance(750);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+  }));
+});
+
+test('ctx-handoff: one place sends a typed line and its Enter', () => {
+  const lines = SOURCE.split(/\r?\n/);
+  const start = lines.findIndex(line => line.startsWith('function handoffTypeLine('));
+  assert.ok(start > 0, 'handoffTypeLine is a top-level function');
+  const end = lines.findIndex((line, index) => index > start && /^(async )?function /.test(line));
+  const code = (line) => !/^\s*(\/\/|\*|\/\*)/.test(line);
+  const sends = lines.map((line, index) => ({ line, index })).filter(({ line }) => code(line) && /\bsendInput\(/.test(line));
+  assert.equal(sends.length, 2, 'the text, and the Enter');
+  for (const { line, index } of sends) assert.ok(index > start && index < end, `ctx-handoff.js:${index + 1} ${line.trim()}`);
+  assert.equal(sends.filter(({ line }) => line.includes('entry.id')).length, 2, 'both go to entry.id');
+  assert.equal(sends.filter(({ line }) => line.includes('\'\\r\'')).length, 1, 'one line sends the Enter');
+});
+
+// ── four more: Jason's answer CK-I, and five states found by the check of the plan ──
+
+test('browser: a line that shows only after the last look is never sent, and a second "Type it anyway" over it holds the doubled line', () => withHold(true, async () => {
+  const h = await bootEnded();
+  h.knobs.echo = false;
+  await h.click('primary');
+  await h.advance(1300);   // the last look: typed but not sent
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+  assert.equal(h.request().unsent, true);
+  // The slow echo arrives 100 ms after the last look: the app's own line now sits in the box.
+  await h.advance(100);
+  h.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + REQUEST_LINE;
+  h.knobs.echo = true;
+  await h.advance(3000);
+  await h.tick();
+  assert.equal(h.sent.length, 1, 'no Enter at any later time');
+  assert.equal(h.request().unsent, true);
+  assert.equal(h.header().note, NOT_SENT);
+  assert.equal(h.header().primary, 'Hand off');
+  assert.equal(h.header().primaryOverride, true, 'the next click follows the screen: text in the box');
+  assert.equal(h.byId['handoff-primary-btn'].getAttribute('title'),
+    'There is text in this session\'s input box. Click to type the request anyway (asks first).');
+  // CK-I: "Type it anyway" over the app's own unsent line types the line a second time behind it.
+  await h.click('primary');
+  assert.equal(h.confirms.length, 1);
+  assert.ok(h.confirms[0].endsWith(BOX_HELD_LINE), h.confirms[0]);
+  await h.advance(500);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, REQUEST_LINE]]);
+  assert.equal(h.knobs.rows[PROMPT_CURSOR_ROW], PROMPT_BOX_EMPTY + REQUEST_LINE + REQUEST_LINE, 'the line stands in the box twice');
+  await h.advance(1300);
+  assert.equal(h.sent.length, 2, 'no Enter: a doubled line is not sent');
+  assert.equal(h.request().unsent, true);
+  assert.equal(h.header().note, NOT_SENT, 'B8\'s note shows again');
+}));
+
+test('browser: with two sessions in the window the typing path keeps to the session that was clicked', async (t) => {
+  // A second session of this window: running, its turn ended, at an empty prompt in a terminal of its own.
+  const addSecond = async (h) => {
+    h.knobs.other = fakeTerminal({ rows: emptyPromptScreen(), scrollback: [], viewTop: null, cursorY: PROMPT_CURSOR_ROW });
+    h.run(`window._openSessions.set('${NEW_SID}', { terminal: __knobs.other });
+      sessionMap.set('${NEW_SID}', { sessionId: '${NEW_SID}', projectPath: 'C:/proj', type: 'claude' });
+      activePtyIds = new Set(['${SID}', '${NEW_SID}']);
+      sessionBusyState.set('${NEW_SID}', false);`);
+    h.files.set(VM_DIR + '\\' + NEW_SID + '.json', JSON.stringify(VM_SIDECAR));
+    h.files.set(VM_DIR + '\\' + NEW_SID + '.state.json', JSON.stringify(endedState(h)));
+    h.listeners.busy(NEW_SID, false);
+    await h.run(`handoffRefresh('${NEW_SID}')`);
+    await flush();
+  };
+  const view = async (h, id) => { h.run(`activeSessionId = '${id}'`); await h.tick(); };
+  const requestOf = (h, id) => JSON.parse(h.run(`JSON.stringify(handoffRt.cache.get('${id}').request)`));
+
+  await t.test('Hand off: the hold gives up while the other session is in view', () => withHold(true, async () => {
+    const h = await bootEnded();
+    await addSecond(h);
+    h.knobs.echo = false;
+    await h.click('primary');
+    await h.advance(100);
+    await view(h, NEW_SID);
+    await h.advance(1200);   // the last look, 1300 after the text
+    await h.tick();
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE]], 'no Enter, to either session');
+    assert.equal(requestOf(h, SID).unsent, true, 'the record of the session that was clicked');
+    assert.equal(h.header().primary, 'Hand off', 'the header is the other session\'s');
+    assert.equal(h.header().note, null, 'and nothing is drawn on it');
+    // Back in view inside the 60 seconds: the note is there. After them it is gone.
+    await h.advance(3700);
+    await view(h, SID);
+    assert.equal(h.header().note, NOT_SENT);
+    await h.ticks(57);       // 62 s after the click
+    assert.equal(h.header().note, null);
+  }));
+
+  await t.test('Ultracode: the same, and the switch of the clicked session is dropped', () => withHold(true, async () => {
+    const h = await bootUltra(false);
+    await addSecond(h);
+    h.knobs.echo = false;
+    await clickUltra(h);
+    await h.advance(100);
+    await view(h, NEW_SID);
+    await h.advance(1200);
+    await h.tick();
+    assert.deepEqual(h.sent, [[SID, '/effort ultracode']]);
+    assert.equal(h.header().note, null, 'nothing on the header of the session in view');
+    assert.equal(h.run(`handoffRt.cache.get('${SID}').ultraSwitch`), null);
+    await h.advance(3700);
+    await view(h, SID);
+    assert.equal(ultraHeader(h).label, 'Ultracode');
+    assert.equal(h.header().note, NOT_SENT);
+    await h.ticks(57);
+    assert.equal(h.header().note, null);
+  }));
+
+  await t.test('two lines on their way at once: each path looks at its own screen and sends to its own id', () => withHold(true, async () => {
+    const h = await bootEnded();
+    await addSecond(h);
+    h.knobs.echo = false;          // the first session's line does not show; the second session's does
+    await h.click('primary');      // the first session
+    await h.advance(300);
+    await view(h, NEW_SID);
+    assert.equal(h.header().primaryOverride, false, 'the second session is at an empty prompt');
+    await h.click('primary');      // the second session
+    await h.advance(250);
+    assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [NEW_SID, REQUEST_LINE], [NEW_SID, '\r']]);
+    await h.advance(1050);         // 1600 after the first click: every look of both paths is over
+    assert.equal(h.sent.length, 3, 'the first session gets no Enter, the second no second one');
+    assert.equal(requestOf(h, SID).unsent, true);
+    assert.equal(requestOf(h, NEW_SID).phase, 'requested');
+    assert.ok(!requestOf(h, NEW_SID).unsent);
+  }));
+});
+
+test('browser: Update types through the same path: its Enter is held too, and Update can be clicked again', () => withHold(true, async () => {
+  const w = await bootUltra(false);
+  w.setHandoffFile(true);
+  w.setState(writtenVmState(w, { ultracode: false }));
+  await w.refresh();
+  assert.equal(w.header().update, true);
+  w.knobs.echo = false;
+  const clickMs = w.now;
+  await w.click('update');
+  assert.deepEqual(w.sent, [[SID, REQUEST_LINE]]);
+  await w.advance(1300);
+  assert.deepEqual(w.sent, [[SID, REQUEST_LINE]], 'no Enter');
+  assert.deepEqual(w.request(), { phase: 'timeout', atMs: clickMs, reason: '', unsent: true });
+  assert.equal(w.header().note, NOT_SENT);
+  assert.equal(w.header().primary, 'Continue in new session');
+  assert.equal(w.header().update, true);
+  assert.equal(w.byId['handoff-update-btn'].getAttribute('aria-disabled'), 'false', 'Update can be clicked again');
+}));
+
+test('browser: an Enter whose write throws does not leave the switch waiting: the looks are armed all the same', () => withHold(true, async () => {
+  const h = await bootUltra(false);
+  h.run(`{
+    const send = window.api.sendInput;
+    window.api.sendInput = (id, data) => {
+      if (data.length === 1 && data.charCodeAt(0) === 13) throw new Error('the write of the Enter failed');
+      send(id, data);
+    };
+  }`);
+  await clickUltra(h);
+  await h.advance(250);
+  assert.deepEqual(h.sent, [[SID, '/effort ultracode']], 'the Enter never left');
+  assert.equal(h.errors.length, 1, 'logged, once');
+  assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
+  await h.advance(4999);
+  assert.equal(ultraHeader(h).label, `Ultracode${ELLIPSIS}`);
+  await h.advance(1);   // the last look, 5000 after the Enter was tried
+  assert.equal(ultraHeader(h).label, 'Ultracode', 'not left saying it is switching');
+  assert.equal(h.header().note, ULTRACODE_NOT_CONFIRMED);
+  assert.equal(h.header().primaryEnabled, true, 'Hand off does not wait for a reload (B12)');
+  assert.equal(h.errors.length, 1);
+}));

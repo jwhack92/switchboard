@@ -185,3 +185,65 @@ test('prompt-screen: a row that is not text is a doubt, wherever it stands', () 
     assert.equal(stateOf(change(S02C, { 20: bad })), 'unknown', 'row 20 of an empty prompt is ' + JSON.stringify(bad));
   }
 });
+
+// ── echoSeen (ready state, commit 3) ───────────────────────────────────────
+// P (the pointer) and RULE (a rule row, edge to edge) are declared at the top of this file, by task 07.
+const { echoSeen } = require('../public/prompt-screen');
+const HANDOFF = 'Write the context handoff now. [ctx-handoff:request]';
+// A screen that ends in the input box: `box` are its rows (one, or more when the line wraps).
+const screenWith = (box, above = ['\u25cf ok', '', '\u273b Worked for 6s']) => {
+  const rows = [...above, RULE, ...box, RULE, '  status'];
+  return { rows, cursorY: above.length + box.length };   // the cursor on the last row of the box
+};
+
+test('prompt-screen: echoSeen is true when the typed text shows in the input box at the cursor row', () => {
+  assert.equal(echoSeen(screenWith([P + '\u00a0/effort ultracode']), '/effort ultracode'), true);
+  assert.equal(echoSeen(screenWith([P + '\u00a0' + HANDOFF]), HANDOFF), true);
+  assert.equal(echoSeen(screenWith([P + ' ' + HANDOFF.replace(/ /g, '  ')]), HANDOFF), true, 'spacing does not matter');
+  assert.equal(echoSeen(screenWith([P + '\u00a0/effort ultracode   a grey suggestion']), '/effort ultracode'), true, 'text after it is allowed');
+  assert.equal(echoSeen(screenWith([P + '\u00a0/effort ultracode off']), '/effort ultracode'), true, 'more text after it is not the line a second time');
+  // A long line wraps: the rows from the pointer row to the cursor row are read as one.
+  assert.equal(echoSeen(screenWith([P + '\u00a0' + HANDOFF.slice(0, 30), HANDOFF.slice(30)]), HANDOFF), true);
+  assert.equal(echoSeen(screenWith([P + '\u00a0' + HANDOFF.slice(0, 10), HANDOFF.slice(10, 20), HANDOFF.slice(20, 30), HANDOFF.slice(30)]), HANDOFF), true, 'the pointer row three rows above the cursor');
+});
+
+test('prompt-screen: echoSeen is false on every doubt', () => {
+  const text = '/effort ultracode';
+  assert.equal(echoSeen(screenWith([P + '\u00a0']), text), false, 'an empty box');
+  assert.equal(echoSeen(screenWith([P + '\u00a0my own text' + text]), text), false, 'the line typed after a draft');
+  assert.equal(echoSeen(screenWith([P + '\u00a0/effort ultra']), text), false, 'only part of it yet');
+  // CK-I: the typed line twice in a row. The app's own unsent line was in the box when it was typed again.
+  assert.equal(echoSeen(screenWith([P + '\u00a0' + text + text]), text), false, 'the line twice in a row');
+  assert.equal(echoSeen(screenWith([P + '\u00a0' + HANDOFF + ' ' + HANDOFF.slice(0, 20), HANDOFF.slice(20)]), HANDOFF), false, 'twice, the second copy wrapped onto the next row');
+  assert.equal(echoSeen(screenWith([P + '\u00a0' + text]), ''), false, 'no text to look for');
+  assert.equal(echoSeen(null, text), false);
+  assert.equal(echoSeen({ rows: null, cursorY: 3 }, text), false);
+  assert.equal(echoSeen({ ...screenWith([P + '\u00a0' + text]), cursorY: null }, text), false, 'no cursor row');
+  assert.equal(echoSeen({ ...screenWith([P + '\u00a0' + text]), cursorY: 99 }, text), false, 'a cursor row off the screen');
+  // A prompt echoed in the conversation starts with the pointer too, but has no rule row above it.
+  assert.equal(echoSeen({ rows: ['\u25cf ok', P + ' ' + text, '', RULE, P + '\u00a0', RULE], cursorY: 1 }, text), false);
+  // The pointer row more than three rows above the cursor is not looked for.
+  const five = [P + '\u00a0' + HANDOFF.slice(0, 10), HANDOFF.slice(10, 20), HANDOFF.slice(20, 30), HANDOFF.slice(30, 40), HANDOFF.slice(40)];
+  assert.equal(echoSeen(screenWith(five), HANDOFF), false);
+});
+
+test('prompt-screen: echoSeen reads the cursor row, not a menu row under the box', () => {
+  const text = '/effort ultracode';
+  const menu = (boxText) => {
+    const rows = ['\u25cf ok', '', RULE, P + '\u00a0' + boxText, RULE, P + ' /effort ultracode   Turn ultracode on', '  /effort high'];
+    return { rows, cursorY: 3 };
+  };
+  assert.equal(echoSeen(menu(text), text), true, 'the box holds the text; the menu under it does not matter');
+  assert.equal(echoSeen(menu(''), text), false, 'the text is only in the menu row');
+});
+
+test('prompt-screen: echoSeen is false while a question panel is open above the box', () => {
+  const text = '/effort ultracode';
+  const rows = ['\u273b Worked for 6s', RULE, '  Do you want to proceed?', '  ' + P + ' 1. Yes', '    2. No', '',
+    '  Enter to confirm \u00b7 Esc to cancel', RULE, P + '\u00a0' + text, RULE, '  status'];
+  assert.equal(echoSeen({ rows, cursorY: 8 }, text), false, 'the cursor on the box');
+  assert.equal(echoSeen({ rows, cursorY: 10 }, text), false, 'the cursor under the box, as the recorded question had it');
+  // The same rows without the panel: seen.
+  const plain = ['\u273b Worked for 6s', '', '', '', '', '', '', RULE, P + '\u00a0' + text, RULE, '  status'];
+  assert.equal(echoSeen({ rows: plain, cursorY: 8 }, text), true);
+});
