@@ -838,3 +838,162 @@ test('header-and-status (pin): what the header title shows for a session started
     assert.equal(plain.headerName.textContent, 'please fix the login page');
   });
 });
+
+test('header-and-status: the header reads "Did not stop" for a live session whose stop stalled or failed, and Running or Stopped otherwise', () => {
+  const HEADER_DID_NOT_STOP = { cls: 'did-not-stop', text: 'Did not stop', stop: '' };
+  const draw = (running, didNotStop) => {
+    const header = fakeHeader();
+    const ctx = load(HEADER_STATUS, { file: APP, globals: {
+      activeSessionId: 'sess1', activePtyIds: new Set(running), didNotStopIds: new Set(didNotStop),
+      terminalHeaderStatus: header.status, terminalStopBtn: header.stop, updatePtyTitle: () => {},
+    } });
+    header.stop.style.display = 'none';
+    ctx.updateTerminalHeader();
+    return headerState(header);
+  };
+  assert.deepEqual(draw(['sess1', 'other'], ['sess1']), HEADER_DID_NOT_STOP, 'the Stop button stays: Stop still works');
+  assert.deepEqual(draw(['sess1', 'other'], ['other']), HEADER_RUNNING, 'another session did not stop');
+  assert.deepEqual(draw(['sess1'], []), HEADER_RUNNING);
+  assert.deepEqual(draw(['other'], ['sess1']), HEADER_STOPPED, 'it has ended: the status goes with the session');
+  assert.deepEqual(draw([], []), HEADER_STOPPED);
+});
+
+test('header-and-status: the running check asks which sessions did not stop, replaces the set and redraws the header; a page or a main process without that call changes nothing', async (t) => {
+  const withStops = (opts) => {
+    const page = bootRunningCheck(opts);
+    page.stops = async () => [];
+    page.seen.stopAsks = 0;
+    page.ctx.window.api.getStopStates = () => { page.seen.stopAsks++; return page.stops(); };
+    page.ctx.didNotStopIds = new Set();
+    return page;
+  };
+
+  await t.test('a stalled session on screen: Did not stop within one check, the rows unchanged; it goes when main no longer lists it and when the session ends', async () => {
+    const page = withStops({ running: [], active: 'row-a' });
+    const before = page.ctx.didNotStopIds;
+    page.answer = async () => ['row-a', 'row-b'];
+    page.stops = async () => ['row-a'];
+    await page.ctx.pollActiveSessions();
+    assert.equal(page.seen.stopAsks, 1);
+    assert.notEqual(page.ctx.didNotStopIds, before, 'a new Set, not the old one changed');
+    assert.ok(isASet(page.ctx.didNotStopIds));
+    assert.deepEqual([...page.ctx.didNotStopIds], ['row-a']);
+    assert.deepEqual(headerState(page.header), { cls: 'did-not-stop', text: 'Did not stop', stop: '' });
+    assert.equal(page.seen.ptyTitles, 2, 'the header is drawn by the running answer and once more by this one');
+    assert.equal(dots(page).rows['row-a'], true, 'the row shows as running and keeps its Stop');
+    page.stops = async () => [];
+    await page.ctx.pollActiveSessions();
+    assert.deepEqual(headerState(page.header), HEADER_RUNNING);
+    page.stops = async () => ['row-a'];
+    page.answer = async () => [];
+    await page.ctx.pollActiveSessions();
+    assert.deepEqual(headerState(page.header), HEADER_STOPPED);
+  });
+
+  await t.test('the order: the running ids first, the stop states after the header was drawn, the re-arm last', async () => {
+    const page = withStops({ running: [], active: 'row-a' });
+    const order = [];
+    page.answer = async () => { order.push('running'); return ['row-a']; };
+    page.stops = async () => { order.push(`stops after "${page.header.status.textContent}", timers ${page.clock.timers.length}`); return []; };
+    await page.ctx.pollActiveSessions();
+    assert.deepEqual(order, ['running', 'stops after "Running", timers 0']);
+    assert.deepEqual(armed(page).map((timer) => timer.ms), [3000]);
+    assert.equal(armed(page)[0].fn, page.ctx.pollActiveSessions, 'what the timer runs is still the check itself');
+  });
+
+  await t.test('the stop-state call rejects, throws at once or answers no list: the set stays as it was and the check still re-arms', async () => {
+    for (const stops of [() => Promise.reject(new Error("No handler registered for 'get-stop-states'")), () => { throw new Error('boom'); }, async () => 5]) {
+      const page = withStops({ running: [], active: 'row-a' });
+      const before = page.ctx.didNotStopIds;
+      page.answer = async () => ['row-a'];
+      page.stops = stops;
+      assert.equal(await page.ctx.pollActiveSessions(), undefined, 'the check does not reject');
+      assert.equal(page.ctx.didNotStopIds, before);
+      assert.deepEqual(headerState(page.header), HEADER_RUNNING);
+      assert.deepEqual(armed(page).map((timer) => timer.ms), [3000]);
+      assert.equal(armed(page)[0].fn, page.ctx.pollActiveSessions);
+    }
+  });
+
+  await t.test('the stop-state call answers nothing (undefined or null): the set becomes a new, empty one, the header reads Running and the check still re-arms', async () => {
+    for (const nothing of [undefined, null]) {
+      const page = withStops({ running: [], active: 'row-a' });
+      page.answer = async () => ['row-a'];
+      page.stops = async () => ['row-a'];
+      await page.ctx.pollActiveSessions();
+      const before = page.ctx.didNotStopIds;
+      page.stops = async () => nothing;
+      assert.equal(await page.ctx.pollActiveSessions(), undefined, 'the check does not reject');
+      assert.notEqual(page.ctx.didNotStopIds, before, 'no answer is an answer: the set is replaced');
+      assert.ok(isASet(page.ctx.didNotStopIds));
+      assert.deepEqual([...page.ctx.didNotStopIds], []);
+      assert.deepEqual(headerState(page.header), HEADER_RUNNING);
+      assert.deepEqual(armed(page).map((timer) => timer.ms), [3000]);
+    }
+  });
+
+  await t.test('a session whose stop stalled is re-keyed while it is on screen: Did not stop again under the new id after one check', async () => {
+    const page = withStops({ running: [], active: 'row-a' });
+    page.answer = async () => ['row-a'];
+    page.stops = async () => ['row-a'];
+    await page.ctx.pollActiveSessions();
+    assert.deepEqual(headerState(page.header), { cls: 'did-not-stop', text: 'Did not stop', stop: '' });
+    // The re-key (a fork, a plan-accept, later a /clear): the page shows the session under its new id, and main lists it under that id.
+    page.ctx.activeSessionId = 'row-new';
+    page.answer = async () => ['row-new'];
+    page.stops = async () => ['row-new'];
+    await page.ctx.pollActiveSessions();
+    assert.deepEqual(headerState(page.header), { cls: 'did-not-stop', text: 'Did not stop', stop: '' });
+    assert.deepEqual([...page.ctx.didNotStopIds], ['row-new'], 'the old id went with the answer: the set is replaced, never added to');
+  });
+
+  await t.test('the running call rejects: the stop states are still asked', async () => {
+    const page = withStops({ running: ['row-a'], active: 'row-a' });
+    page.answer = () => Promise.reject(new Error('main did not answer'));
+    page.stops = async () => ['row-a'];
+    await page.ctx.pollActiveSessions();
+    assert.equal(page.seen.stopAsks, 1);
+    assert.deepEqual(headerState(page.header), { cls: 'did-not-stop', text: 'Did not stop', stop: '' });
+  });
+
+  await t.test('a page without that call (an older preload): nothing is asked, the header is drawn once, no set is made', async () => {
+    const page = bootRunningCheck({ running: [], active: 'row-a' });
+    page.answer = async () => ['row-a'];
+    await page.ctx.pollActiveSessions();
+    assert.equal(page.seen.ptyTitles, 1);
+    assert.equal(peek(page.ctx, 'typeof didNotStopIds'), 'undefined');
+    assert.deepEqual(headerState(page.header), HEADER_RUNNING);
+  });
+});
+
+test('header-and-status: style.css gives the "Did not stop" status two rules, its amber colour and an amber dot', () => {
+  const css = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'public', 'style.css'), 'utf8');
+  assert.equal(css.split('did-not-stop').length - 1, 2, 'two rules and nothing else: the text and the dot');
+  assert.match(css, /#terminal-header-status\.did-not-stop\s*\{\s*color:\s*#ffd166;\s*\}/);
+  assert.match(css, /#terminal-header-status\.did-not-stop::before\s*\{\s*background:\s*#ffd166;\s*\}/);
+});
+
+test('header-and-status: a reload of the list redraws the corner notice once, after the rows are in the session map; a page without the notice reloads as before', async () => {
+  const page = bootTypedName();
+  const seen = [];
+  page.app.MainFaultNotice = { redraw: () => { seen.push(!!page.session('s1')); } };
+  page.rows = () => realRow('s1', {});
+  await page.reload();
+  assert.deepEqual(seen, [true], 'one redraw for the load, with the row already in the session map');
+  await page.reload();
+  assert.deepEqual(seen, [true, true], 'and one for every later load');
+  // Without the notice script, with one that has no redraw, or with a name that is no object: the load ends as before.
+  for (const notice of [undefined, null, {}, { redraw: 'no function' }, 5]) {
+    const plain = bootTypedName();
+    if (notice !== undefined) plain.app.MainFaultNotice = notice;
+    plain.rows = () => realRow('s1', {});
+    await plain.reload();
+    assert.equal(plain.session('s1').summary, 'please fix the login page', String(notice));
+    assert.equal(plain.redraws, 1, 'the sidebar was drawn');
+  }
+  // The call stands once in the file, among the last statements of loadProjects.
+  const app = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const CALL = "if (typeof MainFaultNotice !== 'undefined' && MainFaultNotice && typeof MainFaultNotice.redraw === 'function') MainFaultNotice.redraw();";
+  assert.equal(app.split(CALL).length - 1, 1);
+  assert.match(app, /refreshSidebar\(\{ resort, reason \}\);[^{}]*MainFaultNotice\.redraw\(\);[^{}]*\r?\n\}/, 'after the sidebar was drawn, before loadProjects ends');
+});

@@ -40,8 +40,10 @@ if (process.platform === 'win32') {
 // electron-log's console transport writes to stdout/stderr on every log call. If
 // whatever launched us handed Electron a pipe and then exited, that write fails
 // with EPIPE — and with no 'error' listener Node re-throws it as an uncaught
-// exception in the main process, so the whole app dies with a modal
-// "A JavaScript error occurred in the main process" dialog, triggered by
+// exception in the main process. That used to raise Electron's modal
+// "A JavaScript error occurred in the main process" box (the app did not die:
+// it ran on behind the box); since the crash guard, main-faults.js logs it and
+// shows the corner notice instead. Either way it would be triggered by
 // something as ordinary as clicking a session.
 //
 // The file transport is the log that matters (%APPDATA%/switchboard/logs);
@@ -60,8 +62,7 @@ try { require('electron-reloader')(module, { watchRenderer: true }); } catch {};
 // with an error nobody caught, the fault file beside the log, and a line for
 // every way the app can exit. Loaded on this side of the reloader line on
 // purpose, so a change to it needs an app restart. The app can run without it:
-// hence the guarded require and a stand-in with the same method names. `clear`
-// is not asked of the module until the commit that adds the notice. From here
+// hence the guarded require and a stand-in with the same method names. From here
 // on an uncaught error and an unhandled rejection are handled by main-faults,
 // and Electron's own box no longer shows for them; errors raised by the
 // requires above the reloader line still get Electron's box.
@@ -71,7 +72,7 @@ let mainFaults;
 try {
   mainFaults = require('./main-faults').createMainFaults({ log, app, dialog, broadcast: registry.broadcast });
   for (const name of MAIN_FAULTS_METHODS) {
-    if (name !== 'clear' && typeof mainFaults[name] !== 'function') throw new Error('main-faults.js has no ' + name + '()');
+    if (typeof mainFaults[name] !== 'function') throw new Error('main-faults.js has no ' + name + '()');
   }
 } catch (err) {
   try { log.error('[main-fault] load failed', err); } catch {}
@@ -1032,6 +1033,7 @@ ipcMain.handle('open-main-log', () => {
     return { ok: false, error: String(e && e.message) };
   }
 });
+ipcMain.handle('clear-main-fault', (_event, id) => { mainFaults.clear(id); return { ok: true }; });
 
 // --- IPC: MCP bridge ---
 ipcMain.on('mcp-diff-response', (_event, sessionId, diffId, action, editedContent) => {

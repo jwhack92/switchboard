@@ -1421,6 +1421,14 @@ body { display: flex; flex-direction: column; }
   background: #6a6a80;
 }
 
+#terminal-header-status.did-not-stop {
+  color: #ffd166;
+}
+
+#terminal-header-status.did-not-stop::before {
+  background: #ffd166;
+}
+
 #terminal-stop-btn {
   cursor: pointer;
   background: none;

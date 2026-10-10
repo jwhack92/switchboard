@@ -747,3 +747,146 @@ test('main-faults wiring (main.js): the two process listeners are installed dire
   assert.equal(run.h.proc.count('unhandledRejection'), 0);
   assert.equal(run.h.logged('error').length, 1);
 });
+
+const boom = () => new Error('first');
+const hit = (h) => h.faults.report('internal', boom());
+
+test('main-faults: clear takes a record off the list and tells every window once with cleared true; an unknown id does nothing', () => {
+  const h = make();
+  h.loaded();
+  hit(h);
+  h.clock.advance(1000);              // so the second record is the newer one
+  h.faults.report('internal', new TypeError('second kind'));
+  const [newer, older] = h.faults.list();
+  h.sent.length = 0;
+  assert.equal(h.faults.clear(older.id), undefined);
+  assert.deepEqual(h.faults.list().map((r) => r.id), [newer.id]);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0][0], 'main-fault');
+  assert.deepEqual({ ...h.sent[0][1] }, { ...older, cleared: true });
+  for (const id of ['no-such-id', undefined, null, older.id]) assert.equal(h.faults.clear(id), undefined);
+  assert.equal(h.sent.length, 1, 'an unknown id, no id and a second clear send nothing');
+  assert.equal(h.faults.list().length, 1);
+  // A dismissed record is cleared the same way.
+  h.faults.dismiss(newer.id);
+  h.sent.length = 0;
+  h.faults.clear(newer.id);
+  assert.deepEqual(h.sent.map(([channel, r]) => [channel, r.id, r.dismissed, r.cleared]), [['main-fault', newer.id, true, true]]);
+  assert.deepEqual(h.faults.list(), []);
+
+  // The records of a previous run that did not close: the 'last-run' record and one fault of that run.
+  const old = make({ prefill: [
+    { t: 10, run: 'r1', ev: 'start', version: '1', pid: 1 },
+    { t: 20, run: 'r1', ev: 'fault', id: 'a', kind: 'internal', origin: 'uncaughtException', n: 1, firstLine: 'Error: old one', sessionId: null, stack: 'Error: old one\n    at x' },
+  ] });
+  assert.deepEqual(old.faults.list().map((r) => [r.kind, r.previousRun, r.dismissed]), [['last-run', true, false], ['internal', true, true]]);
+  const before = fs.readFileSync(old.file, 'utf8');
+  const logged = old.log.calls.length;
+  for (const r of old.faults.list()) old.faults.clear(r.id);
+  assert.deepEqual(old.faults.list(), []);
+  assert.deepEqual(old.sent.map(([channel, r]) => [channel, r.cleared]), [['main-fault', true], ['main-fault', true]]);
+  assert.equal(fs.readFileSync(old.file, 'utf8'), before, 'a clear writes nothing: the record stays in the log file');
+  assert.equal(old.log.calls.length, logged, 'and nothing to the main log');
+});
+
+test('main-faults: clear never throws, calls off the send that was armed, and the same error after a clear is listed again as a new open record with a new id', () => {
+  // (a) a broadcast that throws
+  const t = make({ broadcastThrows: true });
+  hit(t);
+  assert.doesNotThrow(() => t.faults.clear(t.faults.list()[0].id));
+  assert.deepEqual(t.faults.list(), []);
+
+  // (b) a send that is still armed for the record is called off
+  const h = make();
+  h.loaded();
+  hit(h); hit(h);                     // the first is sent at once; the second arms one send for 1000 ms later
+  const first = h.faults.list()[0];
+  assert.equal(first.count, 2);
+  h.sent.length = 0;
+  h.faults.clear(first.id);
+  h.clock.advance(1000);
+  assert.deepEqual(h.sent.map(([channel, r]) => [channel, r.id, r.cleared]), [['main-fault', first.id, true]],
+    'nothing follows the cleared send: a late count would bring the cleared notice back in every window');
+
+  // (c) the same error again: a new record with a new id, counted from one, sent at once
+  h.sent.length = 0;
+  hit(h);
+  const again = h.faults.list();
+  assert.equal(again.length, 1);
+  assert.notEqual(again[0].id, first.id, 'an id that was not used before in this run');
+  assert.equal(again[0].count, 1, 'a new record, counted from one');
+  assert.equal(again[0].dismissed, false);
+  assert.deepEqual(h.sent.map(([channel, r]) => [channel, r.id, r.count, r.cleared]), [['main-fault', again[0].id, 1, undefined]]);
+  // dismissed, cleared, and again within the same minute: open at once
+  h.faults.dismiss(again[0].id);
+  h.faults.clear(again[0].id);
+  hit(h);
+  const third = h.faults.list();
+  assert.deepEqual([third.length, third[0].count, third[0].dismissed], [1, 1, false],
+    'shown open at once: the once-a-minute rule is for a dismissed record, and this is a new one');
+  assert.equal(new Set([first.id, again[0].id, third[0].id]).size, 3);
+
+  // (d) the log side does not notice a clear: nothing is written at the clear, the same error gets no new
+  // full entries afterwards, and what was owed is written later, as before
+  const g = make();
+  g.loaded();
+  for (let i = 0; i < 5; i++) hit(g);               // three full entries, two occurrences owed
+  assert.equal(g.logged('error').length, 3);
+  const written = [g.log.calls.length, g.lines().length];
+  g.faults.clear(g.faults.list()[0].id);
+  assert.deepEqual([g.log.calls.length, g.lines().length], written, 'a clear writes nothing, the owed count included');
+  hit(g);                                           // the sixth occurrence of this error: a new record, no new full entry
+  assert.deepEqual([g.faults.list().length, g.faults.list()[0].count], [1, 1]);
+  assert.equal(g.logged('error').length, 3, 'the cap of three full entries is the error\'s, not the record\'s');
+  g.faults.flush();
+  assert.deepEqual(g.lines().filter((l) => l.ev === 'repeat').map((l) => [l.kind, l.firstLine, l.count]), [['internal', 'Error: first', 3]]);
+  assert.equal(g.logged('warn').filter((c) => /^\[main-fault\] kind=internal id=\S+ line="Error: first" repeated 3 more times$/.test(c[1])).length, 1);
+});
+
+test('main-faults wiring (main.js): the guarded require asks the module for clear like every other method: the real module has it, and a module without it becomes the stand-in', () => {
+  const ok = runRequireBlock();
+  assert.equal(typeof ok.mainFaults.clear, 'function', 'the real module has clear');
+  assert.deepEqual(ok.h.logged('error'), [], 'and passes the check with clear in it');
+  assert.ok(!REQUIRE_BLOCK().includes("name !== 'clear'"), 'the skip of clear is gone from the method check');
+  // a module that has every method but clear
+  const noClear = () => ({ createMainFaults: () => Object.fromEntries(NAMES.filter((n) => n !== 'clear').map((n) => [n, () => undefined])) });
+  const bad = runRequireBlock({ require: noClear });
+  const errors = bad.h.logged('error');
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0][1], '[main-fault] load failed');
+  assert.match(String(errors[0][2] && errors[0][2].message), /main-faults\.js has no clear\(\)/);
+  assert.equal(typeof bad.mainFaults.clear, 'function', 'the stand-in');
+  assert.equal(bad.mainFaults.clear('x'), undefined);
+  assert.deepEqual([...bad.mainFaults.list()], []);
+});
+
+test("main-faults wiring: the 'clear-main-fault' handler calls mainFaults.clear with the id and answers ok, inside the block of the main-faults handlers and away from the clipboard handler", () => {
+  const block = cut('main.js', "ipcMain.handle('clear-main-fault'", 'mainFaults.clear(id); return { ok: true }; });', { includeEnd: true });
+  const handlers = {};
+  const calls = [];
+  load(block, { file: 'main.js', globals: {
+    ipcMain: { handle: (channel, fn) => { handlers[channel] = fn; } },
+    mainFaults: { clear: (id) => { calls.push(['clear', id]); } },
+  } });
+  assert.deepEqual(Object.keys(handlers), ['clear-main-fault']);
+  assert.deepEqual({ ...handlers['clear-main-fault']({}, 'f1') }, { ok: true });
+  assert.deepEqual(calls, [['clear', 'f1']]);
+  // The handler is the fourth and last of task 01's block, under the heading of the main-faults handlers.
+  const faultsBlock = cut('main.js', '// --- IPC: main faults ---', '// --- IPC: MCP bridge ---');
+  assert.deepEqual([...faultsBlock.matchAll(/ipcMain\.handle\('([a-z-]+)'/g)].map((m) => m[1]),
+    ['get-main-faults', 'dismiss-main-fault', 'open-main-log', 'clear-main-fault']);
+  const clip = cut('main.js', '// --- IPC: clipboard write ---', '// --- IPC: terminal display diagnostics ---');
+  assert.ok(!/main-fault|mainFaults/.test(clip), 'no notice code beside the clipboard handler');
+  assert.match(clip, /ipcMain\.handle\('clipboard-write-text', /);
+});
+
+test('main-faults: no comment still says the main process has no handler for an uncaught error', () => {
+  const read = (file) => fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
+  assert.ok(!read('db.js').includes('nothing in main installs an uncaughtException'));
+  assert.match(read('db.js'), /main-faults\.js/);
+  assert.ok(!read('token-usage.js').includes('main.js has no uncaughtException handler'));
+  assert.match(read('token-usage.js'), /main-faults\.js/);
+  const stdio = cut('main.js', '// A dead stdout must never kill the app.', 'for (const stream of [process.stdout, process.stderr]) {');
+  assert.ok(!stdio.includes('the whole app dies with a modal'));
+  assert.match(stdio, /main-faults\.js/);
+});

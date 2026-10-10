@@ -235,6 +235,14 @@ contextBridge.exposeInMainWorld('api', {
   onUpdaterEvent: (callback) => {
     ipcRenderer.on('updater-event', (_event, type, data) => callback(type, data));
   },
+  // The corner notice of main's faults (public/main-fault-notice.js); against an older main process the four invokes reject, so callers catch.
+  onMainFault: (callback) => {
+    ipcRenderer.on('main-fault', (_event, record) => callback(record));
+  },
+  getMainFaults: () => ipcRenderer.invoke('get-main-faults'),
+  dismissMainFault: (id) => ipcRenderer.invoke('dismiss-main-fault', id),
+  clearMainFault: (id) => ipcRenderer.invoke('clear-main-fault', id),
+  openMainLog: () => ipcRenderer.invoke('open-main-log'),
 
   // MCP bridge (main → renderer)
   onMcpOpenDiff: (callback) => {

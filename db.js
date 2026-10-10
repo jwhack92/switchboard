@@ -208,17 +208,19 @@ function ensureColumns(table, specs) {
  * Tell the user the database is unusable, then throw.
  *
  * This is not a developer-only diagnostic. db.js is required at main.js top
- * level (main.js:171) and nothing in main installs an uncaughtException
- * handler, so a bare throw here is an unhandled exception during main-process
- * module load: Electron's own default handler shows the generic "A JavaScript
- * error occurred in the main process" box with a raw stack (the same crash
- * path main.js:40-46 documents), which tells a user nothing about which table
- * is wrong or where the file is. Refusing to start is right — a database this
- * process cannot use must not be written to — but it has to say why.
+ * level, so a bare throw here is an uncaught error during main-process module
+ * load. main-faults.js, installed right after main.js's reloader line, takes
+ * it: it logs the stack and, this early in a start, shows at most its one
+ * start-up box, titled "A JavaScript error occurred in the main process",
+ * with the raw stack, and then closes the app (the comment above main.js's
+ * stdout guard describes the same path). That tells a user nothing about
+ * which table is wrong or where the file is. Refusing to start is right — a
+ * database this process cannot use must not be written to — but it has to
+ * say why.
  *
  * dialog.showErrorBox is documented as callable before the app `ready` event
  * (node_modules/electron/electron.d.ts:7600-7607) and is the only API that can
- * speak this early, so the named message lands first and Electron's stack box
+ * speak this early, so the named message lands first and the start-up box with the stack, if one is shown,
  * follows it. It is resolved lazily and defensively: under
  * ELECTRON_RUN_AS_NODE — how the tests load this module — require('electron')
  * yields the binary's path, a string with no `dialog`, and on Linux before

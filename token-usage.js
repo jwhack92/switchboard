@@ -7,8 +7,10 @@
 // worker cannot be used.
 //
 // The one rule that shapes everything below: this module can never stop the
-// app. main.js has no uncaughtException handler and calls noteChanged() from a
-// watcher callback with no try/catch, so
+// app, and never throws into main. main.js calls noteChanged() from a watcher
+// callback with no try/catch, and an error that escaped there would be an
+// uncaught error in the main process (main-faults.js logs it and shows the
+// corner notice; before the crash guard it raised Electron's error box), so
 //   - nothing does I/O or loads better-sqlite3 at require time,
 //   - every export is wrapped and answers { error } instead of throwing,
 //   - every worker handler and every timer callback is wrapped the same way,

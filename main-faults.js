@@ -184,8 +184,17 @@ function createMainFaults({ log, app, dialog, broadcast, now = Date.now, stderr 
     const table = sessionId ? bySession : bySignature;
     const key = kind + '\n' + (sessionId || signatureOf(text));
     let record = table.get(key);
-    if (record) {
+    if (record && record.cleared) {
+      made += 1;
+      Object.assign(record, {
+        id: 'f' + made, firstLine, count: 1, firstAt: at, lastAt: at, previousRun: false, dismissed: false,
+        stack: text.slice(0, STACK_MAX), made, sentAt: null, dismissedAt: 0, cleared: false,
+      });
+      record.seen += 1;
+      records.set(record.id, record);
+    } else if (record) {
       record.count += 1;
+      record.seen += 1;
       record.lastAt = at;
       if (record.dismissed && at - record.dismissedAt >= REOPEN_AFTER_MS) record.dismissed = false;
     } else {
@@ -193,19 +202,19 @@ function createMainFaults({ log, app, dialog, broadcast, now = Date.now, stderr 
       record = {
         id: 'f' + made, kind, sessionId, firstLine, count: 1, firstAt: at, lastAt: at,
         previousRun: false, dismissed: false, stack: text.slice(0, STACK_MAX), runErrors: 0,
-        made, table, key, owed: 0, owedTimer: null, sentAt: null, sendTimer: null, dismissedAt: 0,
+        made, table, key, owed: 0, owedTimer: null, sentAt: null, sendTimer: null, dismissedAt: 0, seen: 1, cleared: false,
       };
       table.set(key, record);
       records.set(record.id, record);
       if (table.size > TABLE_CAP) drop(table.values().next().value);
     }
     while (fullAt.length && at - fullAt[0] >= FULL_WINDOW_MS) fullAt.shift();
-    if (record.count <= FULL_PER_RECORD && fullAt.length < FULL_PER_WINDOW) {
+    if (record.seen <= FULL_PER_RECORD && fullAt.length < FULL_PER_WINDOW) {
       fullAt.push(at);
       const head = `[main-fault] kind=${kind} id=${record.id} origin=${origin}` + (sessionId ? ` session=${sessionId}` : '');
       if (none) writeLog('warn', firstLine, head); else writeLog('error', firstLine, head, text);
-      const line = { id: record.id, kind, origin, n: record.count, firstLine, sessionId };
-      if (record.count === 1) line.stack = record.stack;
+      const line = { id: record.id, kind, origin, n: record.seen, firstLine, sessionId };
+      if (record.seen === 1) line.stack = record.stack;
       writeLine('fault', line);
     } else {
       record.owed += 1;
@@ -269,6 +278,15 @@ function createMainFaults({ log, app, dialog, broadcast, now = Date.now, stderr 
     sendNow(record);
   }
 
+  function clear(id) {
+    const record = records.get(id);
+    if (!record) return;
+    records.delete(id);
+    disarm(record, 'sendTimer');
+    if (record.table) record.cleared = true;
+    try { broadcast('main-fault', { ...plain(record), cleared: true }); } catch {}
+  }
+
   function noteWindow(win) {
     try { win.webContents.once('did-finish-load', safe(() => { windowLoaded = true; })); } catch {}
     win.on('session-end', entry(() => { crumb('windows-session-end'); }));
@@ -284,7 +302,7 @@ function createMainFaults({ log, app, dialog, broadcast, now = Date.now, stderr 
 
   /** What flush() does: every pending repeat line (rules L and F), then the line for the calls rule R only counted. */
   function writePending() {
-    for (const record of [...records.values()]) writeRepeat(record);
+    for (const record of new Set([...records.values(), ...bySignature.values(), ...bySession.values()])) writeRepeat(record);
     if (!nested) return;
     const count = nested;
     nested = 0;
@@ -414,6 +432,7 @@ function createMainFaults({ log, app, dialog, broadcast, now = Date.now, stderr 
     report: entry(report),
     list,
     dismiss: entry(dismiss),
+    clear: entry(clear),
     noteWindow: safe(noteWindow),
     noteMainLoaded: safe(noteMainLoaded),
     noteExitPath: entry(noteExitPath),

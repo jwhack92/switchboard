@@ -104,6 +104,8 @@ let cachedAllProjects = [];
 let cachedProjectTree = { projects: [] };    // archived excluded
 let cachedProjectTreeAll = { projects: [] }; // everything
 let activePtyIds = new Set();
+// Live sessions whose Stop stalled or failed, replaced by the running check; another file reads it behind typeof.
+let didNotStopIds = new Set();
 let sortedOrder = []; // [{ projectPath, itemIds: [itemId, ...] }, ...] — single source of truth for sidebar order
 let activeTab = 'sessions';
 let cachedPlans = [];
@@ -1135,6 +1137,12 @@ async function pollActiveSessions() {
     updateRunningIndicators();
     updateTerminalHeader();
   } catch {}
+  try {
+    if (typeof window.api.getStopStates === 'function') {
+      didNotStopIds = new Set(await window.api.getStopStates());
+      updateTerminalHeader();
+    }
+  } catch {}
   scheduleActiveSessionsPoll();
 }
 
@@ -1177,8 +1185,9 @@ function updateRunningIndicators() {
 function updateTerminalHeader() {
   if (!activeSessionId) return;
   const running = activePtyIds.has(activeSessionId);
-  terminalHeaderStatus.className = running ? 'running' : 'stopped';
-  terminalHeaderStatus.textContent = running ? 'Running' : 'Stopped';
+  const didNotStop = running && typeof didNotStopIds !== 'undefined' && didNotStopIds.has(activeSessionId);
+  terminalHeaderStatus.className = didNotStop ? 'did-not-stop' : (running ? 'running' : 'stopped');
+  terminalHeaderStatus.textContent = didNotStop ? 'Did not stop' : (running ? 'Running' : 'Stopped');
   terminalStopBtn.style.display = running ? '' : 'none';
   updatePtyTitle();
 }
@@ -1339,6 +1348,8 @@ async function loadProjects({ resort = false, reason = 'project' } = {}) {
   }
   refreshSidebar({ resort, reason });
   renderDefaultStatus();
+  // The corner notice names a session by the title of its row: one drawn before the rows were loaded gets its title now.
+  if (typeof MainFaultNotice !== 'undefined' && MainFaultNotice && typeof MainFaultNotice.redraw === 'function') MainFaultNotice.redraw();
 }
 
 // Sidebar rendering (slugId, folderId, buildSlugGroup, renderProjects,
