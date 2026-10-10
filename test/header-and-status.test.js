@@ -580,15 +580,18 @@ test('header-and-status (pin): the running check replaces the set with a new Set
 //     way every title is). It is never 'New session'.
 //   - After the next reload of the list: still the typed name, while the
 //     session is pending and after its real row has arrived with the name main
-//     saved. loadProjects does not write the header title at all today; the
-//     title is written by showTerminalHeader, which only showSession calls.
+//     saved. When this was recorded loadProjects did not write the header
+//     title at all: showTerminalHeader wrote it, which only showSession calls.
+//     Since the small fix "the header title follows the row" loadProjects ends
+//     with syncTerminalHeaderName, which writes the row's title.
 //   - So the fault "a session started with a typed name flips to New session"
 //     does NOT show on this path today.
 // One more case is recorded but its header text is only printed, not asserted:
-// a reload whose row carries NO name (the save never reached main). Today the
-// header keeps the typed name because nothing redraws it, while the session's
-// own record loses the name; a header that follows the row would show the row's
-// title there. The assertions of that case hold on both sides of such a fix.
+// a reload whose row carries NO name (the save never reached main). When this
+// was recorded the header kept the typed name because nothing redrew it, while
+// the session's own record lost the name. Since that fix the header follows the
+// row and shows the row's title there. The assertions of that case hold on both
+// sides of the fix.
 
 const TYPED = '  Fix the login  ';
 const TYPED_SHOWN = 'Fix the login';
@@ -823,7 +826,7 @@ test('header-and-status (pin): what the header title shows for a session started
 
     // Recorded, not asserted: a fix that makes the title follow the row
     // changes this text on purpose. Today nothing redraws it.
-    t.diagnostic(`recorded, reload with an unnamed row: header title ${JSON.stringify(page.headerName.textContent)} (today the reload does not redraw it); every write ${JSON.stringify(page.titles)}`);
+    t.diagnostic(`recorded, reload with an unnamed row: header title ${JSON.stringify(page.headerName.textContent)} (the reload redraws it from the row: syncTerminalHeaderName); every write ${JSON.stringify(page.titles)}`);
 
     assert.equal(page.session(id).name, null, 'the record now says what the row says');
     assert.ok(!page.titles.includes('New session'), JSON.stringify(page.titles));
@@ -996,4 +999,518 @@ test('header-and-status: a reload of the list redraws the corner notice once, af
   const CALL = "if (typeof MainFaultNotice !== 'undefined' && MainFaultNotice && typeof MainFaultNotice.redraw === 'function') MainFaultNotice.redraw();";
   assert.equal(app.split(CALL).length - 1, 1);
   assert.match(app, /refreshSidebar\(\{ resort, reason \}\);[^{}]*MainFaultNotice\.redraw\(\);[^{}]*\r?\n\}/, 'after the sidebar was drawn, before loadProjects ends');
+});
+
+// --- Small fixes, commit c (entries D2 and D3) -----------------------------------
+//
+// From this commit on loadProjects DOES write the header title, through
+// syncTerminalHeaderName; the comment above pin 24 and its last printed line
+// say so (corrected with this commit). No assertion of pin 24 changed and it
+// still passes: with a typed name the row's title IS the typed name, so the
+// sync has nothing to write.
+
+/**
+ * The running check with the REAL status bar text behind it.
+ *   loaded    has the sidebar loaded once (the flag the check asks)
+ *   running   the running set before the check
+ *   all       the folders the status bar counts
+ *   info      the status bar's info element, when the test wants its own
+ */
+function bootStatusCheck({ loaded = true, running = [], all = [], info } = {}) {
+  const clock = fakeTimers();
+  const header = fakeHeader();
+  const bar = info || { textContent: '(not drawn yet)' };
+  const page = { clock, header, bar, answer: async () => [] };
+  page.ctx = load(RUNNING_CHECK + '\n' + STATUS_TEXT, {
+    file: APP,
+    globals: {
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+      window: { api: { getActiveSessions: () => page.answer() } },
+      activePtyIds: new Set(running),
+      activeSessionId: 'row-a',
+      document: { querySelectorAll: () => [] },
+      attentionSessions: new Set(),
+      responseReadySessions: new Set(),
+      sessionBusyState: new Map(),
+      gridCards: new Map(),
+      terminalHeaderStatus: header.status,
+      terminalStopBtn: header.stop,
+      updatePtyTitle: () => {},
+      cachedAllProjects: all,
+      cachedProjectTreeAll: { projects: [] },
+      statusBarInfo: bar,
+    },
+  });
+  if (loaded) peek(page.ctx, 'projectsLoadedOnce = true');
+  return page;
+}
+
+test('header-and-status: the status bar loses \'running\' after the check sees no sessions', async () => {
+  const page = bootStatusCheck({ running: ['f0-s0'], all: folders(2) });
+  page.bar.textContent = '1 running' + DOT + '2 sessions' + DOT + '1 folders';
+  page.answer = async () => [];
+  await page.ctx.pollActiveSessions();
+  assert.equal(page.bar.textContent, '2 sessions' + DOT + '1 folders');
+
+  // And it comes back with the next check that sees sessions.
+  page.answer = async () => ['f0-s0', 'f0-s1'];
+  await page.ctx.pollActiveSessions();
+  assert.equal(page.bar.textContent, '2 running' + DOT + '2 sessions' + DOT + '1 folders');
+});
+
+test('header-and-status: a check before the first sidebar load leaves the status bar alone', async () => {
+  const written = [];
+  const info = new Proxy({ textContent: '(not drawn yet)' }, {
+    set(target, key, value) { written.push(key); target[key] = value; return true; },
+  });
+  const page = bootStatusCheck({ loaded: false, running: [], all: [], info });
+  page.answer = async () => ['row-a'];
+  await page.ctx.pollActiveSessions();
+  assert.deepEqual(written, [], 'nothing of the bar was written');
+  assert.equal(info.textContent, '(not drawn yet)');
+  assert.deepEqual(headerState(page.header), HEADER_RUNNING, 'the rest of the check ran');
+
+  // The same page once the sidebar has loaded: the next check draws.
+  peek(page.ctx, 'projectsLoadedOnce = true');
+  await page.ctx.pollActiveSessions();
+  assert.equal(info.textContent, '1 running' + DOT + '0 sessions' + DOT + '0 folders');
+});
+
+test('header-and-status: the first sidebar load switches the redraw on, and from then on every check redraws', async () => {
+  const page = bootTypedName();
+  let redraws = 0;
+  page.app.renderDefaultStatus = () => { redraws++; };
+  await page.app.pollActiveSessions();
+  assert.equal(redraws, 0, 'a check before the first load does not draw');
+  await page.reload();
+  assert.equal(redraws, 1, 'the load draws once itself; the check inside that first load does not');
+  await page.app.pollActiveSessions();
+  assert.equal(redraws, 2, 'a check after the first load draws');
+  await page.reload();
+  assert.equal(redraws, 4, 'a later load: once from its check, once itself');
+});
+
+test('header-and-status: the check is re-armed even if the status bar throws', async () => {
+  let tries = 0;
+  const info = { get textContent() { return ''; }, set textContent(value) { tries++; throw new Error('the status bar broke'); } };
+  const page = bootStatusCheck({ running: [], all: folders(1), info });
+  page.answer = async () => ['row-a'];
+  await assert.doesNotReject(page.ctx.pollActiveSessions());
+  assert.equal(tries, 1, 'the bar was tried once');
+  assert.deepEqual(headerState(page.header), HEADER_RUNNING, 'the header was drawn before the bar was tried');
+  const timers = armed(page);
+  assert.equal(timers.length, 1, 'the check is armed again');
+  assert.equal(timers[0].fn, page.ctx.pollActiveSessions);
+  assert.equal(timers[0].ms, 3000);
+});
+
+test('header-and-status: the header takes the row\'s automatic title after a sidebar reload', async () => {
+  const page = bootTypedName();
+  const id = await page.launch(null); // no typed name
+  assert.equal(page.headerName.textContent, 'New session');
+  page.rows = () => realRow(id, { aiTitle: 'Reply with ok' });
+  await page.reload();
+  assert.equal(page.headerName.textContent, 'Reply with ok');
+  assert.deepEqual(page.titles, ['New session', 'Reply with ok']);
+  await page.reload();
+  assert.deepEqual(page.titles, ['New session', 'Reply with ok'], 'a title that did not change is not written again');
+
+  // A row with no automatic title yet: its summary.
+  const plain = bootTypedName();
+  const other = await plain.launch(null);
+  plain.rows = () => realRow(other, {});
+  await plain.reload();
+  assert.equal(plain.headerName.textContent, 'please fix the login page');
+});
+
+test('header-and-status: the header is left alone when no session is active', async () => {
+  const page = bootTypedName();
+  const id = await page.launch(null);
+  // A task log takes the pane: it clears the active session and writes its own label.
+  page.app.activeSessionId = null;
+  page.headerName.textContent = 'npm test';
+  page.titles.length = 0;
+
+  page.app.syncTerminalHeaderName();
+  page.rows = () => realRow(id, { aiTitle: 'Reply with ok' });
+  await page.reload();
+  for (const none of ['', undefined]) {
+    page.app.activeSessionId = none;
+    page.app.syncTerminalHeaderName();
+  }
+  assert.deepEqual(page.titles, [], 'nothing wrote the title');
+  assert.equal(page.headerName.textContent, 'npm test', 'the task log keeps its label');
+});
+
+test('header-and-status: the header sync does nothing in grid view', async () => {
+  const page = bootTypedName();
+  const id = await page.launch(null);
+  page.rows = () => realRow(id, { aiTitle: 'Reply with ok' });
+  page.app.gridViewActive = true;
+  page.titles.length = 0;
+  await page.reload();
+  page.app.syncTerminalHeaderName();
+  assert.deepEqual(page.titles, [], 'in grid view the header belongs to the grid');
+  assert.equal(page.headerName.textContent, 'New session');
+
+  // Back in the single view the next sync writes it.
+  page.app.gridViewActive = false;
+  page.app.syncTerminalHeaderName();
+  assert.equal(page.headerName.textContent, 'Reply with ok');
+});
+
+test('header-and-status: the header sync reads the session on screen: its name first, the open terminal\'s own record when the list has none, and never an empty title', async () => {
+  const page = bootTypedName();
+  const first = await page.launch('First');
+  const second = await page.launch('Second'); // the one on screen now
+  assert.equal(page.app.activeSessionId, second);
+  assert.equal(page.headerName.textContent, 'Second');
+  page.titles.length = 0;
+
+  // A rename of a row that is NOT on screen leaves the header alone.
+  page.session(first).name = 'First, renamed';
+  page.app.syncTerminalHeaderName();
+  assert.deepEqual(page.titles, []);
+
+  // A rename of the one on screen.
+  page.session(second).name = 'Second, renamed';
+  page.app.syncTerminalHeaderName();
+  assert.equal(page.headerName.textContent, 'Second, renamed');
+
+  // The name taken off again: the automatic title (cleaned the way every title is), then the summary.
+  Object.assign(page.session(second), { name: null, aiTitle: 'Auto <b>title</b>' });
+  page.app.syncTerminalHeaderName();
+  assert.equal(page.headerName.textContent, 'Auto title');
+  page.session(second).aiTitle = null;
+  page.app.syncTerminalHeaderName();
+  assert.equal(page.headerName.textContent, 'New session', 'the summary of a session without a transcript');
+
+  // Nothing to show: the header keeps what it has.
+  page.titles.length = 0;
+  for (const summary of ['', '<b></b>', undefined, null]) {
+    page.session(second).summary = summary;
+    page.app.syncTerminalHeaderName();
+  }
+  assert.deepEqual(page.titles, [], 'an empty title is never written');
+  assert.equal(page.headerName.textContent, 'New session');
+
+  // The list has no record under the id on screen: the open terminal's own record is read.
+  const record = page.session(second);
+  peek(page.app, 'sessionMap').delete(second);
+  record.name = 'From the open terminal';
+  page.app.syncTerminalHeaderName();
+  assert.equal(page.headerName.textContent, 'From the open terminal');
+
+  // Neither has one: nothing is written and nothing throws.
+  page.app.openSessions.delete(second);
+  page.titles.length = 0;
+  assert.doesNotThrow(() => page.app.syncTerminalHeaderName());
+  assert.deepEqual(page.titles, []);
+});
+
+// The rename box (public/sidebar.js startRename, to the end of the file).
+const RENAME_BOX = cut('public/sidebar.js', 'function startRename(summaryEl, session) {');
+
+/**
+ * startRename on a row, with a text box that can be typed into and left.
+ *   sync   what the page has as syncTerminalHeaderName; leave it out for a page without one
+ * Answers the box (`input.value = ...; await input.leave()`) and `order`: every
+ * save and every sync, with the name the record had at that moment.
+ */
+function bootRenameBox(session, sync) {
+  const order = [];
+  const row = { shows: null };
+  const element = () => {
+    const heard = [];
+    return {
+      value: '', className: '', textContent: '', type: '',
+      addEventListener: (type, fn) => { heard.push({ type, fn }); },
+      removeEventListener: () => {},
+      replaceWith: (other) => { row.shows = other; },
+      focus() {}, select() {},
+      leave: () => Promise.all(heard.filter((l) => l.type === 'blur').map((l) => l.fn({}))),
+    };
+  };
+  const globals = {
+    document: { createElement: element },
+    window: { api: { renameSession: async (id, name) => { order.push(['saved', id, name]); return { name }; } } },
+  };
+  if (sync) globals.syncTerminalHeaderName = () => { order.push(['sync', session.name]); sync(); };
+  const ctx = load(RENAME_BOX, { file: 'public/sidebar.js', globals });
+  const summaryEl = element();
+  row.shows = summaryEl;
+  ctx.startRename(summaryEl, session);
+  return { order, input: row.shows };
+}
+
+test('header-and-status: a rename updates the header', async () => {
+  const session = { sessionId: 's1', name: null, aiTitle: 'Auto title', summary: 'first words' };
+  let synced = 0;
+  const box = bootRenameBox(session, () => { synced++; });
+  box.input.value = 'My name';
+  await box.input.leave();
+  assert.deepEqual(box.order, [['saved', 's1', 'My name'], ['sync', 'My name']],
+    'saved first, and the record already has the new name when the header is synced');
+  assert.equal(synced, 1);
+
+  // A box left as it was opened saves nothing and syncs nothing.
+  const untouched = bootRenameBox({ ...session }, () => {});
+  await untouched.input.leave();
+  assert.deepEqual(untouched.order, []);
+
+  // A name that is taken off: the header is synced too (it falls back to the automatic title).
+  const named = { sessionId: 's2', name: 'Mine', aiTitle: 'Auto title', summary: 'first words' };
+  const cleared = bootRenameBox(named, () => {});
+  cleared.input.value = '   ';
+  await cleared.input.leave();
+  assert.deepEqual(cleared.order, [['saved', 's2', null], ['sync', null]]);
+
+  // A page without the function (app.js not loaded): the rename is saved all the same.
+  const alone = bootRenameBox({ sessionId: 's3', name: null, summary: 'x' });
+  alone.input.value = 'Still saved';
+  await assert.doesNotReject(alone.input.leave());
+  assert.deepEqual(alone.order, [['saved', 's3', 'Still saved']]);
+});
+
+// The session-forked listener, cut by a prefix of its first line so the cut
+// still works when the /clear work gives the listener more arguments.
+const FORK_LISTENER = cut(APP, 'window.api.onSessionForked(', 'window.api.onProcessExited(');
+
+test('header-and-status: the session-forked listener writes no header title itself; it moves the session and starts the reload', async () => {
+  const titles = [];
+  const order = [];
+  let forked = null;
+  const record = { sessionId: 'old-id', name: null, aiTitle: 'Auto title' };
+  const rowEl = {
+    classList: classes(),
+    querySelector: (selector) => (selector === '.session-summary' ? { textContent: 'the text of the sidebar row' } : null),
+  };
+  const ctx = load(FORK_LISTENER, {
+    file: APP,
+    globals: {
+      console: { warn() {}, error() {}, log() {} },
+      window: { api: { onSessionForked: (cb) => { forked = cb; }, renameSession: async () => ({}) } },
+      openSessions: new Map([['old-id', { session: record }]]),
+      pendingSessions: new Map(),
+      sessionMap: new Map([['old-id', record]]),
+      activeSessionId: 'old-id',
+      setActiveSession: (id) => { order.push('active ' + id); },
+      rekeySessionMaps: () => {},
+      terminalHeaderId: { textContent: '' },
+      terminalHeaderName: { get textContent() { return ''; }, set textContent(value) { titles.push(value); } },
+      document: { querySelector: () => rowEl, querySelectorAll: () => [] },
+      loadProjects: async () => { order.push('reload'); },
+      pollActiveSessions: () => {},
+    },
+  });
+  forked('old-id', 'new-id');
+  await settled();
+  assert.deepEqual(order, ['active new-id', 'reload']);
+  assert.equal(ctx.terminalHeaderId.textContent, 'new-id', 'the id in the header is still the listener\'s to write');
+  assert.equal(rowEl.classList.contains('active'), true, 'the row is still marked as the one on screen');
+  assert.deepEqual(titles, [], 'the title comes from syncTerminalHeaderName at the end of the reload, not from here');
+});
+
+test('header-and-status: the header title is written only by showTerminalHeader, the task log and syncTerminalHeaderName; the write in the session-detected listener is the one allowed by name', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const { ROOT } = require('../test-support/source-cut');
+  const WRITE = /terminalHeaderName\s*\.\s*textContent\s*=(?!=)/g;
+  const writesIn = (text) => (text.match(WRITE) || []).length;
+
+  // Every script under public/, folders included.
+  const publicDir = path.join(ROOT, 'public');
+  const writers = {};
+  let lookups = 0;
+  for (const name of fs.readdirSync(publicDir, { recursive: true })) {
+    if (!String(name).endsWith('.js')) continue;
+    const text = fs.readFileSync(path.join(publicDir, String(name)), 'utf8');
+    if (writesIn(text)) writers[String(name).split(path.sep).join('/')] = writesIn(text);
+    lookups += text.split('terminal-header-name').length - 1;
+  }
+  assert.deepEqual(writers, { 'app.js': 3, 'task-runner.js': 1 });
+  assert.equal(lookups, 1, 'one script looks the element up (app.js), so it is written under no other name');
+
+  // app.js: the first draw, the sync, and the listener nothing sends to.
+  assert.equal(writesIn(cut(APP, 'async function showTerminalHeader(session) {', 'function syncTerminalHeaderName() {')), 1, 'showTerminalHeader');
+  assert.equal(writesIn(cut(APP, 'function syncTerminalHeaderName() {', '// Every call into the task runner from this file and from sidebar.js is')), 1, 'syncTerminalHeaderName');
+  const detected = cut(APP, 'window.api.onSessionDetected(', 'window.api.onSessionForked(');
+  assert.equal(writesIn(detected), 1, 'the session-detected listener');
+  assert.ok(detected.includes("terminalHeaderName.textContent = 'New session';"), 'its line is as it was: nothing sends to this listener');
+  assert.equal(writesIn(FORK_LISTENER), 0, 'the session-forked listener');
+
+  // The task log: its own label, in showTaskLog.
+  const taskLog = cut('public/task-runner.js', 'async function showTaskLog(projectPath, label) {');
+  assert.equal(writesIn(taskLog), 1, 'showTaskLog');
+  // And it clears the active session BEFORE it writes its label. The sync knows
+  // "a task log has the pane" only as "no session is active": this is that link.
+  const cleared = taskLog.indexOf('setActiveSession(null);');
+  const labelled = taskLog.indexOf('terminalHeaderName.textContent = label;');
+  assert.ok(cleared !== -1, 'showTaskLog clears the active session');
+  assert.ok(labelled !== -1, 'showTaskLog writes its label');
+  assert.ok(cleared < labelled, 'the active session is cleared before the label is written');
+});
+
+// --- Whole-page cases: the real listener, the real reload and the real sync together ---
+
+/**
+ * The real session-forked listener on a page of bootTypedName. It gets the
+ * page's own maps and header elements, and its reload and its running check are
+ * the page's. Its globals are the ones the listener test above gives, and no more.
+ *   rowEl   what the listener's own lookup of the sidebar row finds
+ * Answers what main's event calls: fork(oldId, newId).
+ */
+function bootForkOn(page, rowEl) {
+  let forked = null;
+  const ctx = load(FORK_LISTENER, {
+    file: APP,
+    globals: {
+      console: { warn() {}, error() {}, log() {} },
+      window: { api: {
+        onSessionForked: (cb) => { forked = cb; },
+        renameSession: async (id, name) => { page.renames.push([id, name]); return { name }; },
+      } },
+      openSessions: page.app.openSessions,
+      pendingSessions: page.app.pendingSessions,
+      sessionMap: peek(page.app, 'sessionMap'),
+      activeSessionId: null, // set from the page at the moment of the event, below
+      setActiveSession: (id) => { page.app.activeSessionId = id; },
+      rekeySessionMaps: () => {},
+      terminalHeaderId: page.headerId,
+      terminalHeaderName: page.headerName,
+      document: { querySelector: () => rowEl, querySelectorAll: () => [] },
+      loadProjects: () => page.app.loadProjects(),
+      pollActiveSessions: () => page.app.pollActiveSessions(),
+    },
+  });
+  return (oldId, newId) => {
+    ctx.activeSessionId = page.app.activeSessionId;
+    forked(oldId, newId);
+  };
+}
+
+test('header-and-status: a fork or a plan-accept of the session on screen, through the real listener and the real reload: the title is the record\'s own under the new id, never the text of the sidebar row', async () => {
+  const rowEl = {
+    classList: classes(),
+    querySelector: (selector) => (selector === '.session-summary' ? { textContent: 'the text of the sidebar row' } : null),
+  };
+
+  // A named session. Main's list has no row yet for the new id.
+  const page = bootTypedName();
+  const oldId = await page.launch();
+  const fork = bootForkOn(page, rowEl);
+  page.titles.length = 0;
+  page.rows = () => [];
+  fork(oldId, 'forked-1');
+  await settled();
+  assert.equal(page.app.activeSessionId, 'forked-1');
+  assert.equal(page.headerId.textContent, 'forked-1', 'the id line shows the new id');
+  assert.equal(page.session(oldId), undefined, 'the record left the old id');
+  assert.equal(page.session('forked-1').name, TYPED_SHOWN, 'and is listed under the new one, with its name');
+  assert.deepEqual(page.renames[page.renames.length - 1], ['forked-1', TYPED_SHOWN], 'the name was saved under the new id');
+  assert.deepEqual(page.titles, [], 'the header already shows the record\'s own title: nothing is written, the row\'s text least of all');
+  assert.equal(page.headerName.textContent, TYPED_SHOWN);
+
+  // The real row arrives, with the saved name and an automatic title: the name comes first.
+  page.rows = () => realRow('forked-1', { name: TYPED_SHOWN, aiTitle: 'Login page fix' });
+  await page.reload();
+  assert.deepEqual(page.titles, []);
+  assert.equal(page.headerName.textContent, TYPED_SHOWN);
+
+  // A session without a name (a plan-accept sends the same two arguments).
+  const plain = bootTypedName();
+  const first = await plain.launch(null);
+  const accept = bootForkOn(plain, rowEl);
+  plain.titles.length = 0;
+  plain.rows = () => [];
+  accept(first, 'accepted-1');
+  await settled();
+  assert.equal(plain.headerId.textContent, 'accepted-1');
+  assert.deepEqual(plain.titles, [], 'no row yet: the header keeps the record\'s summary');
+  assert.equal(plain.headerName.textContent, 'New session');
+  // Its row arrives with the automatic title: written once, by the reload.
+  plain.rows = () => realRow('accepted-1', { aiTitle: 'Reply with ok' });
+  await plain.reload();
+  await plain.reload();
+  assert.deepEqual(plain.titles, ['Reply with ok']);
+});
+
+test('header-and-status: a window reload with a restored session: nothing is drawn before the first load, and that load writes the row\'s title', async () => {
+  const page = bootTypedName();
+  let bar = 0;
+  page.app.renderDefaultStatus = () => { bar++; };
+  // The script starts with the id the window kept (sessionStorage). No terminal is open yet and no list is loaded.
+  page.app.activeSessionId = 'restored-1';
+  await page.app.pollActiveSessions();
+  assert.equal(bar, 0, 'a check before the first load leaves the status bar alone');
+  assert.doesNotThrow(() => page.app.syncTerminalHeaderName(), 'neither the list nor an open terminal has the id yet');
+  assert.deepEqual(page.titles, [], 'and nothing is written');
+
+  page.rows = () => realRow('restored-1', { aiTitle: 'Restored title' });
+  await page.reload();
+  assert.equal(bar, 1, 'the first load draws the status bar, once');
+  assert.deepEqual(page.titles, ['Restored title'], 'the row\'s title, written once');
+  assert.equal(page.headerBox.style.display, 'none', 'the sync shows nothing: showing the header is the first draw\'s');
+
+  // An id the list never brings (its transcript is gone): nothing is written and nothing throws.
+  const gone = bootTypedName();
+  gone.app.activeSessionId = 'gone-1';
+  await gone.reload();
+  assert.deepEqual(gone.titles, []);
+});
+
+test('header-and-status: a plain terminal on screen: the header follows its rename and the next reload, and reads Terminal without a name', async () => {
+  const page = bootTypedName();
+  // The row main builds for a live plain terminal (session-cache.js): summary 'Terminal', type 'terminal'.
+  const terminalRow = (fields) => realRow('term-1', { summary: 'Terminal', firstPrompt: '', messageCount: 0, type: 'terminal', ...fields });
+  page.rows = () => terminalRow({});
+  await page.reload();
+  const record = page.session('term-1');
+  page.app.createTerminalEntry(record);
+  page.pane.showSession('term-1');
+  await settled();
+  assert.equal(page.headerName.textContent, 'Terminal');
+
+  // Renamed in the sidebar: the rename box sets the record's name and calls the sync.
+  record.name = 'Build shell';
+  page.app.syncTerminalHeaderName();
+  assert.equal(page.headerName.textContent, 'Build shell');
+
+  // The reload after it: main's row carries the saved name (small fixes, commit a).
+  page.rows = () => terminalRow({ name: 'Build shell' });
+  await page.reload();
+  assert.equal(page.session('term-1'), record, 'the list holds the same record');
+  assert.equal(record.name, 'Build shell');
+  assert.equal(page.headerName.textContent, 'Build shell');
+
+  // The name taken off again: the header reads what the row reads.
+  page.rows = () => terminalRow({});
+  await page.reload();
+  assert.equal(page.headerName.textContent, 'Terminal');
+  assert.deepEqual(page.titles, ['Terminal', 'Build shell', 'Terminal']);
+});
+
+test('header-and-status: a rename saved while a reload is on its way: header and row agree when that reload ends, and the next reload brings the name', async () => {
+  const page = bootTypedName();
+  const id = await page.launch(null);
+  page.rows = () => realRow(id, { aiTitle: 'Old title' });
+  await page.reload();
+  assert.equal(page.headerName.textContent, 'Old title');
+
+  // A reload starts: its rows are read now, before the rename is saved.
+  const onItsWay = page.app.loadProjects();
+  page.rows = () => realRow(id, { aiTitle: 'Old title', name: 'New name' }); // what main answers from now on
+  page.session(id).name = 'New name';
+  page.app.syncTerminalHeaderName();
+  assert.equal(page.headerName.textContent, 'New name');
+
+  await onItsWay;
+  await settled();
+  assert.equal(page.session(id).name, null, 'the record took the fields of the rows that were read before the save');
+  assert.equal(page.headerName.textContent, 'Old title', 'and the header says what the row says, never a title the row does not show');
+
+  await page.reload();
+  assert.equal(page.session(id).name, 'New name');
+  assert.equal(page.headerName.textContent, 'New name');
 });

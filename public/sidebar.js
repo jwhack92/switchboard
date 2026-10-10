@@ -1042,6 +1042,7 @@ function startRename(summaryEl, session) {
     const nameToSave = (newName && newName !== fallback) ? newName : null;
     await window.api.renameSession(session.sessionId, nameToSave);
     session.name = nameToSave;
+    if (typeof syncTerminalHeaderName === 'function') syncTerminalHeaderName();
 
     const newSummary = document.createElement('div');
     newSummary.className = 'session-summary';

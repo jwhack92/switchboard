@@ -449,8 +449,6 @@ window.api.onSessionForked((oldId, newId) => {
     if (item) {
       document.querySelectorAll('.session-item.active').forEach(el => el.classList.remove('active'));
       item.classList.add('active');
-      const summary = item.querySelector('.session-summary');
-      if (summary) terminalHeaderName.textContent = summary.textContent;
     }
   });
   pollActiveSessions();
@@ -1123,6 +1121,8 @@ terminalStopBtn.addEventListener('click', () => {
 const POLL_FAST_MS = 3000;
 const POLL_IDLE_MS = 30000;
 let pollTimer = null;
+// True once loadProjects has filled the lists. Before that the status bar would read "0 sessions" from empty lists.
+let projectsLoadedOnce = false;
 
 function scheduleActiveSessionsPoll() {
   if (pollTimer) clearTimeout(pollTimer);
@@ -1136,6 +1136,7 @@ async function pollActiveSessions() {
     activePtyIds = new Set(ids);
     updateRunningIndicators();
     updateTerminalHeader();
+    if (projectsLoadedOnce) { try { renderDefaultStatus(); } catch {} }
   } catch {}
   try {
     if (typeof window.api.getStopStates === 'function') {
@@ -1347,7 +1348,9 @@ async function loadProjects({ resort = false, reason = 'project' } = {}) {
     await hydrateProjectTasks([cachedProjects, cachedAllProjects], extraPaths);
   }
   refreshSidebar({ resort, reason });
+  projectsLoadedOnce = true;
   renderDefaultStatus();
+  syncTerminalHeaderName();
   // The corner notice names a session by the title of its row: one drawn before the rows were loaded gets its title now.
   if (typeof MainFaultNotice !== 'undefined' && MainFaultNotice && typeof MainFaultNotice.redraw === 'function') MainFaultNotice.redraw();
 }
@@ -1481,6 +1484,21 @@ async function showTerminalHeader(session) {
   } catch {
     terminalHeaderShell.style.display = 'none';
   }
+}
+
+// The only writer of the header title after the first draw. The first draw is
+// showTerminalHeader; the task log writes its own label (public/task-runner.js
+// showTaskLog). Called at the end of loadProjects and by the sidebar's rename.
+// Does nothing in grid view and while a task log has the pane, where the
+// header belongs to something else.
+function syncTerminalHeaderName() {
+  if (!activeSessionId) return;
+  if (gridViewActive) return;
+  const s = sessionMap.get(activeSessionId) || openSessions.get(activeSessionId)?.session;
+  if (!s) return;
+  const title = cleanDisplayName(s.name || s.aiTitle || s.summary);
+  if (!title || title === terminalHeaderName.textContent) return;
+  terminalHeaderName.textContent = title;
 }
 
 // Every call into the task runner from this file and from sidebar.js is
