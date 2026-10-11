@@ -6245,3 +6245,24 @@ test('browser: a plain Ultracode click on a busy session reads the turn marker a
   await h.advance(6000);
   assert.deepEqual(h.sent, []);
 });
+
+test('browser: a second click while a busy click reads the marker again does nothing, even once the session has turned idle', async () => {  // K-1
+  const { h } = await bootWaiting();
+  await h.click('primary');
+  await h.advance(100);
+  h.busyEvent(false);
+  await h.advance(10);
+  await h.click('primary');
+  assert.deepEqual(h.sent, []);
+  await h.advance(1000);
+  assert.equal(h.sent.filter(([, text]) => text === REQUEST_LINE).length, 1);
+  assert.equal(h.inputs().clickNote, '');
+});
+
+test('browser: a re-key while a busy click reads the marker again leaves no id behind', async () => {  // M-2
+  const { h } = await bootWaiting();
+  await h.click('primary');
+  h.listeners.fork(SID, NEW_SID);
+  await h.advance(1000);
+  assert.deepEqual(JSON.parse(h.run('JSON.stringify([...handoffRt.rereading])')), []);
+});

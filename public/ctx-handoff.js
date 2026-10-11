@@ -1894,14 +1894,16 @@ async function handoffTypeRequest(id, which) {
   // starts under a spinner that never went off sends no busy event: read the
   // marker again now and decide again, with no box (part M). One click at a
   // time: a second click while the read is on its way does nothing.
+  // The id is taken before the wait: a re-key meanwhile changes entry.id.
+  const rereadId = entry.id;
+  if (handoffRt.rereading.has(rereadId)) return;
   if (!control.override && handoffInputs(entry.id).busy === true) {
-    if (handoffRt.rereading.has(entry.id)) return;
-    handoffRt.rereading.add(entry.id);
+    handoffRt.rereading.add(rereadId);
     try {
       await handoffDelay(HANDOFF_MIN_READ_GAP_MS);
       await handoffRefresh(entry.id);
     } finally {
-      handoffRt.rereading.delete(entry.id);
+      handoffRt.rereading.delete(rereadId);
     }
     const gate = typingGate(handoffInputs(entry.id));
     control = handoffTypingControl(entry.id, which);
@@ -2066,14 +2068,16 @@ async function handoffToggleUltracode(id) {
   // starts under a spinner that never went off sends no busy event: read the
   // marker again now and decide again, with no box (part M). One click at a
   // time: a second click while the read is on its way does nothing.
+  // The id is taken before the wait: a re-key meanwhile changes entry.id.
+  const rereadId = entry.id;
+  if (handoffRt.rereading.has(rereadId)) return;
   if (!control.override && handoffInputs(entry.id).busy === true) {
-    if (handoffRt.rereading.has(entry.id)) return;
-    handoffRt.rereading.add(entry.id);
+    handoffRt.rereading.add(rereadId);
     try {
       await handoffDelay(HANDOFF_MIN_READ_GAP_MS);
       await handoffRefresh(entry.id);
     } finally {
-      handoffRt.rereading.delete(entry.id);
+      handoffRt.rereading.delete(rereadId);
     }
     const gate = typingGate(handoffInputs(entry.id));
     control = handoffUltracodeControl(entry.id);
