@@ -10,9 +10,12 @@
 // through window.PromptScreen. ultracodeScreen in ctx-handoff.js is the other
 // reader of program text.
 //
-// Every mark that is missing or changed moves the answer away from 'empty', so
-// a new program version can only make the buttons ask more, never type on a
-// screen that is not an empty prompt.
+// Every mark that is missing or changed moves the answer away from 'empty',
+// except WORKING: a working line the mark does not match is not seen, and the
+// screen reads as if no turn ran. Since a busy session whose turn has ended is
+// typed into on the screen's word (ctx-handoff.js typingGate, part M), that
+// mark is the last guard against a turn the state file has not caught up with:
+// read it again at every Claude Code version.
 
 (function () {
   'use strict';

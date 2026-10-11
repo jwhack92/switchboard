@@ -12,7 +12,9 @@
 // the one box a click gets (handoffConfirmTyping) when the gate asks first: the
 // session has not reported the end of its turn, this window has not yet been
 // told whether the session is busy (after a reload), or the session's screen
-// does not show an empty prompt. A session that is busy is never typed into.
+// does not show an empty prompt. A busy session is never typed into while its
+// turn runs; once the hook has recorded the end of its turn (a workflow keeps
+// the spinner on after it), the same checks as for an idle one decide.
 //
 // The same files say whether a session has ultracode on. The header has a
 // button that switches it by typing the /effort command, through the same
@@ -335,7 +337,11 @@ function typingGate(input) {
     reason = 'Session did not stop';
     advice = 'It takes no typing. Press Stop to try once more.';
   } else if (o.pendingRow) reason = 'Session is still starting';
-  else if (o.busy === true) reason = 'Session is working';
+  // Busy refuses only while the turn has not ended. Claude Code keeps its
+  // spinner title on after a turn ends while a workflow is pending, so busy
+  // stays true for the whole run; `ended` (the hook's Stop after the last
+  // prompt, no spinner after it, later than our last line) says it is over.
+  else if (o.busy === true && !ended) reason = 'Session is working';
   else if (!o.running) reason = 'Session is not running';
   else if (o.lineOnWay === true) reason = 'Waiting for the session to confirm the Ultracode switch';
   else if (screenState === 'question') {
@@ -436,10 +442,12 @@ function chooseHeaderNote(notes, nowMs) {
  *                             show an empty prompt: a click asks first (the one
  *                             box, handoffConfirmTyping)
  *   disabled                  never typed into: shown in another window, did
- *                             not stop, still starting, busy, not running, an
- *                             Ultracode switch on its way, or a question on the
- *                             screen. `title` says which.
- * busy === true is never overridable.
+ *                             not stop, still starting, busy with its turn not
+ *                             ended, not running, an Ultracode switch on its
+ *                             way, or a question on the screen. `title` says
+ *                             which.
+ * busy === true with the turn not ended is never overridable; with the turn
+ * ended it is no reason at all (a workflow keeps the spinner on).
  *
  * `busyKnown` says whether `busy` can be believed. Main sends cli-busy-state
  * only when a session CHANGES between busy and idle, and a window that has
@@ -853,6 +861,7 @@ const handoffRt = {
   ctxDirPromise: null,
   inflight: new Map(), // sessionId → Promise of the read in progress
   lastReadAtMs: new Map(), // sessionId → when its last read was started
+  rereading: new Set(), // sessionId → a busy click's re-read is on its way
   els: null,           // header elements, once built
   names: null,         // the names Continue has given (handoffNameStore), once asked for
   logged: new Set(),
@@ -1044,18 +1053,23 @@ function handoffDidNotStop(id) {
 }
 
 // Everything buttonModel, ultracodeModel and chipState take, for one session.
-// The three flags that can only DISABLE typing fail closed: each starts as "do
-// not type" and is lowered only by a successful read of the app's own value.
-// That covers a global that throws on access (temporal dead zone), one that
-// does not exist at all, and a missing window._isOwnedElsewhere. (`running`
-// fails closed separately: without activePtyIds it is false, and nothing is
-// typed into a session that is not running.)
+// `pendingRow` and `ownedElsewhere` can only DISABLE typing, and fail closed:
+// each starts as "do not type" and is lowered only by a successful read of the
+// app's own value. That covers a global that throws on access (temporal dead
+// zone), one that does not exist at all, and a missing
+// window._isOwnedElsewhere. `busy` starts as true too, but since part M true
+// refuses only while the turn has not ended (typingGate); with neither source
+// read, `busyKnown` is false and a click asks first. (`running` fails closed
+// separately: without activePtyIds it is false, and nothing is typed into a
+// session that is not running.)
 //
 // `busy` is the app's own flag OR main's (when main reports one): the app's is
 // kept up by events and is the fresher of the two, main's is the only one that
 // knows about a turn already running when this window loaded. Either saying
-// "busy" is enough not to type. `busyKnown` (see buttonModel) is true once
-// either source has actually spoken; with neither, the click asks first.
+// "busy" is enough to refuse while the turn has not ended; once the hook has
+// recorded its end, busy is no reason and the screen decides (part M).
+// `busyKnown` (see buttonModel) is true once either source has actually
+// spoken; with neither, the click asks first.
 function handoffInputs(id) {
   const entry = handoffRt.cache.get(id) || null;
   const nowMs = Date.now();
@@ -1857,8 +1871,10 @@ function handoffSetClickNote(entry, text) {
   handoffRenderHeader();
 }
 
-function handoffNotTypedNote(left, gate, control) {
-  const changed = 'Not typed. The session changed while the box was open.';
+function handoffNotTypedNote(left, gate, control, { boxOpen = true } = {}) {
+  const changed = boxOpen
+    ? 'Not typed. The session changed while the box was open.'
+    : 'Not typed. The session changed.';
   if (left) return changed;
   if (!gate.allowed) {
     return gate.reason === 'Session is working' || gate.reason === 'Session is asking you something'
@@ -1874,6 +1890,28 @@ async function handoffTypeRequest(id, which) {
   if (!control || !control.enabled) return;
   const unreadable = handoffScreenRead(entry.id) === null;
   let blindOk = false;
+  // A busy session is typed into on its turn marker alone, and a turn that
+  // starts under a spinner that never went off sends no busy event: read the
+  // marker again now and decide again, with no box (part M). One click at a
+  // time: a second click while the read is on its way does nothing.
+  if (!control.override && handoffInputs(entry.id).busy === true) {
+    if (handoffRt.rereading.has(entry.id)) return;
+    handoffRt.rereading.add(entry.id);
+    try {
+      await handoffDelay(HANDOFF_MIN_READ_GAP_MS);
+      await handoffRefresh(entry.id);
+    } finally {
+      handoffRt.rereading.delete(entry.id);
+    }
+    const gate = typingGate(handoffInputs(entry.id));
+    control = handoffTypingControl(entry.id, which);
+    const left = handoffActiveId() !== entry.id || handoffHeaderOff(entry.id);
+    const note = handoffNotTypedNote(left, gate, control, { boxOpen: false });
+    if (note) {
+      handoffSetClickNote(entry, note);
+      return;
+    }
+  }
   if (control.override) {
     if (!await handoffConfirmTyping(control.gate, REQUEST_LINE)) return;
     // The question was open for as long as the user took: the session may have
@@ -2024,6 +2062,29 @@ async function handoffToggleUltracode(id) {
   const target = control.target;
   const unreadable = handoffScreenRead(entry.id) === null;
   let blindOk = false;
+  // A busy session is typed into on its turn marker alone, and a turn that
+  // starts under a spinner that never went off sends no busy event: read the
+  // marker again now and decide again, with no box (part M). One click at a
+  // time: a second click while the read is on its way does nothing.
+  if (!control.override && handoffInputs(entry.id).busy === true) {
+    if (handoffRt.rereading.has(entry.id)) return;
+    handoffRt.rereading.add(entry.id);
+    try {
+      await handoffDelay(HANDOFF_MIN_READ_GAP_MS);
+      await handoffRefresh(entry.id);
+    } finally {
+      handoffRt.rereading.delete(entry.id);
+    }
+    const gate = typingGate(handoffInputs(entry.id));
+    control = handoffUltracodeControl(entry.id);
+    const left = handoffActiveId() !== entry.id || handoffHeaderOff(entry.id);
+    let note = handoffNotTypedNote(left, gate, control, { boxOpen: false });
+    if (!note && control.target !== target) note = 'Not typed. Ultracode is already ' + target + '.';
+    if (note) {
+      handoffSetClickNote(entry, note);
+      return;
+    }
+  }
   if (control.override) {
     if (!await handoffConfirmTyping(control.gate, ULTRACODE_TEXT[target])) return;
     // As in handoffTypeRequest: the question was open for as long as the user

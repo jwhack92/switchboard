@@ -733,7 +733,7 @@ test('buttonModel: rule 3, Continue stays enabled when typing is refused; Update
   const cases = [
     ['owned elsewhere', { ownedElsewhere: true }, WHY_OWNED],
     ['pending row', { pendingRow: true }, WHY_PENDING],
-    ['busy', { busy: true }, WHY_BUSY],
+    ['busy', { busy: true, lastBusyAtMs: STOP_MS + 1 }, WHY_BUSY],
   ];
   for (const [name, over, why] of cases) {
     const m = buttonModel(buttonArgs({ state: writtenState(), handoffReadable: true, ...over }));
@@ -922,7 +922,7 @@ test('buttonModel: rule 5, each disabled reason on Hand off', () => {
   const cases = [
     ['owned elsewhere', { ownedElsewhere: true }, WHY_OWNED],
     ['pending row', { pendingRow: true }, WHY_PENDING],
-    ['busy', { busy: true }, WHY_BUSY],
+    ['busy', { busy: true, state: hookState({ last_prompt_at: 1020 }) }, WHY_BUSY],
     ['busy, spinner after the last stop', { busy: true, lastBusyAtMs: STOP_MS + 60000 }, WHY_BUSY],
   ];
   for (const [name, over, why] of cases) {
@@ -963,6 +963,7 @@ test('buttonModel: override, Hand off asks first for every way the turn can be "
   }
 });
 
+// Every case here is a turn that has not ended. A busy session whose turn has ended goes by the screen (part M, the 'typingGate: busy, turn ended' tests).
 test('buttonModel: override, a busy session is never typed into, with or without a turn marker', () => {
   for (const [name, over] of NOT_ENDED) {
     const hand = buttonModel(buttonArgs({ ...over, busy: true }));
@@ -1226,7 +1227,7 @@ test('buttonModel: busyKnown never turns a disabled control into an override', (
   const cases = [
     ['owned elsewhere', { ownedElsewhere: true }, WHY_OWNED],
     ['pending row', { pendingRow: true }, WHY_PENDING],
-    ['busy', { busy: true }, WHY_BUSY],
+    ['busy', { busy: true, lastBusyAtMs: STOP_MS + 1 }, WHY_BUSY],
   ];
   for (const [name, over, why] of cases) {
     const m = buttonModel(buttonArgs({ ...over, busyKnown: false }));
@@ -2248,7 +2249,7 @@ test('browser: a plain click types the line, then Enter as a separate write, and
 
 test('browser: a click on a disabled button types nothing', async () => {
   const h = await bootEnded();
-  h.setBusy(true);
+  h.busyEvent(true);
   await h.tick();
   assert.equal(h.header().primaryEnabled, false);
   await h.click('primary');
@@ -2448,7 +2449,7 @@ test('browser: readCtxState with a boolean busy replaces the ask-first rule', as
 
 test('browser: readCtxState saying busy disables typing although this window has no busy flag of its own', async () => {
   const h = boot({ readCtxState: true });
-  h.knobs.ctxReply = () => ctxReply(h, { busy: true });
+  h.knobs.ctxReply = () => ctxReply(h, { busy: true, state: endedState(h, { last_prompt_at: h.sec - 10 }) });
   await h.refresh();
   assert.equal(h.run(`!!sessionBusyState.get('${SID}')`), false, 'the app map is empty after a load');
   assert.equal(h.inputs().busy, true);
@@ -2757,7 +2758,7 @@ test('browser: main\'s reply without a busy key stays "not told"; with one it is
   assert.equal(told.inputs().busyKnown, false);
 
   const busy = boot({ readCtxState: true });
-  busy.knobs.ctxReply = () => mainReply(busy, { busy: true });
+  busy.knobs.ctxReply = () => mainReply(busy, { busy: true, state: endedState(busy, { last_prompt_at: busy.sec - 10 }) });
   await busy.refresh();
   assert.equal(busy.inputs().busy, true);
   assert.equal(busy.header().primaryEnabled, false);
@@ -3287,6 +3288,14 @@ const ON_LINE = 'Ultracode on (this session only): workflows may run. Effort sta
 const OLD_ON_LINE = 'Set effort level to ultracode (this session only): workflows may run';
 const OFF_LINE = 'Ultracode off. Effort stays high.';
 
+// Which of gateCases' combinations have a turn that ended (part M), from the
+// fixtures' own numbers: a Stop at 1010 s that is after the prompt (hookState()
+// and hookState({ last_prompt_at: null }); null, oldHookState() and the Stop at
+// 900 s are not), no spinner after it (STOP_MS + 1 is after it, STOP_MS - 1 is
+// not), and no line typed after it (STOP_MS + 5 is after it, STOP_MS - 5 is not).
+// Busy refuses only where this is false.
+const endedFor = (args) => !!args.state && args.state.last_stop_at === 1010
+  && args.lastBusyAtMs !== STOP_MS + 1 && args.request.atMs !== STOP_MS + 5;
 // Every combination the gate looks at.
 function gateCases() {
   const states = [hookState(), null, oldHookState(), hookState({ last_stop_at: 900 }), hookState({ last_prompt_at: null })];
@@ -3326,7 +3335,7 @@ test('typingGate: Hand off is exactly what the gate says, in every combination',
     if (!args.running) {
       assert.equal(model.visible, false);
       assert.equal(gate.allowed, false);
-      assert.equal(gate.why, args.ownedElsewhere ? 'Shown in another window' : args.pendingRow ? 'Session is still starting' : args.busy === true ? 'Session is working' : 'Session is not running');
+      assert.equal(gate.why, args.ownedElsewhere ? 'Shown in another window' : args.pendingRow ? 'Session is still starting' : args.busy === true && !endedFor(args) ? 'Session is working' : 'Session is not running');
       continue;
     }
     assert.equal(model.primary.kind, 'handoff');
@@ -3409,7 +3418,7 @@ test('ultracodeModel: where typing is not allowed it is disabled, with the reaso
   const reasons = [
     [{ ownedElsewhere: true }, 'Shown in another window'],
     [{ pendingRow: true }, 'Session is still starting'],
-    [{ busy: true }, 'Session is working'],
+    [{ busy: true, lastBusyAtMs: STOP_MS + 1 }, 'Session is working'],
   ];
   for (const [over, why] of reasons) {
     const model = ultracodeModel(ultraArgs({ ultracodeValue: true, ...over }));
@@ -4002,7 +4011,8 @@ test('browser: a no, or an answer that is not exactly true, types nothing', asyn
 
 test('browser: a session that went busy while the question was open is not typed into', async () => {
   const h = await bootUltra(true, { reloaded: true });
-  h.run(`confirmDialog = async () => { sessionBusyState.set('${SID}', true); return true; }`);
+  h.knobs.duringQuestion = () => h.busyEvent(true);
+  h.run('confirmDialog = async () => { __knobs.duringQuestion(); return true; }');
   await clickUltra(h);
   await h.advance(6000);
   assert.deepEqual(h.sent, []);
@@ -4683,7 +4693,7 @@ test('ctx-handoff: typingGate asks first unless the screen says empty', () => {
 });
 
 test('ctx-handoff: typingGate names one reason, the stronger first', () => {
-  const all = { ownedElsewhere: true, didNotStop: true, pendingRow: true, busy: true, lineOnWay: true, screen: scr('question') };
+  const all = { ownedElsewhere: true, didNotStop: true, pendingRow: true, busy: true, lastBusyAtMs: STOP_MS + 1, lineOnWay: true, screen: scr('question') };
   const refusals = [
     ['ownedElsewhere', 'Shown in another window', ''],
     ['didNotStop', 'Session did not stop', 'It takes no typing. Press Stop to try once more.'],
@@ -4725,7 +4735,7 @@ test('ctx-handoff: typingGate names one reason, the stronger first', () => {
 
 test('ctx-handoff: gateText builds the tooltip, the asks-first title, the box and the note from the one reason', () => {
   const asking = typingGate(buttonArgs({ screen: scr('question') }));
-  const working = typingGate(buttonArgs({ busy: true }));
+  const working = typingGate(buttonArgs({ busy: true, lastBusyAtMs: STOP_MS + 1 }));
   const stuck = typingGate(buttonArgs({ didNotStop: true }));
   const waiting = typingGate(buttonArgs({ lineOnWay: true }));
   const draft = typingGate(buttonArgs({ screen: scr('draft') }));
@@ -5088,7 +5098,8 @@ test('browser: a question that opens while the in-page box is up stops the typin
 test('browser: a yes that types nothing says why in the header note', async () => {
   // The session started working.
   const busy = await bootReloaded();
-  busy.run('confirmDialog = async () => { sessionBusyState.set("' + SID + '", true); return true; }');
+  busy.knobs.duringQuestion = () => busy.busyEvent(true);
+  busy.run('confirmDialog = async () => { __knobs.duringQuestion(); return true; }');
   await busy.click('primary');
   await busy.advance(1000);
   assert.deepEqual(busy.sent, []);
@@ -5134,7 +5145,8 @@ test('browser: a yes that types nothing says why in the header note', async () =
 
   // A click that then types clears the note of the click before it.
   const again = await bootReloaded();
-  again.run('window.__askBusy = true; confirmDialog = async () => { if (window.__askBusy) sessionBusyState.set("' + SID + '", true); return true; }');
+  again.knobs.duringQuestion = () => again.busyEvent(true);
+  again.run('window.__askBusy = true; confirmDialog = async () => { if (window.__askBusy) __knobs.duringQuestion(); return true; }');
   await again.click('primary');
   await again.advance(1000);
   assert.equal(again.header().note, 'Not typed. Session is working.');
@@ -5940,4 +5952,296 @@ test('browser: after "No confirmation seen" or a refusal the next click follows 
     assert.equal(h.header().note, ULTRACODE_NO_MODEL);
     assert.equal(ultraHeader(h).asksFirst, false);
   });
+});
+
+// ── part M: a busy session whose turn has ended ─────────────────────────────
+// Claude Code 2.1.296 keeps its spinner title on after a turn ends while a
+// workflow is pending, so busy stays true for the whole run. Busy refuses only
+// while the turn has not ended (no Stop after the last prompt, a spinner after
+// the Stop, or no Stop since the last line typed here); once it has, the checks
+// of an idle session decide. lastBusyAtMs: the spinner came on when the turn
+// started, before its Stop, and never went off.
+const WAITING = { busy: true, busyKnown: true, lastBusyAtMs: STOP_MS - 5000 };
+
+test('typingGate: busy, turn ended, empty prompt: Hand off types plainly', () => {
+  // null: a reloaded window, told busy by main, has seen no event at all.
+  for (const lastBusyAtMs of [STOP_MS - 5000, STOP_MS, null]) {
+    const args = buttonArgs({ ...WAITING, lastBusyAtMs, screen: scr('empty') });
+    assert.deepEqual(gateFacts(typingGate(args)), { allowed: true, override: false, reason: '', advice: '' }, String(lastBusyAtMs));
+    const hand = buttonModel(args).primary;
+    assert.deepEqual({ kind: hand.kind, enabled: hand.enabled, override: hand.override, title: hand.title },
+      { kind: 'handoff', enabled: true, override: false, title: 'Ask this session to write its context handoff' }, String(lastBusyAtMs));
+  }
+});
+
+test('typingGate: busy, turn ended, text in the box: asks first and names the text', () => {
+  const args = buttonArgs({ ...WAITING, screen: scr('draft') });
+  const gate = typingGate(args);
+  assert.deepEqual(gateFacts(gate), { allowed: true, override: true, reason: TEXT_IN_BOX, advice: '' });
+  assert.equal(buttonModel(args).primary.title, TEXT_IN_BOX + '. Click to type the request anyway (asks first).');
+  assert.equal(gateText(gate, 'box', { line: REQUEST_LINE, hold: true }).split('\n\n')[0], TEXT_IN_BOX + '.');
+});
+
+test('typingGate: busy, turn ended, a screen it cannot read: asks first', () => {
+  for (const screen of [scr('unknown'), undefined, null]) {
+    const args = buttonArgs({ ...WAITING, screen });
+    assert.deepEqual(gateFacts(typingGate(args)), { allowed: true, override: true, reason: NO_PROMPT, advice: '' }, JSON.stringify(screen));
+    const hand = buttonModel(args).primary;
+    assert.equal(hand.enabled, true, JSON.stringify(screen));
+    assert.equal(hand.override, true, JSON.stringify(screen));
+  }
+});
+
+test('typingGate: busy, turn ended, a question on the screen: refused, "Session is asking you something"', () => {
+  const args = buttonArgs({ ...WAITING, screen: scr('question') });
+  assert.deepEqual(gateFacts(typingGate(args)), { allowed: false, override: false, reason: ASKING, advice: 'Answer it in the terminal first.' });
+  const hand = buttonModel(args).primary;
+  assert.equal(hand.enabled, false);
+  assert.equal(hand.override, false);
+  assert.equal(hand.title, ASKING + '. Answer it in the terminal first.');
+});
+
+test('typingGate: busy, turn ended, this window not told: asks first', () => {
+  for (const busyKnown of [false, undefined]) {
+    assert.deepEqual(gateFacts(typingGate(buttonArgs({ ...WAITING, busyKnown }))),
+      { allowed: true, override: true, reason: REASON_NOT_TOLD, advice: '' }, String(busyKnown));
+  }
+});
+
+test('typingGate: busy with the turn not ended: refused, "Session is working", whatever the screen', () => {
+  const notEnded = [
+    ['prompt after the stop', { state: hookState({ last_prompt_at: 1020, last_stop_at: 1010 }) }],
+    ['never stopped', { state: hookState({ last_prompt_at: 1000, last_stop_at: null }) }],
+  ];
+  for (const [name, over] of notEnded) {
+    for (const screen of [scr('empty'), scr('draft'), scr('unknown'), scr('question')]) {
+      const args = buttonArgs({ ...WAITING, ...over, screen });
+      assert.deepEqual(gateFacts(typingGate(args)), { allowed: false, override: false, reason: WHY_BUSY, advice: '' }, `${name} / ${screen.state}`);
+      assert.equal(buttonModel(args).primary.title, WHY_BUSY, `${name} / ${screen.state}`);
+    }
+  }
+});
+
+test('typingGate: busy, a Stop recorded but a busy event after it: refused', () => {
+  for (const lastBusyAtMs of [STOP_MS + 1, STOP_MS + 60000]) {
+    const args = buttonArgs({ ...WAITING, lastBusyAtMs });
+    assert.deepEqual(gateFacts(typingGate(args)), { allowed: false, override: false, reason: WHY_BUSY, advice: '' }, String(lastBusyAtMs));
+  }
+});
+
+test('typingGate: busy, turn ended but a line was typed here after the Stop: refused', () => {
+  for (const request of [{ phase: 'idle', atMs: STOP_MS + 5000, reason: '' }, { phase: 'timeout', atMs: STOP_MS + 5000, reason: 'x' }]) {
+    const args = buttonArgs({ ...WAITING, request });
+    assert.deepEqual(gateFacts(typingGate(args)), { allowed: false, override: false, reason: WHY_BUSY, advice: '' }, request.phase);
+  }
+});
+
+test('typingGate: busy with no state file, or one without the turn keys: refused, as before', () => {
+  for (const [name, state] of [['null', null], ['undefined', undefined], ['old hook', oldHookState()]]) {
+    for (const lastBusyAtMs of [null, STOP_MS - 5000]) {
+      const args = buttonArgs({ ...WAITING, state, lastBusyAtMs });
+      assert.deepEqual(gateFacts(typingGate(args)), { allowed: false, override: false, reason: WHY_BUSY, advice: '' }, name);
+      assert.equal(buttonModel(args).primary.title, WHY_BUSY, name);
+      assert.equal(ultracodeModel({ ...args, ultracodeValue: true }).title, WHY_BUSY, name);
+    }
+  }
+});
+
+test('buttonModel and ultracodeModel: Update and Ultracode follow the gate for a busy session, ended or not', () => {
+  const kind = (part) => (!part.enabled ? 'cannot' : part.override ? 'asks' : 'plain');
+  const cases = [
+    [{ screen: scr('empty') }, 'plain', ''],
+    [{ screen: scr('draft') }, 'asks', TEXT_IN_BOX],
+    [{ screen: scr('unknown') }, 'asks', NO_PROMPT],
+    [{ screen: scr('question') }, 'cannot', ASKING],
+    [{ state: writtenState({ last_prompt_at: 1020 }) }, 'cannot', WHY_BUSY],
+    [{ lastBusyAtMs: STOP_MS + 1 }, 'cannot', WHY_BUSY],
+  ];
+  for (const [over, want, reason] of cases) {
+    const name = JSON.stringify(over);
+    const args = buttonArgs({ ...WAITING, state: writtenState(), handoffReadable: true, ...over });
+    const gate = typingGate(args);
+    const model = buttonModel(args);
+    const ultra = ultracodeModel({ ...args, ultracodeValue: true, switching: false, headerOff: false });
+    assert.equal(gate.reason, reason, name);
+    assert.equal(model.primary.kind, 'continue', name);
+    assert.equal(model.update.visible, true, name);
+    assert.equal(kind(model.update), want, name);
+    assert.equal(kind(ultra), want, name);
+    if (want === 'plain') {
+      assert.equal(model.update.title, 'Ask this session to write the handoff again', name);
+      assert.equal(ultra.title, 'Ultracode is on. Click to switch it off.', name);
+    } else if (want === 'cannot') {
+      assert.equal(model.update.title, gateText(gate, 'tooltip'), name);
+      assert.equal(ultra.title, model.update.title, name);
+    }
+  }
+});
+
+// A session whose turn has ended while its spinner stayed on (a workflow runs
+// on): one busy event when the turn started, the hook's Stop 29 s later, no
+// idle event. → { h, stopAt } (stopAt in seconds, as the hook writes it)
+async function bootWaiting(opts, stateOver = {}) {
+  const h = boot(opts);
+  h.setSidecar(VM_SIDECAR);
+  h.busyEvent(true);
+  await h.advance(30000);
+  const stopAt = h.sec - 1;
+  h.setState(endedState(h, { last_prompt_at: h.sec - 31, last_stop_at: stopAt, ...stateOver }));
+  await h.refresh();
+  return { h, stopAt };
+}
+
+test('browser: a session whose spinner stays on after its turn ended gets a plain Hand off, and the click types', async () => {  // B1
+  const { h, stopAt } = await bootWaiting();
+  assert.equal(h.inputs().busy, true);
+  assert.equal(h.inputs().busyKnown, true);
+  assert.equal(h.header().primary, 'Hand off');
+  assert.equal(h.header().primaryEnabled, true);
+  assert.equal(h.header().primaryOverride, false);
+  await h.click('primary');
+  await h.advance(600);
+  assert.equal(h.confirms.length, 0);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+  // The line it typed is stamped later than the Stop, which is what stopAfterSent
+  // reads once the request is idle again (4a-8 pins that rule). Here the button
+  // shows "Writing…" meanwhile, so it cannot be clicked.
+  assert.ok(h.request().atMs > stopAt * 1000);
+  await h.advance(1000);
+  await h.tick();
+  assert.equal(h.header().primaryEnabled, false);
+});
+
+test('browser: the next prompt under the same spinner refuses again, "Session is working"', async () => {  // B2
+  const { h, stopAt } = await bootWaiting();
+  h.setState(endedState(h, { last_prompt_at: h.sec, last_stop_at: stopAt }));   // a scheduled prompt or a message
+  await h.refresh();
+  assert.equal(h.header().primaryEnabled, false);
+  assert.equal(h.header().primaryOverride, false);
+  assert.equal(h.byId['handoff-primary-btn'].getAttribute('title'), WHY_BUSY);
+  await h.click('primary');
+  await h.advance(2000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.confirms.length, 0);
+});
+
+test('browser: after a reload, main saying busy with the turn ended gives a plain Hand off', async () => {  // B3
+  const h = boot({ readCtxState: true });
+  h.knobs.ctxReply = () => ctxReply(h, { busy: true });
+  await h.refresh();
+  assert.equal(h.inputs().busy, true);
+  assert.equal(h.inputs().busyKnown, true);
+  assert.equal(h.header().primaryEnabled, true);
+  assert.equal(h.header().primaryOverride, false);
+  await h.click('primary');
+  await h.advance(600);
+  assert.equal(h.confirms.length, 0);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+});
+
+test('browser: a turn that starts under the spinner while the box is open is not typed into', async () => {  // B4
+  const { h, stopAt } = await bootWaiting();
+  // The waiting screen of fact 5: the grey suggestion reads as text in the box,
+  // and the workflow row under the status line (it starts with the pointer, at
+  // column 0 here, the case that could pass for a box) is not a second box.
+  h.knobs.rows[PROMPT_CURSOR_ROW] = PROMPT_BOX_EMPTY + 'keep going until the plan workflow finishes';
+  h.knobs.rows[54] = PROMPT_POINTER + ' ◯ sidebar-plan-write ▰▰▰▰▰▰▰▰▰▱ 11/12 · 1h01m · ↓ 1.4m tokens';
+  await h.tick();
+  assert.equal(h.inputs().screen.state, 'draft');
+  assert.equal(h.header().primaryEnabled, true);
+  assert.equal(h.header().primaryOverride, true);
+  h.knobs.duringQuestion = () => h.setState(endedState(h, { last_prompt_at: h.sec, last_stop_at: stopAt }));
+  h.run('confirmDialog = async () => { __knobs.duringQuestion(); return true; }');
+  await h.click('primary');
+  await h.advance(1000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.header().note, 'Not typed. Session is working.');
+});
+
+test('browser: Ultracode switches a busy session whose turn has ended, and refuses once a turn runs', async () => {  // B5
+  // The spinner on with no busy event after the Stop: what the window holds while a workflow runs on.
+  const h = await bootUltra(false);
+  h.setBusy(true);
+  await h.tick();
+  assert.equal(h.inputs().busy, true);
+  assert.equal(ultraHeader(h).enabled, true);
+  assert.equal(ultraHeader(h).asksFirst, false);
+  assert.equal(h.header().primaryEnabled, true);
+  await clickUltra(h);
+  await h.advance(600);
+  assert.equal(h.confirms.length, 0);
+  assert.deepEqual(h.sent[0], [SID, '/effort ultracode']);
+
+  const r = await bootUltra(false);
+  r.setBusy(true);
+  r.setState(endedState(r, { ultracode: false, last_prompt_at: r.sec }));
+  await r.refresh();
+  assert.equal(ultraHeader(r).enabled, false);
+  assert.equal(ultraHeader(r).title, 'Session is working');
+  await clickUltra(r);
+  await r.advance(6000);
+  assert.deepEqual(r.sent, []);
+});
+
+test('browser: a working line above the box of a busy session whose turn has ended: asks first, never plain', async () => {  // B7
+  // The guard that is left when the state file has not caught up with a turn (R1).
+  // The line must stand in the 20 rows above the box (prompt-screen.js:86),
+  // not at row 12 where promptScreenWith puts its lines.
+  const { h } = await bootWaiting();
+  showEmptyPrompt(h);
+  h.knobs.rows[48] = '✻ Pondering… (3s · esc to interrupt)';
+  await h.tick();
+  assert.equal(h.inputs().screen.state, 'unknown');
+  assert.equal(h.header().primaryEnabled, true);
+  assert.equal(h.header().primaryOverride, true);
+  h.knobs.confirmAnswer = false;
+  await h.click('primary');
+  await h.advance(1000);
+  assert.equal(h.confirms.length, 1);
+  assert.deepEqual(h.sent, []);
+});
+
+test('browser: the recorded question on a busy session whose turn has ended: refused, nothing typed', async () => {  // B8
+  const { h } = await bootWaiting();
+  showQuestion(h);
+  await h.tick();
+  assert.equal(h.header().primaryEnabled, false);
+  assert.equal(h.byId['handoff-primary-btn'].getAttribute('title'), ASKING_TIP);
+  await h.click('primary');
+  await h.advance(1000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.confirms.length, 0);
+});
+
+test('browser: a plain click on a busy session reads the turn marker again first, and a turn started meanwhile is not typed into', async () => {  // B9
+  const { h, stopAt } = await bootWaiting();
+  assert.equal(h.header().primaryOverride, false);
+  // A scheduled prompt under the same spinner: the hook stamped it, the cache has not read it.
+  h.setState(endedState(h, { last_prompt_at: h.sec, last_stop_at: stopAt }));
+  await h.click('primary');
+  await h.advance(1000);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.confirms.length, 0);
+  assert.equal(h.header().note, 'Not typed. Session is working.');
+});
+
+test('browser: two quick clicks on a busy session type the request once', async () => {  // B10
+  const { h } = await bootWaiting();
+  await h.click('primary');
+  await h.click('primary');
+  await h.advance(1000);
+  assert.equal(h.sent.filter(([, text]) => text === REQUEST_LINE).length, 1);
+  assert.equal(h.inputs().clickNote, '');
+});
+
+test('browser: a plain Ultracode click on a busy session reads the turn marker again first', async () => {  // B11
+  const h = await bootUltra(false);
+  h.setBusy(true);
+  await h.tick();
+  assert.equal(ultraHeader(h).enabled, true);
+  assert.equal(ultraHeader(h).asksFirst, false);
+  h.setState(endedState(h, { ultracode: false, last_prompt_at: h.sec }));   // not read yet
+  await clickUltra(h);
+  await h.advance(6000);
+  assert.deepEqual(h.sent, []);
 });
