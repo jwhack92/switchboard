@@ -1571,6 +1571,58 @@ ipcMain.handle('get-usage', async () => {
   }
 });
 
+// --- IPC: handoff switch (the ctx-handoff hook's opt-out marker <id>.off) ---
+//
+// While <ctx folder>/<session id>.off exists the hook asks that session for no
+// handoff by itself; only existence counts, and a request typed with its marker
+// is still honoured (ctx_handoff.py, "Opt-out", opted_out). The header switch
+// reads, makes and deletes that one file and nothing else. CTX_ID_RE keeps a
+// renderer string from becoming a path; the folder is read-ctx-state's
+// (claudeCtxDir). Kept out of the read-ctx-state reply on purpose: four tests
+// pin that reply and its file calls exactly.
+// env: Switchboard's own environment opts every session out by the hook's rule
+// (pty-env.js passes CLAUDE_CTX_HANDOFF on to every session it starts).
+function handoffOffByEnv() {
+  return ['off', '0', 'false', 'no'].includes(String(process.env.CLAUDE_CTX_HANDOFF || '').trim().toLowerCase());
+}
+function handoffOffFile(sessionId) {
+  return path.join(claudeCtxDir(), sessionId + '.off');
+}
+try {
+  ipcMain.handle('read-handoff-off', (_event, sessionId) => {
+    if (typeof sessionId !== 'string' || !CTX_ID_RE.test(sessionId)) return { error: 'bad session id' };
+    return { off: fs.existsSync(handoffOffFile(sessionId)), env: handoffOffByEnv() };
+  });
+  ipcMain.handle('set-handoff-off', (_event, sessionId, off) => {
+    if (typeof sessionId !== 'string' || !CTX_ID_RE.test(sessionId)) return { error: 'bad session id' };
+    if (typeof off !== 'boolean') return { error: 'bad value' };
+    // The renderer learns of a re-key after main made it: an earlier id it
+    // still holds means the session that runs now under the live id.
+    const id = resolveLiveSession(sessionId).id;
+    if (typeof id !== 'string' || !CTX_ID_RE.test(id)) return { error: 'bad session id' };
+    const file = handoffOffFile(id);
+    let code = null;
+    try {
+      if (off) fs.writeFileSync(file, '', { flag: 'a' });   // made if missing; one that is there is kept as it is
+      else fs.unlinkSync(file);
+    } catch (err) {
+      // Deleting one that is already gone is what was asked for.
+      if (!(err && err.code === 'ENOENT' && !off)) code = (err && err.code) || 'EWRITE';
+    }
+    // On: the earlier id's marker goes too, so that id does not come back off.
+    if (!off && id !== sessionId) {
+      try { fs.unlinkSync(handoffOffFile(sessionId)); } catch {}
+    }
+    const now = fs.existsSync(file);
+    if (code) log.warn(`[handoff-off] ${off ? 'make' : 'delete'} failed id=${id} code=${code} now=${now ? 'off' : 'on'}`);
+    else log.info(`[handoff-off] ${now ? 'off' : 'on'} id=${id}${id !== sessionId ? ` (asked as ${sessionId})` : ''}`);
+    // ok: the file is as asked, which is what the hook reads (a folder of that name counts as off).
+    return { ok: now === off, off: now, env: handoffOffByEnv(), code, id };
+  });
+} catch (err) {
+  try { log.error('[handoff-off] handler registration failed', err); } catch {}
+}
+
 // --- IPC: get-memories ---
 function folderToShortPath(folder) {
   // Convert "-Users-home-dev-MyClaude" → "dev/MyClaude"
@@ -2834,6 +2886,14 @@ sessionTransitions.init({
     : null),
   broadcast: registry.broadcast,
   ownerId: registry.ownerId,
+  // The hook's opt-out marker follows the session: <new id>.off is made when
+  // <old id>.off exists. Nothing is deleted; one already there is kept.
+  copyHandoffOff: (oldId, newId) => {
+    if (typeof oldId !== 'string' || typeof newId !== 'string' || !CTX_ID_RE.test(oldId) || !CTX_ID_RE.test(newId)) return;
+    if (!fs.existsSync(path.join(claudeCtxDir(), oldId + '.off'))) return;
+    fs.writeFileSync(path.join(claudeCtxDir(), newId + '.off'), '', { flag: 'a' });
+    log.info(`[handoff-off] follows ${oldId} → ${newId}`);
+  },
 });
 log.info(`[clear-detect] notes dir=${claudeCtxDir()}`);
 const { detectSessionTransitions } = sessionTransitions;

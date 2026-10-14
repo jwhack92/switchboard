@@ -22,6 +22,8 @@ contextBridge.exposeInMainWorld('api', {
   onTokenStatsChanged: (cb) => ipcRenderer.on('token-stats-changed', (_e, info) => cb(info)),
   // The context-handoff hook's sidecar + state for one session, read by main.
   readCtxState: (sessionId) => ipcRenderer.invoke('read-ctx-state', sessionId),
+  readHandoffOff: (sessionId) => ipcRenderer.invoke('read-handoff-off', sessionId),
+  setHandoffOff: (sessionId, off) => ipcRenderer.invoke('set-handoff-off', sessionId, off),
   getMemories: () => ipcRenderer.invoke('get-memories'),
   readMemory: (filePath) => ipcRenderer.invoke('read-memory', filePath),
   saveMemory: (filePath, content) => ipcRenderer.invoke('save-memory', filePath, content),

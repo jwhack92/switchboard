@@ -21,6 +21,12 @@
 // gate as Hand off (typingGate), and a running session's row carries a bolt
 // while it is on.
 //
+// The header also has the auto handoff switch, just after the meter: whether
+// the hook may ask this session for a handoff by itself. A click types
+// nothing: it asks main to make or delete the hook's opt-out marker,
+// <session_id>.off in that folder. It is the only thing in this file that
+// makes a file (through main).
+//
 // How the state file is read follows the hook's own "Reader contract"
 // (ctx_handoff.py module docstring): crossed_at ties the file to a request,
 // written_at alone never does, a Stop counts only when it is later than the
@@ -820,6 +826,59 @@ function pollDue(tick, ids) {
   return [...ids].sort().filter((id, index) => (tick + index) % POLL_EVERY_TICKS === 0);
 }
 
+// The auto handoff switch's tooltips. The 400K and 150K are the hook's
+// THRESHOLD and REARM_STEP, and AUTO_OFF_TITLE says what the hook does today
+// with a session that is opted out (ctx_handoff.py, "Opt-out").
+const AUTO_ON_TITLE = 'Automatic handoff prompts are on: the hook asks this session for a handoff when its context passes the trigger (400K, then 150K past each handoff). Click to turn them off for this session. Hand off and Update still work.';
+const AUTO_OFF_TITLE = 'Automatic handoff prompts are off for this session. Hand off and Update still work. While off, the hook also gives the session no handoff back after a compaction. Click to turn them back on: if the context is past the trigger, the session is asked for a handoff at its next turn end, even if it wrote one while off.';
+const AUTO_ENV_TITLE = 'Automatic handoff prompts are off for every session Switchboard starts: CLAUDE_CTX_HANDOFF is set in its environment. This switch cannot turn them on. Hand off and Update still work.';
+// Why a click on the switch came to nothing: text in the header note, where
+// " (<code>)." follows when main gave a code, else ".".
+const AUTO_FAILED_OFF = 'Could not turn automatic handoff prompts off';
+const AUTO_FAILED_ON = 'Could not turn automatic handoff prompts on';
+const AUTO_REKEYED = 'The session changed id during the click. Click again.';
+
+// The header's auto handoff switch: whether the ctx-handoff hook may ask this
+// session for a handoff by itself (no <id>.off marker) or not. Not a typing
+// control: a click makes or deletes a file through main and types nothing, so
+// the typing gate plays no part. Takes:
+//   isTerminal, running, headerOff, ownedElsewhere
+//   hookSeen  this session's sidecar or state file has been read
+//   off       true / false as main read the marker, null = not told
+//   env       Switchboard's own environment opts every session out
+//   saving    a click's write is on its way (entry.autoSaving: it moves with a re-key)
+// → { visible, label, look ('on' | 'off'), enabled, target, title }
+//   target    what a click asks for: true = make the marker (prompts off)
+function autoHandoffModel(input) {
+  const o = input || {};
+  const off = typeof o.off === 'boolean' ? o.off : null;
+  const model = {
+    visible: false, label: off ? 'Auto handoff off' : 'Auto handoff on', look: off ? 'off' : 'on',
+    enabled: false, target: null, title: '',
+  };
+  if (o.isTerminal || !o.running || o.headerOff || !o.hookSeen || off === null) return model;
+  model.visible = true;
+  if (o.env === true) {
+    model.label = 'Auto handoff off';
+    model.look = 'off';
+    model.title = AUTO_ENV_TITLE;
+    return model;
+  }
+  if (o.ownedElsewhere) {
+    model.title = 'Shown in another window';
+    return model;
+  }
+  if (o.saving === true) {
+    model.label = 'Auto handoff…';
+    model.title = 'Waiting for Switchboard to write the switch';
+    return model;
+  }
+  model.enabled = true;
+  model.target = !off;
+  model.title = off ? AUTO_OFF_TITLE : AUTO_ON_TITLE;
+  return model;
+}
+
 // ---------------------------------------------------------------- browser side
 // Needs the app. test/ctx-handoff.test.js drives it in a vm context with a
 // fake DOM, a fake window.api and its own clock.
@@ -1001,6 +1060,10 @@ function handoffEntry(id) {
       ultraSwitch: null,       // { target, atMs } while a typed switch waits for the terminal's line
       ultraNote: '',           // why the last switch came to nothing
       ultraNoteAtMs: 0,
+      autoOff: null,           // the hook's opt-out marker <id>.off as main read it: true / false, null = not told
+      autoEnv: false,          // Switchboard's own environment opts every session out
+      autoSeq: 0,              // counts the clicks on the switch: a read applies only if no click went out while it was away
+      autoSaving: false,       // a click's write of the marker is on its way
     };
     handoffRt.cache.set(id, entry);
   }
@@ -1105,6 +1168,10 @@ function handoffInputs(id) {
     continueErrorAtMs: entry ? entry.continueErrorAtMs : 0,
     clickNote: entry ? entry.ultraNote : '',
     clickNoteAtMs: entry ? entry.ultraNoteAtMs : 0,
+    autoOff: entry ? entry.autoOff : null,
+    autoEnv: !!entry && entry.autoEnv === true,
+    autoSaving: !!entry && entry.autoSaving === true,
+    hookSeen: !!entry && !!(entry.sidecar || entry.state),
     nowMs,
   };
 }
@@ -1336,11 +1403,31 @@ function handoffSetInert(on) {
   handoffRenderHeader();
 }
 
+// Main's read-handoff-off call: whether the hook's opt-out marker <id>.off is
+// there. → { off, env }, or null for anything else (an older main rejects the
+// invoke; a reply without a boolean `off`): the switch then stays hidden.
+async function handoffReadOff(id) {
+  let res;
+  try {
+    res = await window.api.readHandoffOff(id);
+  } catch (err) {
+    handoffLogOnce('readHandoffOff failed; the auto handoff switch stays hidden', err);
+    return null;
+  }
+  if (res && typeof res.off === 'boolean') return { off: res.off, env: res.env === true };
+  handoffLogOnce('readHandoffOff failed; the auto handoff switch stays hidden', res);
+  return null;
+}
+
 async function handoffDoRefresh(id) {
   // A plain terminal has no Claude context and no sidecar.
   if (handoffIsTerminal(id)) return;
   const entry = handoffEntry(id);
   const startedMs = Date.now();
+  // The auto handoff switch's marker is read side by side with the pair; a
+  // page without the call awaits nothing more.
+  const offSeq = entry.autoSeq;
+  const offRead = typeof window.api.readHandoffOff === 'function' ? handoffReadOff(id) : null;
   let pair = null;
   try {
     pair = await handoffReadPair(id);
@@ -1364,6 +1451,16 @@ async function handoffDoRefresh(id) {
   if (pair.state !== undefined) entry.state = pair.state;
   // Not kept from an earlier read: a reply without the flag is "not told".
   entry.mainBusy = typeof pair.busy === 'boolean' ? pair.busy : null;
+  if (offRead) {
+    const told = await offRead;
+    if (handoffRt.cache.get(id) !== entry) return;
+    // A read that went out before a click's write would show the old file:
+    // it applies only if no click went out while it was away.
+    if (entry.autoSeq === offSeq && entry.autoSaving !== true) {
+      entry.autoOff = told ? told.off : null;
+      entry.autoEnv = !!told && told.env;
+    }
+  }
   await handoffCheckReadable(entry, pair.handoff);
   if (handoffRt.cache.get(id) !== entry) return;
   handoffApplyOutcome(entry);
@@ -1471,6 +1568,14 @@ function handoffBuildHeader() {
   meterState.className = 'handoff-meter-state';
   meter.append(meterText, meterTrack, meterState);
 
+  // The auto handoff switch (autoHandoffModel), just after the meter.
+  const auto = document.createElement('button');
+  auto.id = 'handoff-auto-btn';
+  auto.type = 'button';
+  auto.className = 'handoff-btn handoff-btn-small';
+  auto.style.display = 'none';
+  auto.addEventListener('click', handoffGuard('auto switch click failed', handoffOnAutoClick));
+
   // Why the last request came to nothing. Text in the header, not a popup.
   const note = document.createElement('span');
   note.id = 'handoff-note';
@@ -1506,11 +1611,12 @@ function handoffBuildHeader() {
   update.addEventListener('click', handoffGuard('update click failed', handoffOnUpdateClick));
 
   controls.insertBefore(meter, status.nextSibling);
+  controls.insertBefore(auto, meter.nextSibling);
   controls.insertBefore(note, stopBtn);
   controls.insertBefore(ultracode, stopBtn);
   controls.insertBefore(primary, stopBtn);
   controls.insertBefore(update, stopBtn);
-  return { meter, meterText, meterTrack, meterFill, meterState, note, ultracode, ultracodeLabel, primary, update };
+  return { meter, meterText, meterTrack, meterFill, meterState, auto, note, ultracode, ultracodeLabel, primary, update };
 }
 
 // "Disabled" is aria-disabled plus a class, not the disabled attribute: a
@@ -1550,6 +1656,7 @@ function handoffRenderHeader() {
   const id = handoffActiveId();
   if (handoffHeaderOff(id)) {
     handoffShow(els.meter, false);
+    handoffShow(els.auto, false);
     handoffShow(els.note, false);
     handoffShow(els.ultracode, false);
     handoffShow(els.primary, false);
@@ -1573,7 +1680,12 @@ function handoffRenderHeader() {
   let stateText = '';
   let stateClass = 'handoff-meter-state';
   let stateTitle = '';
-  if (info.status === 'due') {
+  // The hook's own order (its status line): off comes before due and written.
+  if (input.autoOff === true || input.autoEnv === true) {
+    stateText = 'handoff off';
+    stateClass += ' handoff-off';
+    stateTitle = 'Automatic handoff prompts are off for this session. Hand off and Update still work.';
+  } else if (info.status === 'due') {
     stateText = 'handoff due';
     stateClass += ' handoff-due';
     stateTitle = 'This session has passed its handoff threshold and has not written one yet';
@@ -1596,6 +1708,16 @@ function handoffRenderHeader() {
   if (stale) meterTitle = staleTitle(handoffClock(stale.sinceTs));
   else if (meter) meterTitle = 'Context in use: ' + meter.full + (meter.ts !== null ? ' (read ' + handoffClock(meter.ts) + ')' : '');
   handoffSetTitle(els.meterText, meterTitle);
+
+  // headerOff is false here: the early return above took the other case.
+  const auto = autoHandoffModel({ ...input, headerOff: false, off: input.autoOff, env: input.autoEnv, saving: input.autoSaving });
+  handoffSetButton(els.auto, {
+    visible: auto.visible,
+    label: auto.label,
+    enabled: auto.enabled,
+    title: auto.title,
+    extraClass: 'handoff-btn-small handoff-auto-' + auto.look,
+  });
 
   const ultra = ultracodeModel(input);
   handoffSetButton(els.ultracode, {
@@ -2115,6 +2237,59 @@ function handoffOnUltracodeClick() {
   return id ? handoffToggleUltracode(id) : undefined;
 }
 
+// --- The auto handoff switch ---
+
+// A click on the switch: main makes or deletes the session's <id>.off, and
+// the switch then shows what main says the file is. Nothing is typed and no
+// box opens; a click that came to nothing says so in the header note.
+async function handoffSetAuto(id) {
+  // The switch as the click finds it NOW (headerOff as in handoffUltracodeControl).
+  const input = handoffInputs(id);
+  const model = autoHandoffModel({
+    ...input, headerOff: handoffHeaderOff(id), off: input.autoOff, env: input.autoEnv,
+  });
+  if (!model.visible || !model.enabled) return;
+  // A visible switch has an entry: its hook files were read (hookSeen).
+  const entry = handoffRt.cache.get(id);
+  // The id is taken before the wait: a re-key meanwhile changes entry.id.
+  const setId = entry.id;
+  // One click at a time, also across a re-key: the flag is on the entry.
+  if (entry.autoSaving) return;
+  entry.autoSaving = true;
+  entry.autoSeq += 1;
+  handoffRenderHeader();
+  let res = null;
+  try {
+    res = await window.api.setHandoffOff(setId, model.target);
+  } catch (err) {
+    res = null;
+    handoffLogOnce('setHandoffOff failed', err);
+  } finally {
+    entry.autoSaving = false;
+  }
+  // The session's entry is gone.
+  if (handoffRt.cache.get(entry.id) !== entry) return;
+  // Re-keyed meanwhile, and the answer is not for the id the session has now
+  // (main answers for the live id, so after one re-key it is).
+  if (entry.id !== setId && (!res || res.id !== entry.id)) {
+    handoffSetClickNote(entry, AUTO_REKEYED);
+    handoffRefresh(entry.id);
+    return;
+  }
+  if (res && typeof res.off === 'boolean') entry.autoOff = res.off;
+  if (res && typeof res.env === 'boolean') entry.autoEnv = res.env;
+  if (!res || res.ok !== true) {
+    const code = res && typeof res.code === 'string' && res.code ? ' (' + res.code + ').' : '.';
+    handoffSetClickNote(entry, (model.target ? AUTO_FAILED_OFF : AUTO_FAILED_ON) + code);
+  }
+  handoffPaint(entry.id);
+}
+
+function handoffOnAutoClick() {
+  const id = handoffActiveId();
+  return id ? handoffSetAuto(id) : undefined;
+}
+
 // --- Triggers ---
 
 // Entries nobody needs: not running, not on screen, no read out, no request
@@ -2268,6 +2443,7 @@ if (typeof module !== 'undefined' && module.exports) {
     STALE_AFTER_MS,
     typingGate, gateText, chooseHeaderNote, ultracodeValue, ultracodeModel, ultracodeScreen, ultracodeOutcome,
     parseStoredUltracode, staleReading, staleTitle,
+    autoHandoffModel, AUTO_ON_TITLE, AUTO_OFF_TITLE, AUTO_ENV_TITLE, AUTO_FAILED_OFF, AUTO_FAILED_ON, AUTO_REKEYED,
     handoffChipState, handoffBoltState, onActiveSessionChanged,
   };
 }

@@ -1766,3 +1766,113 @@ test('session-transitions: the file says that a change to it needs an app restar
   assert.ok(source.slice(0, 600).includes('a change here needs an app restart'));
   assert.match(source, /resolveLiveSession/);
 });
+
+// --- the handoff switch: the hook's opt-out marker follows a re-key (copyHandoffOff) ---
+
+/**
+ * The context clearBoot() hands init(), plus a recorder for copyHandoffOff: `calls` holds it with every
+ * other call of a move, in the order made. init() is called once, here: one handoffOffBoot at a time.
+ */
+function handoffOffBoot() {
+  const h = boot();
+  const notes = new Map();     // transcript id -> what readClearOrigin answers for it
+  const calls = [];            // [name, ...args] of every call of a move
+  const throwing = new Set();  // names of follow-ups that throw when called
+  const clock = { now: NOW };
+  let timers = [];
+  let seq = 0;
+  const log = {};
+  for (const level of ['debug', 'info', 'warn', 'error']) log[level] = (...args) => { h.logLines.push(level + ' ' + args.join(' ')); };
+  const record = (name) => (...args) => { calls.push([name, ...args]); };
+  const followUp = (name) => (...args) => { calls.push([name, ...args]); if (throwing.has(name)) throw new Error(name + ' failed'); };
+  transitions.init({
+    PROJECTS_DIR: path.dirname(h.dir), activeSessions: h.sessions, log,
+    rekeyMcpServer: record('rekeyMcpServer'),
+    rekeyOwner: (oldId, newId) => {
+      calls.push(['rekeyOwner', oldId, newId]);
+      if (h.owners.has(oldId)) { h.owners.set(newId, h.owners.get(oldId)); h.owners.delete(oldId); }
+    },
+    sendToOwner: record('sendToOwner'),
+    copySessionAssignment: followUp('copySessionAssignment'), rekeyPlanLinks: followUp('rekeyPlanLinks'),
+    rekeyScheduleSession: followUp('rekeyScheduleSession'), copyStar: followUp('copyStar'),
+    copyHandoffOff: followUp('copyHandoffOff'),
+    broadcast: record('broadcast'),
+    ownerId: (id) => (h.owners.has(id) ? h.owners.get(id) : null),
+    readClearOrigin: (id) => (notes.has(id) ? notes.get(id) : null),
+    now: () => clock.now,
+    setTimer: (fn, ms) => { const timer = { id: ++seq, fn, at: clock.now + ms }; timers.push(timer); return timer; },
+    clearTimer: (timer) => { timers = timers.filter((t) => t !== timer); },
+  });
+  return {
+    ...h, notes, calls, throwing,
+    /** One pass over the folder at the clock's time. init() is NOT called again. */
+    pass(folder = FOLDER) {
+      const realNow = Date.now;
+      Date.now = () => clock.now;
+      try { transitions.detectSessionTransitions(folder); } finally { Date.now = realNow; }
+    },
+    /** The log lines of one level that hold `part`. */
+    lines: (level, part) => h.logLines.filter((l) => l.startsWith(level + ' ') && l.includes(part)),
+  };
+}
+
+/** moveCalls() with the copyHandoffOff call where rekey() makes it: after the other follow-ups, directly before the send. */
+const moveCallsWithHandoffOff = (oldId, newId, options) => {
+  const calls = moveCalls(oldId, newId, options);
+  calls.splice(calls.findIndex(([name]) => name === 'sendToOwner'), 0, ['copyHandoffOff', oldId, newId]);
+  return calls;
+};
+
+test('detector: copyHandoffOff is called once with the old and the new id on a fork, a plan-accept and a clear, after the other follow-ups and before the send', async (t) => {
+  await t.test('copyHandoffOff on a fork: once, after the three follow-ups and directly before the send', () => {
+    const h = handoffOffBoot();
+    h.write(LIVE, [userLine(LIVE)]);
+    const a = h.session(LIVE);
+    h.write(NEW, forkOf(LIVE, NEW));
+    h.pass();
+    assert.equal(h.sessions.get(NEW), a);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'copyHandoffOff'), [['copyHandoffOff', LIVE, NEW]]);
+    assert.deepEqual(h.calls, moveCallsWithHandoffOff(LIVE, NEW));
+    assert.deepEqual(h.lines('info', '[session-transition]'), [`info [session-transition] ${LIVE} → ${NEW} (fork)`]);
+  });
+
+  await t.test('copyHandoffOff on a plan-accept: once, after the three follow-ups and directly before the send', () => {
+    const h = handoffOffBoot();
+    h.write(LIVE, planTail(SLUG), 28 * SECOND);
+    const a = h.session(LIVE);
+    h.write(NEW, [userLine(NEW, { slug: SLUG, planContent: '# Do it' })]);
+    h.pass();
+    assert.equal(h.sessions.get(NEW), a);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'copyHandoffOff'), [['copyHandoffOff', LIVE, NEW]]);
+    assert.deepEqual(h.calls, moveCallsWithHandoffOff(LIVE, NEW));
+    assert.deepEqual(h.lines('info', '[session-transition]'), [`info [session-transition] ${LIVE} → ${NEW} (plan-accept)`]);
+  });
+
+  await t.test('copyHandoffOff on a clear: once, after the star carry and directly before the send', () => {
+    const h = handoffOffBoot();
+    h.write(LIVE_B, [userLine(LIVE_B)]);
+    const b = h.session(LIVE_B, { hostToken: TAG_B });
+    h.write(NEW, clearHead(NEW));
+    h.notes.set(NEW, note(NEW, TAG_B, LIVE_B));
+    h.pass();
+    assert.equal(h.sessions.get(NEW), b);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'copyHandoffOff'), [['copyHandoffOff', LIVE_B, NEW]]);
+    assert.deepEqual(h.calls, moveCallsWithHandoffOff(LIVE_B, NEW, { clearedAtMs: TS * 1000 }));
+    assert.deepEqual(h.lines('info', '[session-transition]'), [`info [session-transition] ${LIVE_B} → ${NEW} (clear)`]);
+  });
+});
+
+test('detector: a copyHandoffOff that throws stops nothing and is logged once', () => {
+  const h = handoffOffBoot();
+  h.write(LIVE, [userLine(LIVE)]);
+  const a = h.session(LIVE);
+  h.owners.set(LIVE, 7);
+  h.throwing.add('copyHandoffOff');
+  h.write(NEW, forkOf(LIVE, NEW));
+  assert.doesNotThrow(() => h.pass());
+  assert.deepEqual(h.calls.filter(([name]) => name === 'copyHandoffOff'), [['copyHandoffOff', LIVE, NEW]]);
+  assert.equal(h.sessions.get(NEW), a);
+  assert.deepEqual(h.calls, moveCallsWithHandoffOff(LIVE, NEW, { windowId: 7 }), 'the send and both broadcasts still follow');
+  assert.deepEqual(h.lines('warn', 'follow-up failed'),
+    [`warn [session-transition] follow-up failed name=copyHandoffOff old=${LIVE} new=${NEW} error=copyHandoffOff failed`]);
+});

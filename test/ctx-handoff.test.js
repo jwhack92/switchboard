@@ -6266,3 +6266,564 @@ test('browser: a re-key while a busy click reads the marker again leaves no id b
   await h.advance(1000);
   assert.deepEqual(JSON.parse(h.run('JSON.stringify([...handoffRt.rereading])')), []);
 });
+
+// ── the auto handoff switch (Task N) ───────────────────────────────────────
+//
+// The header's switch for the hook's opt-out marker, <claude-ctx>/<id>.off:
+// the pure model first, then the page with main's two calls (readHandoffOff,
+// setHandoffOff) answered from knobs. No file is made anywhere: the marker is
+// a Set of ids in knobs.
+
+const {
+  autoHandoffModel, AUTO_ON_TITLE, AUTO_OFF_TITLE, AUTO_ENV_TITLE, AUTO_FAILED_OFF, AUTO_FAILED_ON, AUTO_REKEYED,
+} = require(MODULE_PATH);
+
+const AUTO_BTN = 'handoff-auto-btn';
+const AUTO_WAIT_TITLE = 'Waiting for Switchboard to write the switch';
+const AUTO_METER_TITLE = 'Automatic handoff prompts are off for this session. Hand off and Update still work.';
+
+// A running session whose hook files were read, prompts on, shown in this window.
+function autoArgs(over = {}) {
+  return {
+    isTerminal: false, running: true, headerOff: false, ownedElsewhere: false,
+    hookSeen: true, off: false, env: false, saving: false, ...over,
+  };
+}
+
+test('autoHandoffModel: hidden for a plain terminal, a session not running, a header that is not this session\'s, no hook files, or a value main has not told', () => {
+  assert.equal(autoHandoffModel(autoArgs()).visible, true, 'the case the others are held against');
+  const hidden = {
+    'a plain terminal': { isTerminal: true },
+    'a session not running': { running: false },
+    'a header that is not this session\'s': { headerOff: true },
+    'no hook files': { hookSeen: false },
+    'a value main has not told (null)': { off: null },
+    'a value main has not told (no key)': { off: undefined },
+    'a value that is not true or false': { off: 'true' },
+  };
+  for (const [name, over] of Object.entries(hidden)) {
+    for (const base of [{}, { off: true }, { env: true }, { saving: true }, { ownedElsewhere: true }]) {
+      const model = autoHandoffModel(autoArgs({ ...base, ...over }));
+      assert.equal(model.visible, false, name);
+      assert.equal(model.enabled, false, name);
+      assert.equal(model.target, null, name);
+    }
+  }
+  // No input at all is hidden too, and no throw.
+  for (const input of [undefined, null, {}]) assert.equal(autoHandoffModel(input).visible, false);
+});
+
+test('autoHandoffModel: on reads "Auto handoff on" and a click turns it off; off reads "Auto handoff off" and a click turns it on; each title says what a click does and that Hand off and Update still work', () => {
+  assert.deepEqual(autoHandoffModel(autoArgs({ off: false })), {
+    visible: true, label: 'Auto handoff on', look: 'on', enabled: true, target: true, title: AUTO_ON_TITLE,
+  });
+  assert.deepEqual(autoHandoffModel(autoArgs({ off: true })), {
+    visible: true, label: 'Auto handoff off', look: 'off', enabled: true, target: false, title: AUTO_OFF_TITLE,
+  });
+  assert.match(AUTO_ON_TITLE, /^Automatic handoff prompts are on\b/);
+  assert.match(AUTO_ON_TITLE, /Click to turn them off for this session\./);
+  assert.match(AUTO_OFF_TITLE, /^Automatic handoff prompts are off for this session\./);
+  assert.match(AUTO_OFF_TITLE, /Click to turn them back on\b/);
+  for (const title of [AUTO_ON_TITLE, AUTO_OFF_TITLE]) assert.match(title, /Hand off and Update still work\./);
+});
+
+test('autoHandoffModel: off by CLAUDE_CTX_HANDOFF shows off, cannot be clicked, and the title names the variable', () => {
+  for (const off of [false, true]) {
+    assert.deepEqual(autoHandoffModel(autoArgs({ env: true, off })), {
+      visible: true, label: 'Auto handoff off', look: 'off', enabled: false, target: null, title: AUTO_ENV_TITLE,
+    }, `the marker ${off ? 'there' : 'not there'}`);
+  }
+  assert.match(AUTO_ENV_TITLE, /CLAUDE_CTX_HANDOFF/);
+  // The environment's word comes before the other two reasons a click does nothing.
+  assert.equal(autoHandoffModel(autoArgs({ env: true, ownedElsewhere: true })).title, AUTO_ENV_TITLE);
+  assert.equal(autoHandoffModel(autoArgs({ env: true, saving: true })).title, AUTO_ENV_TITLE);
+});
+
+test('autoHandoffModel: shown in another window, or a write on its way: not clickable', () => {
+  assert.deepEqual(autoHandoffModel(autoArgs({ ownedElsewhere: true, off: false })), {
+    visible: true, label: 'Auto handoff on', look: 'on', enabled: false, target: null, title: WHY_OWNED,
+  });
+  assert.deepEqual(autoHandoffModel(autoArgs({ ownedElsewhere: true, off: true })), {
+    visible: true, label: 'Auto handoff off', look: 'off', enabled: false, target: null, title: WHY_OWNED,
+  });
+  for (const off of [false, true]) {
+    assert.deepEqual(autoHandoffModel(autoArgs({ saving: true, off })), {
+      visible: true, label: `Auto handoff${ELLIPSIS}`, look: off ? 'off' : 'on', enabled: false, target: null, title: AUTO_WAIT_TITLE,
+    }, `the marker ${off ? 'there' : 'not there'}`);
+  }
+  // Both at once: the other window's is the reason named.
+  assert.equal(autoHandoffModel(autoArgs({ ownedElsewhere: true, saving: true })).title, WHY_OWNED);
+});
+
+test('autoHandoffModel: busy, a turn not ended, a question on the screen, a pending row or a stop that did not finish change nothing: it types nothing', () => {
+  // Each of these keeps Hand off from typing plainly (typingGate). None of
+  // them is an input of the switch.
+  const stops = {
+    'busy, its turn not ended': { busy: true, state: hookState({ last_stop_at: 900 }) },
+    'a turn not ended': { state: hookState({ last_stop_at: 900 }) },
+    'a question on the screen': { screen: scr('question') },
+    'a pending row': { pendingRow: true },
+    'a stop that did not finish': { didNotStop: true },
+  };
+  for (const off of [false, true]) {
+    const calm = buttonArgs(autoArgs({ off }));
+    assert.deepEqual(gateFacts(typingGate(calm)), { allowed: true, override: false, reason: '', advice: '' });
+    const model = autoHandoffModel(calm);
+    assert.equal(model.enabled, true);
+    assert.equal(model.target, !off);
+    for (const [name, over] of Object.entries(stops)) {
+      const args = { ...calm, ...over };
+      const gate = typingGate(args);
+      assert.equal(gate.allowed && !gate.override, false, `${name}: Hand off does not type plainly`);
+      assert.deepEqual(autoHandoffModel(args), model, `${name}, the marker ${off ? 'there' : 'not there'}`);
+    }
+  }
+});
+
+// What the switch shows, read off its element. No element: not shown.
+function autoSwitch(h) {
+  const btn = h.byId[AUTO_BTN];
+  const shown = !!btn && btn.style.display !== 'none';
+  return {
+    shown,
+    label: shown ? btn.textContent : null,
+    enabled: shown && btn.getAttribute('aria-disabled') === 'false',
+    look: shown ? (/handoff-auto-(on|off)/.exec(btn.className) || [])[1] : null,
+    title: shown ? btn.getAttribute('title') : null,
+  };
+}
+const AUTO_ON = { shown: true, label: 'Auto handoff on', enabled: true, look: 'on', title: AUTO_ON_TITLE };
+const AUTO_OFF = { shown: true, label: 'Auto handoff off', enabled: true, look: 'off', title: AUTO_OFF_TITLE };
+
+async function clickAuto(h) {
+  h.byId[AUTO_BTN].listeners.click();
+  await flush();
+}
+
+// The meter's state text ("handoff due", "handoff off") as it is on screen.
+function autoMeterState(h) {
+  const el = h.byId['handoff-meter'].children[2];
+  return { shown: el.style.display !== 'none', text: el.textContent, className: el.className, title: el.getAttribute('title') };
+}
+
+// A promise the test settles when it chooses: main's answer, held back.
+function autoDeferred() {
+  let resolve;
+  const promise = new Promise((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+// Boots as bootEnded does, then gives window.api main's two calls for the
+// switch, answered from h.knobs, and reads again.
+//   knobs.offFiles          the ids whose <id>.off is there, as main would find it
+//   knobs.offEnv            CLAUDE_CTX_HANDOFF opts every session out
+//   knobs.readOff(id)       what read-handoff-off answers (a value, a promise, or a throw = the invoke rejects)
+//   knobs.setOff(id, off)   what set-handoff-off does and answers, the same way
+//   knobs.offReads, knobs.offSets   the calls the page made, in order
+// opts: off (the marker is there at the start), env, readOff, setOff.
+async function bootAuto(opts = {}) {
+  const h = await bootEnded();
+  const knobs = h.knobs;
+  knobs.offFiles = new Set(opts.off ? [SID] : []);
+  knobs.offEnv = opts.env === true;
+  knobs.offReads = [];
+  knobs.offSets = [];
+  knobs.readOff = opts.readOff || ((id) => ({ off: knobs.offFiles.has(id), env: knobs.offEnv }));
+  // Main as it answers when the write works: the marker is made or deleted,
+  // and the reply says what is there now, for the id it was asked with.
+  knobs.setOff = opts.setOff || ((id, off) => {
+    if (off) knobs.offFiles.add(id); else knobs.offFiles.delete(id);
+    return { ok: true, off: knobs.offFiles.has(id), env: knobs.offEnv, code: null, id };
+  });
+  knobs.readHandoffOff = (id) => { knobs.offReads.push(id); return Promise.resolve().then(() => knobs.readOff(id)); };
+  knobs.setHandoffOff = (id, off) => { knobs.offSets.push([id, off]); return Promise.resolve().then(() => knobs.setOff(id, off)); };
+  h.run(`
+    window.api.readHandoffOff = (id) => __knobs.readHandoffOff(id);
+    window.api.setHandoffOff = (id, off) => __knobs.setHandoffOff(id, off);
+  `);
+  await h.refresh();
+  return h;
+}
+
+// The hook's files for the id a fork gives the session: its header stays on.
+function autoNewIdFiles(h) {
+  h.files.set(VM_DIR + '\\' + NEW_SID + '.json', JSON.stringify(VM_SIDECAR));
+  h.files.set(VM_DIR + '\\' + NEW_SID + '.state.json', JSON.stringify(endedState(h)));
+}
+
+// h.refresh() for a session under another id than SID.
+async function autoRefresh(h, id) {
+  await h.advance(600);
+  await h.run(`handoffRefresh('${id}')`);
+  await flush();
+  h.run('handoffRenderHeader()');
+}
+
+test('browser: the auto handoff switch sits just after the meter, and Ultracode is still just before Hand off', async () => {
+  const h = await bootAuto();
+  const ids = h.byId['terminal-header-controls'].children.map(el => el.id);
+  assert.ok(ids.includes('handoff-meter'));
+  assert.equal(ids.indexOf('handoff-meter') + 1, ids.indexOf(AUTO_BTN));
+  assert.equal(ids.indexOf('terminal-header-status') + 1, ids.indexOf('handoff-meter'), 'the meter is where it was');
+  assert.equal(ids.indexOf('handoff-ultracode-btn') + 1, ids.indexOf('handoff-primary-btn'));
+  const btn = h.byId[AUTO_BTN];
+  assert.equal(btn.tag, 'button');
+  assert.equal(btn.type, 'button');
+  assert.ok(btn.className.split(' ').includes('handoff-btn-small'), btn.className);
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+});
+
+test('browser: a click turns automatic handoff prompts off through main, and a second click turns them back on', async () => {
+  const h = await bootAuto();
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  assert.deepEqual([...h.knobs.offFiles], [SID], 'main made the marker');
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  await h.refresh();
+  assert.deepEqual(autoSwitch(h), AUTO_OFF, 'the next read says the same');
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true], [SID, false]]);
+  assert.deepEqual([...h.knobs.offFiles], [], 'main deleted it');
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  await h.advance(2000);
+  assert.deepEqual(h.sent, [], 'nothing is typed into the session');
+  assert.equal(h.confirms.length, 0, 'no box');
+  assert.equal(h.header().note, null);
+});
+
+test('browser: a marker the session made itself shows as off at the next read, with no click', async () => {
+  const h = await bootAuto();
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  h.knobs.offFiles.add(SID);
+  await h.refresh();
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  // ...and one it took away shows as on again.
+  h.knobs.offFiles.delete(SID);
+  await h.refresh();
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  assert.deepEqual(h.knobs.offSets, []);
+});
+
+test('browser: while off the meter says "handoff off" where it said "handoff due"', async () => {
+  const h = await bootAuto();
+  h.setState(endedState(h, { pending: true, crossed_at: h.sec - 60 }));
+  await h.refresh();
+  assert.deepEqual(autoMeterState(h), {
+    shown: true, text: 'handoff due', className: 'handoff-meter-state handoff-due',
+    title: 'This session has passed its handoff threshold and has not written one yet',
+  });
+  h.knobs.offFiles.add(SID);
+  await h.refresh();
+  assert.deepEqual(autoMeterState(h), {
+    shown: true, text: 'handoff off', className: 'handoff-meter-state handoff-off', title: AUTO_METER_TITLE,
+  });
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  // Back on: due again.
+  h.knobs.offFiles.delete(SID);
+  await h.refresh();
+  assert.equal(autoMeterState(h).text, 'handoff due');
+});
+
+test('browser: while off, Hand off and Update still type the request', async () => {
+  const h = await bootAuto({ off: true });
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  assert.equal(h.header().primary, 'Hand off');
+  await h.click('primary');
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+  await h.advance(250);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+  assert.equal(h.confirms.length, 0);
+
+  // Update, beside Continue, on a session that has written a handoff.
+  const u = await bootAuto({ off: true });
+  u.setHandoffFile(true);
+  u.setState(writtenVmState(u));
+  await u.refresh();
+  assert.deepEqual(autoSwitch(u), AUTO_OFF);
+  assert.equal(u.header().update, true);
+  await u.click('update');
+  assert.deepEqual(u.sent, [[SID, REQUEST_LINE]]);
+  await u.advance(250);
+  assert.deepEqual(u.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+  assert.equal(u.confirms.length, 0);
+  for (const w of [h, u]) assert.deepEqual(w.knobs.offSets, [], 'neither click touched the marker');
+});
+
+test('browser: a switch that fails says so in the header note, opens no box, and shows what the file is', async () => {
+  // The make failed and there is no marker.
+  const h = await bootAuto();
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  h.knobs.setOff = (id) => ({ ok: false, off: false, env: false, code: 'EPERM', id });
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  assert.equal(h.header().note, AUTO_FAILED_OFF + ' (EPERM).');
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  assert.equal(h.confirms.length, 0);
+  assert.deepEqual(h.sent, []);
+
+  // The delete failed and the marker is still there; then a call that gets no
+  // answer at all.
+  const g = await bootAuto({ off: true });
+  assert.deepEqual(autoSwitch(g), AUTO_OFF);
+  g.knobs.setOff = (id) => ({ ok: false, off: true, env: false, code: 'EBUSY', id });
+  await clickAuto(g);
+  assert.equal(g.header().note, AUTO_FAILED_ON + ' (EBUSY).');
+  assert.deepEqual(autoSwitch(g), AUTO_OFF);
+  g.knobs.setOff = () => { throw new Error('the invoke rejected'); };
+  await clickAuto(g);
+  assert.deepEqual(g.knobs.offSets, [[SID, false], [SID, false]]);
+  assert.equal(g.header().note, AUTO_FAILED_ON + '.');
+  assert.deepEqual(autoSwitch(g), AUTO_OFF);
+  assert.equal(g.confirms.length, 0);
+  assert.deepEqual(g.sent, []);
+});
+
+test('browser: a read that went out before the click does not turn the switch back', async () => {
+  const h = await bootAuto();
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  // A read goes out, and main's answer about the marker is held back.
+  const answer = h.knobs.readOff;
+  h.knobs.readReply = autoDeferred();
+  h.knobs.readOff = () => h.knobs.readReply.promise;
+  await h.advance(600);
+  const reads = h.knobs.offReads.length;
+  h.run(`handoffRefresh('${SID}')`);
+  await flush();
+  assert.deepEqual(h.knobs.offReads.slice(reads), [SID], 'the read is out');
+  h.knobs.readOff = answer;
+  // The click, in the same millisecond: main makes the marker and says so.
+  const clickMs = h.now;
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  // Now the held answer comes. It says what that read found: no marker yet.
+  h.knobs.readReply.resolve({ off: false, env: false });
+  await flush();
+  assert.equal(h.now, clickMs, 'the clock did not move between the read and the click');
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  // A read sent after the click counts again.
+  await h.refresh();
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  h.knobs.offFiles.delete(SID);
+  await h.refresh();
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+});
+
+test('browser: two quick clicks on the switch write once', async () => {
+  const h = await bootAuto();
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  const write = h.knobs.setOff;
+  h.knobs.setReply = autoDeferred();
+  h.knobs.setOff = (id, off) => h.knobs.setReply.promise.then(() => write(id, off));
+  await clickAuto(h);
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  h.knobs.setReply.resolve();
+  await flush();
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  // The write is in: the next click is a new one.
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true], [SID, false]]);
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+});
+
+test('browser: a main without the two calls shows no switch and leaves the rest of the header as it was', async () => {
+  // A page that has no such call at all: the header every test above this
+  // section sees.
+  const before = await bootEnded();
+  // The new preload against a main started before the change: both invokes
+  // reject, as readCtxState's does there (knobs.ctxFail 'reject').
+  const noHandler = (channel) => () => { throw new Error(`Error invoking remote method '${channel}': No handler registered`); };
+  const h = await bootAuto({ readOff: noHandler('read-handoff-off'), setOff: noHandler('set-handoff-off') });
+  assert.equal(autoSwitch(h).shown, false);
+  assert.deepEqual(h.header(), before.header());
+  assert.deepEqual(h.header(), { meter: true, primary: 'Hand off', primaryEnabled: true, primaryOverride: false, update: false, note: null });
+  assert.deepEqual(meterLook(h), meterLook(before));
+  assert.equal(autoMeterState(h).text, autoMeterState(before).text);
+  // The poll changes none of it, and the switch's element, where the page has
+  // one, takes no click.
+  await h.ticks(3);
+  await before.ticks(3);
+  if (h.byId[AUTO_BTN]) await clickAuto(h);
+  assert.equal(autoSwitch(h).shown, false);
+  assert.deepEqual(h.header(), before.header());
+  assert.deepEqual(h.knobs.offSets, []);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.confirms.length, 0);
+});
+
+test('browser: off by CLAUDE_CTX_HANDOFF: the switch shows off and a click writes nothing', async () => {
+  const h = await bootAuto({ env: true });
+  assert.deepEqual(autoSwitch(h), { shown: true, label: 'Auto handoff off', enabled: false, look: 'off', title: AUTO_ENV_TITLE });
+  assert.equal(autoMeterState(h).text, 'handoff off');
+  await clickAuto(h);
+  await h.advance(2000);
+  assert.deepEqual(h.knobs.offSets, []);
+  assert.deepEqual(autoSwitch(h), { shown: true, label: 'Auto handoff off', enabled: false, look: 'off', title: AUTO_ENV_TITLE });
+});
+
+test('browser: grid view and a task log hide the switch, and a click there writes nothing', async () => {
+  const offs = { 'grid view': ['gridViewActive = true', 'gridViewActive = false'], 'a task log': ['activeTaskView = { id: 7 }', 'activeTaskView = null'] };
+  for (const [name, [on, back]] of Object.entries(offs)) {
+    const h = await bootAuto();
+    assert.deepEqual(autoSwitch(h), AUTO_ON, name);
+    h.run(on);
+    // No render in between: the switch is still on screen until the next tick.
+    await clickAuto(h);
+    assert.deepEqual(h.knobs.offSets, [], name);
+    await h.tick();
+    assert.equal(autoSwitch(h).shown, false, name);
+    await clickAuto(h);
+    await h.advance(2000);
+    assert.deepEqual(h.knobs.offSets, [], name);
+    // Back in the session's own header it is there again, and works.
+    h.run(back);
+    await h.tick();
+    assert.deepEqual(autoSwitch(h), AUTO_ON, name);
+    await clickAuto(h);
+    assert.deepEqual(h.knobs.offSets, [[SID, true]], name);
+  }
+});
+
+test('browser: after a fork the switch reads the new id\'s marker', async () => {
+  // Off under the old id; the new id has no marker.
+  const h = await bootAuto({ off: true });
+  autoNewIdFiles(h);
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  const reads = h.knobs.offReads.length;
+  await forkEvent(h, SID, NEW_SID);
+  assert.deepEqual(h.knobs.offReads.slice(reads), [NEW_SID]);
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  // ...and a click is for the new id.
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[NEW_SID, true]]);
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+
+  // On under the old id; the new id has a marker (main's detector made it).
+  const g = await bootAuto();
+  autoNewIdFiles(g);
+  g.knobs.offFiles.add(NEW_SID);
+  assert.deepEqual(autoSwitch(g), AUTO_ON);
+  await forkEvent(g, SID, NEW_SID);
+  assert.deepEqual(autoSwitch(g), AUTO_OFF);
+});
+
+test('browser: a re-key while the switch is being written does not show an answer for another id, and says to click again', async () => {
+  const h = await bootAuto();
+  autoNewIdFiles(h);
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  h.knobs.setReply = autoDeferred();
+  h.knobs.setOff = () => h.knobs.setReply.promise;
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  await forkEvent(h, SID, NEW_SID);
+  // Past the 500 ms rule, so that the read the click asks for is a read.
+  await h.advance(600);
+  const reads = h.knobs.offReads.length;
+  // An answer for the id the click was sent with: that id's marker was made,
+  // not this session's.
+  h.knobs.offFiles.add(SID);
+  h.knobs.setReply.resolve({ ok: true, off: true, env: false, code: null, id: SID });
+  await flush();
+  assert.equal(h.header().note, AUTO_REKEYED);
+  assert.deepEqual(h.knobs.offReads.slice(reads), [NEW_SID], 'the new id is read');
+  assert.deepEqual(autoSwitch(h), AUTO_ON, 'the new id has no marker: the answer for the old id is not shown');
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  assert.equal(h.confirms.length, 0);
+});
+
+test('browser: a fork between a click and its answer ends with the switch showing what was clicked', async () => {
+  const h = await bootAuto();
+  autoNewIdFiles(h);
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  h.knobs.setReply = autoDeferred();
+  h.knobs.setOff = () => h.knobs.setReply.promise;
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  await forkEvent(h, SID, NEW_SID);
+  // Main had re-keyed before the write reached it: it made the live id's
+  // marker and answers with that id.
+  h.knobs.offFiles.add(NEW_SID);
+  h.knobs.setReply.resolve({ ok: true, off: true, env: false, code: null, id: NEW_SID });
+  await flush();
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  assert.equal(h.header().note, null);
+  // The next read of the new id says the same.
+  await autoRefresh(h, NEW_SID);
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+});
+
+test('browser: a switch click that fails while a Hand off request is out shows the file as it is, and its note once the request ends', async () => {
+  const h = await bootAuto();
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  await h.click('primary');
+  await h.advance(250);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+  assert.equal(h.header().primary, `Writing${ELLIPSIS}`);
+  h.knobs.setOff = (id) => ({ ok: false, off: false, env: false, code: 'EPERM', id });
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  assert.deepEqual(autoSwitch(h), AUTO_ON, 'the file as it is: no marker');
+  assert.equal(h.header().primary, `Writing${ELLIPSIS}`);
+  assert.equal(h.header().note, null, 'no note beside "Writing…"');
+  // The handoff is written half a minute later: the request ends, and the
+  // note of the failed click is within its 60 s.
+  const clickS = h.request().atMs / 1000;
+  h.setHandoffFile(true);
+  h.setState(endedState(h, {
+    crossed_at: clickS + 0.2, written_at: clickS + 20, handoff_path: VM_HANDOFF,
+    last_prompt_at: clickS + 0.2, last_stop_at: clickS + 25,
+  }));
+  await h.advance(30000);
+  await h.refresh();
+  assert.equal(h.request().phase, 'idle');
+  assert.equal(h.header().primary, 'Continue in new session');
+  assert.equal(h.header().note, AUTO_FAILED_OFF + ' (EPERM).');
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  assert.equal(h.confirms.length, 0);
+});
+
+test('browser: a click\'s write that is on its way blocks a second click after a fork too', async () => {
+  const h = await bootAuto();
+  autoNewIdFiles(h);
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  h.knobs.setReply = autoDeferred();
+  h.knobs.setOff = () => h.knobs.setReply.promise;
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  await forkEvent(h, SID, NEW_SID);
+  // The second click, on the session under its new id, while the first write
+  // is still out.
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  h.knobs.offFiles.add(NEW_SID);
+  h.knobs.setReply.resolve({ ok: true, off: true, env: false, code: null, id: NEW_SID });
+  await flush();
+  assert.deepEqual(h.knobs.offSets, [[SID, true]]);
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+});
+
+test('browser: while off, a Hand off request leaves the meter at "handoff off" and the button at "Writing…"', async () => {
+  const h = await bootAuto({ off: true });
+  assert.equal(autoMeterState(h).text, 'handoff off');
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  await h.click('primary');
+  await h.advance(250);
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [SID, '\r']]);
+  // The hook took the request: a crossing of its own kind (manual), pending
+  // until the file is written. With prompts on the meter would say "handoff due".
+  const clickS = h.request().atMs / 1000;
+  h.setState(endedState(h, { pending: true, manual: true, crossed_at: clickS + 0.2, last_prompt_at: clickS + 0.2 }));
+  await h.refresh();
+  assert.equal(h.inputs().state.manual, true);
+  assert.equal(h.inputs().state.pending, true);
+  assert.deepEqual(autoMeterState(h), {
+    shown: true, text: 'handoff off', className: 'handoff-meter-state handoff-off', title: AUTO_METER_TITLE,
+  });
+  assert.equal(h.header().primary, `Writing${ELLIPSIS}`);
+  assert.equal(h.header().primaryEnabled, false);
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+});

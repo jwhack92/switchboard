@@ -11,6 +11,7 @@ const fs = require('fs');
  */
 let PROJECTS_DIR, activeSessions, sendToOwner, rekeyOwner, log, rekeyMcpServer;
 let copySessionAssignment, rekeyPlanLinks, rekeyScheduleSession, copyStar, readClearOrigin, broadcast, ownerId, now, setTimer, clearTimer;
+let copyHandoffOff;
 let clearFolders = new Map();
 
 function init(ctx) {
@@ -31,6 +32,7 @@ function init(ctx) {
   rekeyPlanLinks = ctx.rekeyPlanLinks || (() => {});
   rekeyScheduleSession = ctx.rekeyScheduleSession || (() => {});
   copyStar = ctx.copyStar || (() => {});
+  copyHandoffOff = ctx.copyHandoffOff || (() => {});
   readClearOrigin = ctx.readClearOrigin || (() => null);
   broadcast = ctx.broadcast || (() => {});
   ownerId = ctx.ownerId || (() => null);
@@ -204,6 +206,7 @@ function rekey(session, oldId, newId, kind, signals) {
     ['rekeyScheduleSession', rekeyScheduleSession],
   ];
   if (kind === 'clear') followUps.push(['copyStar', copyStar]);
+  followUps.push(['copyHandoffOff', copyHandoffOff]);
   for (const [name, followUp] of followUps) {
     try {
       followUp(oldId, newId);
