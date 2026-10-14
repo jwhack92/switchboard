@@ -6827,3 +6827,38 @@ test('browser: while off, a Hand off request leaves the meter at "handoff off" a
   assert.equal(h.header().primaryEnabled, false);
   assert.deepEqual(autoSwitch(h), AUTO_OFF);
 });
+
+test('browser: a switch click that works clears the note an earlier switch click left, and leaves a note another control wrote', async () => {
+  // The write failed, and the note says so.
+  const h = await bootAuto();
+  const write = h.knobs.setOff;
+  h.knobs.setOff = (id) => ({ ok: false, off: false, env: false, code: 'EPERM', id });
+  await clickAuto(h);
+  assert.equal(h.header().note, AUTO_FAILED_OFF + ' (EPERM).');
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  // The next click works: the switch reads off and the note of the failed one is gone.
+  h.knobs.setOff = write;
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true], [SID, true]]);
+  assert.deepEqual(autoSwitch(h), AUTO_OFF);
+  assert.equal(h.header().note, null);
+
+  // A note another control wrote stays when a switch click works.
+  const NOTE = 'Not typed. The session changed.';
+  h.run(`handoffSetClickNote(handoffRt.cache.get('${SID}'), ${JSON.stringify(NOTE)})`);
+  assert.equal(h.header().note, NOTE);
+  await clickAuto(h);
+  assert.deepEqual(h.knobs.offSets, [[SID, true], [SID, true], [SID, false]]);
+  assert.deepEqual(autoSwitch(h), AUTO_ON);
+  assert.equal(h.header().note, NOTE);
+  assert.equal(h.confirms.length, 0);
+  assert.deepEqual(h.sent, []);
+
+  // Each other note the switch writes goes too when a click works.
+  for (const note of [AUTO_FAILED_ON + ' (EPERM).', AUTO_REKEYED]) {
+    h.run(`handoffSetClickNote(handoffRt.cache.get('${SID}'), ${JSON.stringify(note)})`);
+    assert.equal(h.header().note, note);
+    await clickAuto(h);
+    assert.equal(h.header().note, null);
+  }
+});

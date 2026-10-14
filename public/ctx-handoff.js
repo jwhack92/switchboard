@@ -830,7 +830,7 @@ function pollDue(tick, ids) {
 // THRESHOLD and REARM_STEP, and AUTO_OFF_TITLE says what the hook does today
 // with a session that is opted out (ctx_handoff.py, "Opt-out").
 const AUTO_ON_TITLE = 'Automatic handoff prompts are on: the hook asks this session for a handoff when its context passes the trigger (400K, then 150K past each handoff). Click to turn them off for this session. Hand off and Update still work.';
-const AUTO_OFF_TITLE = 'Automatic handoff prompts are off for this session. Hand off and Update still work. While off, the hook also gives the session no handoff back after a compaction. Click to turn them back on: if the context is past the trigger, the session is asked for a handoff at its next turn end, even if it wrote one while off.';
+const AUTO_OFF_TITLE = 'Automatic handoff prompts are off for this session. Hand off and Update still work. Click to turn them back on: if the context is past the trigger, the session is asked for a handoff at its next turn end.';
 const AUTO_ENV_TITLE = 'Automatic handoff prompts are off for every session Switchboard starts: CLAUDE_CTX_HANDOFF is set in its environment. This switch cannot turn them on. Hand off and Update still work.';
 // Why a click on the switch came to nothing: text in the header note, where
 // " (<code>)." follows when main gave a code, else ".".
@@ -2281,6 +2281,10 @@ async function handoffSetAuto(id) {
   if (!res || res.ok !== true) {
     const code = res && typeof res.code === 'string' && res.code ? ' (' + res.code + ').' : '.';
     handoffSetClickNote(entry, (model.target ? AUTO_FAILED_OFF : AUTO_FAILED_ON) + code);
+  } else if (typeof entry.ultraNote === 'string'
+    && (entry.ultraNote.startsWith(AUTO_FAILED_OFF) || entry.ultraNote.startsWith(AUTO_FAILED_ON)
+      || entry.ultraNote === AUTO_REKEYED)) {
+    handoffSetClickNote(entry, '');
   }
   handoffPaint(entry.id);
 }
