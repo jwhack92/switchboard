@@ -1038,8 +1038,9 @@ function handoffSetRequest(entry, request) {
 // running program or about this window's last click; it stays with the
 // terminal. 'conversation': a fact about the conversation, its files or its
 // handoff. A clear re-key gives every conversation field its fresh value and
-// carries every terminal field. `typed`, the hand-typed record, is in the
-// table whether or not the entry still has the field.
+// keeps the terminal fields (request and ultraConfirmed by the rules of
+// entryAfterClear). `typed`, the hand-typed record, is in the table whether
+// or not the entry still has the field.
 const ENTRY_FIELD_CLASS = Object.freeze({
   id: 'conversation',
   sidecar: 'conversation',
