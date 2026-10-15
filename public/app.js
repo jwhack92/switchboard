@@ -403,9 +403,16 @@ window.api.onSessionDetected((tempId, realId) => {
   pollActiveSessions();
 });
 
-window.api.onSessionForked((oldId, newId) => {
+window.api.onSessionForked((oldId, newId, reason, info) => {
   const entry = openSessions.get(oldId);
   if (!entry) return;
+  let clearName = null;
+  if (reason === 'clear') {
+    try {
+      if (typeof handoffContinueName === 'function') clearName = handoffContinueName(oldId);
+    } catch {}
+    if (typeof clearName !== 'string' || !clearName.trim()) clearName = null;
+  }
 
   entry.session.sessionId = newId;
   if (activeSessionId === oldId) setActiveSession(newId);
@@ -429,18 +436,35 @@ window.api.onSessionForked((oldId, newId) => {
 
   terminalHeaderId.textContent = newId;
 
-  // Main moves the running session to the new id but not its saved name
-  // (session-transitions.js), so the reload below would bring the row back
-  // unnamed. Save the name under the new id first, the way a rename does, and
-  // keep a name Continue gave "ours" (ctx-handoff.js handoffNameStore), so the
-  // next Continue still counts its number up. Neither may stop the re-key.
+  // What follows a re-key lives in three places, on purpose.
+  //   main (session-transitions.js rekey): everything that is a database row or
+  //     a main-process map: the owner, the pin, the project filing, plan links,
+  //     the schedule.
+  //   here: this window's own maps (above) and the name, because the list of
+  //     names Continue has given is in the window's storage (continue-name.js).
+  //   ctx-handoff.js (its own listener, which runs before this one): the handoff
+  //     entry.
+  // The name. A fork or a plan-accept is the same conversation under a new id:
+  // its saved name goes along unchanged, and stays "ours" if Continue gave it.
+  // A /clear starts a new conversation in the same terminal: it gets the name
+  // Continue would give (handoffContinueName: the title the session was showing
+  // and the next number), asked above under the OLD id, before anything moved.
+  // The cleared conversation keeps its name. Main has to know the name before
+  // the reload below, or the row comes back unnamed. Nothing here may stop the
+  // re-key. The header title is not written here: syncTerminalHeaderName, at
+  // the end of loadProjects, is its only writer.
+  if (reason === 'clear') entry.session.name = clearName;
   const carriedName = entry.session.name;
   if (typeof carriedName === 'string' && carriedName.trim()) {
     const notSaved = (err) => console.warn('[fork] the session name was not carried to the new id', err);
     try { Promise.resolve(window.api.renameSession(newId, carriedName)).catch(notSaved); } catch (err) { notSaved(err); }
     try {
       const names = typeof handoffNameStore === 'function' ? handoffNameStore() : null;
-      if (names && names.isOurs(oldId, carriedName)) names.remember(newId, carriedName);
+      if (reason === 'clear') {
+        if (names) names.remember(newId, carriedName);
+      } else {
+        if (names && names.isOurs(oldId, carriedName)) names.remember(newId, carriedName);
+      }
     } catch {}
   }
 

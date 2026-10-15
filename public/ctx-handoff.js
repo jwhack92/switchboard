@@ -81,6 +81,11 @@ const OVERRIDE_TITLE_UNSEEN = 'This window has seen no busy or idle event for th
 // does for the request line.
 const ULTRACODE_TEXT = { on: '/effort ultracode', off: '/effort ultracode off' };
 const ULTRACODE_UNKNOWN_TITLE = 'Not known yet. The hook reports it after the session\'s first turn.';
+// T6's tooltip (the /clear trial's fallback): what the Ultracode button would say if it had to
+// wait for the cleared session's first idle title. Only the text is kept here, with a test of it.
+// Nothing reads it: the behaviour is built only if the trial fails, and then as an input of
+// typingGate, the one gate, not of ultracodeModel.
+const CLEAR_WAIT_REASON = 'Session is starting again after /clear';
 // Why the last switch came to nothing: text in the header note.
 const ULTRACODE_NOT_CONFIRMED = 'No confirmation seen';
 const ULTRACODE_NO_WORKFLOWS = 'Ultracode needs dynamic workflows enabled (see /config).';
@@ -1029,42 +1034,98 @@ function handoffSetRequest(entry, request) {
   handoffStoreRequest(entry);
 }
 
+// The class of every field of a handoff entry. 'terminal': a fact about the
+// running program or about this window's last click; it stays with the
+// terminal. 'conversation': a fact about the conversation, its files or its
+// handoff. A clear re-key gives every conversation field its fresh value and
+// carries every terminal field. `typed`, the hand-typed record, is in the
+// table whether or not the entry still has the field.
+const ENTRY_FIELD_CLASS = Object.freeze({
+  id: 'conversation',
+  sidecar: 'conversation',
+  state: 'conversation',
+  handoffReadable: 'conversation',
+  readableFor: 'conversation',
+  readableCheckedAtMs: 'conversation',
+  request: 'terminal',
+  lastBusyAtMs: 'terminal',
+  seenBusyEvent: 'terminal',
+  mainBusy: 'terminal',
+  notRunningSinceMs: 'conversation',
+  continueLockUntil: 'conversation',
+  continueError: 'conversation',
+  continueErrorAtMs: 'conversation',
+  pruneMarked: 'conversation',
+  turn: 'conversation',
+  readAtMs: 'conversation',
+  typed: 'terminal',
+  ultraConfirmed: 'terminal',
+  ultraSwitch: 'terminal',
+  ultraNote: 'terminal',
+  ultraNoteAtMs: 'terminal',
+  autoOff: 'terminal',
+  autoEnv: 'terminal',
+  autoSeq: 'terminal',
+  autoSaving: 'terminal',
+});
+
+function freshEntry(id) {
+  return {
+    id, sidecar: null, state: null,
+    handoffReadable: false,
+    readableFor: null,       // the written_at value handoffReadable was checked for
+    readableCheckedAtMs: 0,  // when that check ran
+    request: handoffIdleRequest(),
+    lastBusyAtMs: null,
+    // This window has had a cli-busy-state event (busy or idle) for the
+    // session since this script loaded. Deliberately NOT kept across a
+    // reload: that is exactly when the busy map starts out empty.
+    seenBusyEvent: false,
+    // The busy flag as main reported it on the last read: true / false, or
+    // null when the reply carried none (always, until main has that step).
+    mainBusy: null,
+    notRunningSinceMs: 0,    // first time a request's session was seen not running
+    continueLockUntil: 0,    // Continue ignores clicks until then
+    continueError: '',       // why the last Continue came to nothing
+    continueErrorAtMs: 0,
+    pruneMarked: false,      // handoffPrune found it unneeded on its last pass
+    // The last whole turn this window watched, { busyAtMs, idleAtMs }, and
+    // when the files were last read: what staleReading goes by. Not kept
+    // across a reload either.
+    turn: null,
+    readAtMs: 0,
+    ultraConfirmed: null,    // { value, atMs }: the last switch the terminal confirmed
+    ultraSwitch: null,       // { target, atMs } while a typed switch waits for the terminal's line
+    ultraNote: '',           // why the last switch came to nothing
+    ultraNoteAtMs: 0,
+    autoOff: null,           // the hook's opt-out marker <id>.off as main read it: true / false, null = not told
+    autoEnv: false,          // Switchboard's own environment opts every session out
+    autoSeq: 0,              // counts the clicks on the switch: a read applies only if no click went out while it was away
+    autoSaving: false,       // a click's write of the marker is on its way
+  };
+}
+
+function entryAfterClear(entry, newId, opts) {
+  const next = freshEntry(newId);
+  for (const field of Object.keys(next)) {
+    if (ENTRY_FIELD_CLASS[field] === 'terminal') next[field] = entry[field];
+  }
+  const clearedAtMs = opts ? opts.clearedAtMs : undefined;
+  const request = entry.request;
+  next.request = typeof clearedAtMs === 'number' && Number.isFinite(clearedAtMs)
+    && request && typeof request.atMs === 'number' && request.atMs >= clearedAtMs
+    ? request : handoffIdleRequest();
+  const shown = ultracodeValue(entry.state, entry.ultraConfirmed);
+  next.ultraConfirmed = typeof shown === 'boolean' ? { value: shown, atMs: opts ? opts.nowMs : undefined } : null;
+  return next;
+}
+
 function handoffEntry(id) {
   let entry = handoffRt.cache.get(id);
   if (!entry) {
-    entry = {
-      id, sidecar: null, state: null,
-      handoffReadable: false,
-      readableFor: null,       // the written_at value handoffReadable was checked for
-      readableCheckedAtMs: 0,  // when that check ran
-      request: handoffRestoreRequest(id) || handoffIdleRequest(),
-      lastBusyAtMs: null,
-      // This window has had a cli-busy-state event (busy or idle) for the
-      // session since this script loaded. Deliberately NOT kept across a
-      // reload: that is exactly when the busy map starts out empty.
-      seenBusyEvent: false,
-      // The busy flag as main reported it on the last read: true / false, or
-      // null when the reply carried none (always, until main has that step).
-      mainBusy: null,
-      notRunningSinceMs: 0,    // first time a request's session was seen not running
-      continueLockUntil: 0,    // Continue ignores clicks until then
-      continueError: '',       // why the last Continue came to nothing
-      continueErrorAtMs: 0,
-      pruneMarked: false,      // handoffPrune found it unneeded on its last pass
-      // The last whole turn this window watched, { busyAtMs, idleAtMs }, and
-      // when the files were last read: what staleReading goes by. Not kept
-      // across a reload either.
-      turn: null,
-      readAtMs: 0,
-      ultraConfirmed: handoffRestoreUltracode(id), // { value, atMs }: the last switch the terminal confirmed
-      ultraSwitch: null,       // { target, atMs } while a typed switch waits for the terminal's line
-      ultraNote: '',           // why the last switch came to nothing
-      ultraNoteAtMs: 0,
-      autoOff: null,           // the hook's opt-out marker <id>.off as main read it: true / false, null = not told
-      autoEnv: false,          // Switchboard's own environment opts every session out
-      autoSeq: 0,              // counts the clicks on the switch: a read applies only if no click went out while it was away
-      autoSaving: false,       // a click's write of the marker is on its way
-    };
+    entry = freshEntry(id);
+    entry.request = handoffRestoreRequest(id) || handoffIdleRequest();
+    entry.ultraConfirmed = handoffRestoreUltracode(id);
     handoffRt.cache.set(id, entry);
   }
   return entry;
@@ -2414,12 +2475,21 @@ function handoffInit() {
     api.onProcessExited(handoffGuard('exit listener failed', (sessionId) => handoffRefresh(sessionId)));
   }
   if (typeof api.onSessionForked === 'function') {
-    api.onSessionForked(handoffGuard('fork listener failed', (oldId, newId) => {
+    api.onSessionForked(handoffGuard('fork listener failed', (oldId, newId, reason, info) => {
       const entry = handoffRt.cache.get(oldId);
       if (entry && typeof newId === 'string') {
         handoffRt.cache.delete(oldId);
         handoffForgetStored(oldId);
-        entry.id = newId;
+        // The entry is the terminal's record, so the SAME object moves for every kind of
+        // re-key: the typing path and the looks hold it. A fork or a plan-accept continues
+        // the conversation and takes everything along. A /clear starts a new conversation
+        // in the same terminal: every field gets its fresh value, and only the terminal's
+        // own facts stay (ENTRY_FIELD_CLASS, entryAfterClear).
+        if (reason === 'clear') {
+          Object.assign(entry, entryAfterClear(entry, newId, { clearedAtMs: info && info.clearedAtMs, nowMs: Date.now() }));
+        } else {
+          entry.id = newId;
+        }
         handoffRt.cache.set(newId, entry);
         handoffStoreRequest(entry);
         handoffStoreUltracode(entry);
@@ -2436,6 +2506,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    freshEntry, ENTRY_FIELD_CLASS, entryAfterClear, CLEAR_WAIT_REASON,
     REQUEST_LINE, WARN_AT, DUE_AT, OVERRIDE_TITLE, OVERRIDE_TITLE_UNSEEN,
     HANDOFF_NOT_LANDED, HANDOFF_NOT_WRITTEN, HANDOFF_SESSION_ENDED,
     HANDOFF_NOT_SENT, ENTER_HOLD,

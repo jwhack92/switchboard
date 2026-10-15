@@ -516,7 +516,7 @@ test('launchNewSession: a terminal that cannot be opened answers null', async ()
 // reload that follows would bring the row back unnamed: the sibling "Relaunch
 // work 2" would lose its name, and the next Continue would start over at 2.
 
-const FORKED = cut(fs.readFileSync(APP, 'utf8'), 'window.api.onSessionForked((oldId, newId) => {', 'window.api.onProcessExited(', 'app.js');
+const FORKED = cut(fs.readFileSync(APP, 'utf8'), 'window.api.onSessionForked((oldId, newId, reason, info) => {', 'window.api.onProcessExited(', 'app.js');
 
 /**
  * The listener in a context of its own, with one open session 'old-id'.
@@ -622,6 +622,172 @@ test('session id change: nothing in carrying the name can stop the re-key', asyn
     assert.deepEqual(app.calls.order.filter((c) => c === 'load'), ['load']);
     assert.equal(app.calls.warns.length, warnings);
   }
+});
+
+const sourceCut = require('../test-support/source-cut');
+const REKEY = sourceCut.cut('public/app.js', 'window.api.onSessionForked((oldId, newId, reason, info) => {', 'window.api.onProcessExited(');
+
+/**
+ * The same listener for a re-key with a reason, with one open session 'old-id'.
+ *   session   that session's fields
+ *   rename    what window.api.renameSession does, or null for none
+ *   names     the store handoffNameStore() answers
+ *   rule      what handoffContinueName is: undefined = the rule Continue uses, asked the
+ *             way ctx-handoff.js asks it (by id, from the row the window has under that
+ *             id); null = ctx-handoff.js is not loaded; a function = that function.
+ *             The stand-in for the rule leaves out one input of the real
+ *             handoffContinueName on purpose: `taken`, the count past a title another
+ *             session of the window already shows. That is the rule's own business and
+ *             continuedName's tests above hold it; this boot has one session.
+ *   active    the id of the session in view (activeSessionId), or null for none
+ */
+function bootRekey({ session = {}, rename = async () => ({}), names = createStore(fakeStorage()), rule, active = null } = {}) {
+  const calls = { order: [], renames: [], warns: [], asked: [], active: [] };
+  let listener = null;
+  const api = { onSessionForked: (cb) => { listener = cb; } };
+  if (rename) api.renameSession = (id, name) => { calls.order.push('rename'); calls.renames.push([id, name]); return rename(id, name); };
+  const row = { sessionId: 'old-id', name: null, ...session };
+  const sessionMap = new Map([['old-id', row]]);
+  const globals = {
+    console: { warn: (...a) => calls.warns.push(a), error() {}, log() {} },
+    openSessions: new Map([['old-id', { session: row }]]),
+    pendingSessions: new Map(),
+    sessionMap,
+    activeSessionId: active,
+    // The view moves: recorded with how often the rule had been asked by then.
+    setActiveSession: (id) => { calls.order.push('active'); calls.active.push([id, calls.asked.length]); },
+    rekeySessionMaps() {},
+    terminalHeaderId: { textContent: '' },
+    terminalHeaderName: { textContent: '' },
+    document: { querySelector: () => null, querySelectorAll: () => [] },
+    loadProjects: async () => { calls.order.push('load'); },
+    pollActiveSessions() {},
+    handoffNameStore: () => names,
+    window: { api },
+  };
+  if (rule !== null) {
+    globals.handoffContinueName = rule || ((id) => {
+      calls.asked.push(id);
+      const s = sessionMap.get(id);
+      // Asked too late (the row already carries the new id, or has left this key): no name.
+      if (!s || s.sessionId !== id) return null;
+      return continuedName(s.name || s.aiTitle || s.summary || '', { ours: names.isOurs(id, s.name) });
+    });
+  }
+  const ctx = sourceCut.load(REKEY, { file: 'public/app.js', globals });
+  return { ctx, calls, row, names, rekey: (...args) => listener(...args) };
+}
+const CLEAR = ['clear', { clearedAtMs: 1000000 }];
+
+test('session id change (clear): the new id gets the name Continue would give, saved before the lists are read again', async () => {
+  const LONG = 'A title that is far longer than forty characters in all';
+  const rows = [
+    [{ name: 'Relaunch work' }, 'Relaunch work 2'],                    // a named session
+    [{ name: null, aiTitle: 'Fix login bug' }, 'Fix login bug 2'],     // unnamed: the title it was showing (decision 3)
+    [{ name: 'Upgrade Electron 41' }, 'Upgrade Electron 41 2'],        // a number of its own is not counted up
+    [{ name: null, summary: LONG }, continuedName(LONG)],              // cut before the number
+  ];
+  assert.ok(rows[3][1].endsWith(' 2') && rows[3][1].length < LONG.length);
+  for (const [session, want] of rows) {
+    const app = bootRekey({ session });
+    app.rekey('old-id', 'new-id', ...CLEAR);
+    await settle();
+    assert.deepEqual(app.calls.renames, [['new-id', want]], want);
+    assert.deepEqual(app.calls.order, ['rename', 'load'], 'main has the name before it is asked for the sessions');
+    assert.equal(app.ctx.sessionMap.get('new-id'), app.row);
+    assert.equal(app.row.name, want, 'the row this window shows carries it at once');
+    assert.equal(app.names.isOurs('new-id', want), true, 'so the next clear or Continue counts up');
+    assert.deepEqual(app.calls.asked, ['old-id'], 'the rule is asked once, under the old id, before anything moves');
+    assert.equal(app.calls.warns.length, 0);
+  }
+});
+
+test('session id change (clear): a name of ours counts up; the cleared row keeps its own', async () => {
+  const names = createStore(fakeStorage());
+  names.remember('old-id', 'Relaunch work 2');
+  const app = bootRekey({ session: { name: 'Relaunch work 2' }, names });
+  app.rekey('old-id', 'new-id', ...CLEAR);
+  await settle();
+  assert.deepEqual(app.calls.renames, [['new-id', 'Relaunch work 3']]);
+  assert.equal(names.isOurs('new-id', 'Relaunch work 3'), true);
+  assert.equal(names.isOurs('old-id', 'Relaunch work 2'), true, 'nothing renames or forgets the cleared conversation');
+  // The same session through a fork keeps its name unchanged: only a clear asks the rule.
+  const forked = bootRekey({ session: { name: 'Relaunch work 2' } });
+  forked.rekey('old-id', 'new-id');
+  await settle();
+  assert.deepEqual(forked.calls.renames, [['new-id', 'Relaunch work 2']]);
+  assert.deepEqual(forked.calls.asked, []);
+});
+
+test('session id change (clear): a session with nothing to carry gets no name', async () => {
+  const nothing = [
+    { session: { name: null } },
+    { session: { name: null, summary: PLACEHOLDER } },                 // still titled 'New session'
+    { session: { name: 'Relaunch work' }, rule: null },                // ctx-handoff.js is not loaded
+    { session: { name: 'Relaunch work' }, rule: () => null },
+    { session: { name: 'Relaunch work' }, rule: () => '   ' },
+    { session: { name: 'Relaunch work' }, rule: () => 41 },
+  ];
+  for (const options of nothing) {
+    const app = bootRekey(options);
+    app.rekey('old-id', 'new-id', ...CLEAR);
+    await settle();
+    assert.deepEqual(app.calls.renames, [], JSON.stringify(options.session));
+    assert.deepEqual(app.calls.order, ['load']);
+    assert.equal(app.row.name, null, 'the cleared conversation\'s name is not shown for a session that has none saved');
+    assert.equal(app.names.isOurs('new-id', 'Relaunch work'), false);
+  }
+  // A session this window does not have open is not its to name (C3's limit).
+  const other = bootRekey({ session: { name: 'Relaunch work' } });
+  other.rekey('someone-elses', 'new-id', ...CLEAR);
+  await settle();
+  assert.deepEqual(other.calls.order, []);
+  assert.deepEqual(other.calls.asked, []);
+});
+
+test('session id change (clear): the header id moves, the header title is not written here, and nothing in naming can stop the re-key', async () => {
+  const brokenStore = { isOurs() { throw new Error('store broke'); }, remember() { throw new Error('store broke'); } };
+  // [what the window has, how many warnings that is]
+  const ways = [
+    [{}, 0],
+    [{ rule: () => { throw new Error('rule broke'); } }, 0],
+    [{ rename: () => Promise.reject(new Error('no handler registered')) }, 1],
+    [{ rename: () => { throw new Error('ipc is gone'); } }, 1],
+    [{ rename: null }, 1],
+    [{ names: brokenStore, rule: () => 'Relaunch work 2' }, 0],
+  ];
+  for (const [has, warnings] of ways) {
+    const app = bootRekey({ session: { name: 'Relaunch work' }, ...has });
+    assert.doesNotThrow(() => app.rekey('old-id', 'new-id', ...CLEAR));
+    await settle();
+    assert.equal(app.ctx.sessionMap.get('new-id'), app.row);
+    assert.equal(app.ctx.sessionMap.has('old-id'), false);
+    assert.equal(app.ctx.openSessions.has('new-id'), true);
+    assert.equal(app.row.sessionId, 'new-id');
+    assert.equal(app.ctx.terminalHeaderId.textContent, 'new-id');
+    assert.equal(app.ctx.terminalHeaderName.textContent, '', 'syncTerminalHeaderName is the only writer of the title');
+    assert.deepEqual(app.calls.order.filter((c) => c === 'load'), ['load']);
+    assert.equal(app.calls.warns.length, warnings);
+  }
+  assert.doesNotMatch(REKEY, /terminalHeaderName\.textContent\s*=/);
+});
+
+// The cleared session is the one in view: every boot above has no session in view.
+test('session id change (clear): the session in view moves to the new id once, after the rule was asked under the old id and before the lists are read again', async () => {
+  const app = bootRekey({ session: { name: 'Relaunch work' }, active: 'old-id' });
+  app.rekey('old-id', 'new-id', ...CLEAR);
+  await settle();
+  assert.deepEqual(app.calls.renames, [['new-id', 'Relaunch work 2']]);
+  assert.deepEqual(app.calls.asked, ['old-id']);
+  assert.deepEqual(app.calls.active, [['new-id', 1]], 'one move of the view, made after the one question to the rule');
+  assert.deepEqual(app.calls.order, ['active', 'rename', 'load']);
+  assert.equal(app.ctx.terminalHeaderId.textContent, 'new-id', 'C1: the header shows the new id');
+  // Another session is in view: the view stays where it is.
+  const other = bootRekey({ session: { name: 'Relaunch work' }, active: 'some-other-id' });
+  other.rekey('old-id', 'new-id', ...CLEAR);
+  await settle();
+  assert.deepEqual(other.calls.active, []);
+  assert.deepEqual(other.calls.renames, [['new-id', 'Relaunch work 2']]);
 });
 
 // --- The rename box (public/sidebar.js startRename) ---

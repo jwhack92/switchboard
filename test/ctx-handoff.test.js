@@ -4558,6 +4558,31 @@ async function forkEvent(h, oldId, newId) {
   await flush();
 }
 
+// A session-forked event for a /clear, as the window gets it: four arguments.
+// The rest is forkEvent's: what app.js's own listener does to this fake window's globals.
+async function clearEvent(h, oldId, newId, clearedAtMs) {
+  h.listeners.fork(oldId, newId, 'clear', { clearedAtMs });
+  h.run(`(() => {
+    const session = sessionMap.get('${oldId}');
+    session.sessionId = '${newId}';
+    sessionMap.delete('${oldId}');
+    sessionMap.set('${newId}', session);
+    if (activeSessionId === '${oldId}') activeSessionId = '${newId}';
+    activePtyIds = new Set([...activePtyIds].map(id => (id === '${oldId}' ? '${newId}' : id)));
+  })()`);
+  await flush();
+}
+
+// h.refresh() for a session other than SID.
+async function refreshId(h, id) {
+  await h.advance(600);
+  await h.run(`handoffRefresh('${id}')`);
+  await flush();
+  h.run('handoffRenderHeader()');
+}
+const stateFile = (id) => VM_DIR + '\\' + id + '.state.json';
+const entryOf = (h, id) => JSON.parse(h.run(`JSON.stringify(handoffRt.cache.get('${id}') || null)`));
+
 test('browser (pin): with a terminal showing an empty prompt, a plain Hand off click types the line and Enter follows as a second write, with no question', async (t) => {
   const POINTER = '❯';
   const RULE_ROW = /^─{10,}/;
@@ -6861,4 +6886,390 @@ test('browser: a switch click that works clears the note an earlier switch click
     await clickAuto(h);
     assert.equal(h.header().note, null);
   }
+});
+
+test("preload source check: 'session-forked' forwards four arguments", () => {
+  const preload = fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8');
+  assert.ok(preload.includes(
+    "ipcRenderer.on('session-forked', (_event, oldId, newId, reason, info) => callback(oldId, newId, reason, info));"),
+    'the reason and the clear time reach the windows');
+  assert.equal(preload.split("ipcRenderer.on('session-forked'").length - 1, 1, 'one listener for the channel');
+});
+
+const {
+  freshEntry, ENTRY_FIELD_CLASS, entryAfterClear, CLEAR_WAIT_REASON,
+} = require('../public/ctx-handoff');
+
+test('clear re-key: every field of a fresh handoff entry is classed as terminal or conversation', () => {
+  const fresh = freshEntry(SID);
+  // Every field has a class. The one name the table may hold that the entry
+  // does not is `typed`: the hand-typed record, which its own commit removes
+  // and a revert of that commit brings back.
+  for (const field of Object.keys(fresh)) {
+    assert.ok(ENTRY_FIELD_CLASS[field] === 'terminal' || ENTRY_FIELD_CLASS[field] === 'conversation',
+      `the entry field "${field}" has no class: say whether it belongs to the terminal or to the conversation`);
+  }
+  for (const field of Object.keys(ENTRY_FIELD_CLASS)) {
+    assert.ok(field in fresh || field === 'typed', `the table names "${field}", which a fresh entry does not have`);
+  }
+  assert.ok(Object.isFrozen(ENTRY_FIELD_CLASS));
+  const terminal = Object.keys(ENTRY_FIELD_CLASS).filter((f) => ENTRY_FIELD_CLASS[f] === 'terminal').sort();
+  assert.deepEqual(terminal, [
+    'autoEnv', 'autoOff', 'autoSaving', 'autoSeq',
+    'lastBusyAtMs', 'mainBusy', 'request', 'seenBusyEvent', 'typed',
+    'ultraConfirmed', 'ultraNote', 'ultraNoteAtMs', 'ultraSwitch',
+  ]);
+  // A fresh entry reads nothing from storage.
+  assert.equal(fresh.id, SID);
+  assert.deepEqual(fresh.request, { phase: 'idle', atMs: 0, reason: '' });
+  assert.equal(fresh.ultraConfirmed, null);
+  assert.notEqual(freshEntry(SID), fresh, 'a new object each time');
+  // The live entry is built from it: same fields, no more and no fewer.
+  const h = boot();
+  assert.deepEqual(
+    JSON.parse(h.run(`JSON.stringify(Object.keys(handoffEntry('${SID}')).sort())`)),
+    Object.keys(fresh).sort());
+});
+
+test('renderer: the entry after a clear (pure function)', async (t) => {
+  const CLEARED = 1000000;        // info.clearedAtMs: when the hook saw the cleared session start
+  const NOW = CLEARED + 4000;     // when the re-key reached this window
+  const SWITCH = { target: 'off', atMs: 999000 };
+  const old = (over = {}) => Object.assign(freshEntry(SID), {
+    sidecar: VM_SIDECAR,
+    state: { ultracode: false, last_stop_at: 10, handoff_path: 'C:\\h\\handoff.md', written_at: 5 },
+    handoffReadable: true, readableFor: 5, readableCheckedAtMs: 77,
+    request: { phase: 'idle', atMs: CLEARED - 1, reason: 'left over' },
+    lastBusyAtMs: 900000, seenBusyEvent: true, mainBusy: false,
+    notRunningSinceMs: 3, continueLockUntil: 9e15,
+    continueError: 'an old Continue error', continueErrorAtMs: 55,
+    pruneMarked: true, turn: { busyAtMs: 1, idleAtMs: 2 }, readAtMs: 88,
+    ultraConfirmed: { value: true, atMs: 500000 }, ultraSwitch: SWITCH,
+    ultraNote: 'a note about the last click', ultraNoteAtMs: 998000,
+    autoOff: true, autoEnv: true, autoSeq: 3, autoSaving: true,
+  }, over);
+  const opts = { clearedAtMs: CLEARED, nowMs: NOW };
+
+  await t.test('a new object with exactly the fields of a fresh entry; the old entry is untouched', () => {
+    const before = old();
+    const copy = JSON.stringify(before);
+    const after = entryAfterClear(before, NEW_SID, opts);
+    assert.notEqual(after, before);
+    assert.deepEqual(Object.keys(after).sort(), Object.keys(freshEntry(NEW_SID)).sort());
+    assert.equal(JSON.stringify(before), copy);
+    assert.equal(before.id, SID);
+  });
+  await t.test('every conversation field has its fresh value: no reading, state, watched turn, read time, handoff or Continue error of the old id', () => {
+    const after = entryAfterClear(old(), NEW_SID, opts);
+    const fresh = freshEntry(NEW_SID);
+    for (const field of Object.keys(fresh)) {
+      if (ENTRY_FIELD_CLASS[field] === 'conversation') assert.deepEqual(after[field], fresh[field], field);
+    }
+    assert.equal(after.id, NEW_SID);
+    assert.equal(after.sidecar, null);
+    assert.equal(after.state, null);
+    assert.equal(after.turn, null);
+    assert.equal(after.readAtMs, 0);
+    assert.equal(after.handoffReadable, false);
+    assert.equal(after.continueError, '');
+    assert.equal(after.continueLockUntil, 0);
+  });
+  await t.test('the terminal facts are carried', () => {
+    const after = entryAfterClear(old(), NEW_SID, opts);
+    assert.equal(after.lastBusyAtMs, 900000);
+    assert.equal(after.seenBusyEvent, true);
+    assert.equal(after.mainBusy, false);
+    assert.equal(after.ultraSwitch, SWITCH, 'the same record: a line on its way is still on its way');
+    assert.equal(after.ultraNote, 'a note about the last click');
+    assert.equal(after.ultraNoteAtMs, 998000);
+    // Task N's switch (Jason's answer N-4): all four move with the entry.
+    assert.equal(after.autoOff, true);
+    assert.equal(after.autoEnv, true);
+    assert.equal(after.autoSeq, 3);
+    assert.equal(after.autoSaving, true);
+    if ('typed' in freshEntry(SID)) {
+      const typed = { atMs: 7, enter: false };
+      assert.equal(entryAfterClear(old({ typed }), NEW_SID, opts).typed, typed);
+    }
+  });
+  await t.test('the value Ultracode showed is carried as ultraConfirmed, stamped with the time of the re-key', () => {
+    // Shown before: on (confirmed after the last Stop, although the hook still says off).
+    assert.deepEqual(entryAfterClear(old(), NEW_SID, opts).ultraConfirmed, { value: true, atMs: NOW });
+    // Shown before from the hook alone.
+    const hookOnly = old({ ultraConfirmed: null, state: { ultracode: true, last_stop_at: 10 } });
+    assert.deepEqual(entryAfterClear(hookOnly, NEW_SID, opts).ultraConfirmed, { value: true, atMs: NOW });
+    const hookOff = old({ ultraConfirmed: null, state: { ultracode: false, last_stop_at: 10 } });
+    assert.deepEqual(entryAfterClear(hookOff, NEW_SID, opts).ultraConfirmed, { value: false, atMs: NOW });
+    // Not known before: nothing to carry.
+    assert.equal(entryAfterClear(old({ ultraConfirmed: null, state: null }), NEW_SID, opts).ultraConfirmed, null);
+  });
+  await t.test('a request typed before the clear stays behind; one typed at or after it moves', () => {
+    assert.deepEqual(entryAfterClear(old(), NEW_SID, opts).request, { phase: 'idle', atMs: 0, reason: '' });
+    const atClear = { phase: 'requested', atMs: CLEARED, reason: '' };
+    assert.equal(entryAfterClear(old({ request: atClear }), NEW_SID, opts).request, atClear, 'the same record');
+    const unsent = { phase: 'idle', atMs: CLEARED + 1, reason: '', unsent: true };
+    assert.equal(entryAfterClear(old({ request: unsent }), NEW_SID, opts).request, unsent);
+  });
+  await t.test('without a clear time no request moves', () => {
+    const late = { phase: 'requested', atMs: CLEARED + 5, reason: '' };
+    for (const clearedAtMs of [undefined, null, NaN, '1000000', Infinity]) {
+      const after = entryAfterClear(old({ request: late }), NEW_SID, { clearedAtMs, nowMs: NOW });
+      assert.deepEqual(after.request, { phase: 'idle', atMs: 0, reason: '' }, String(clearedAtMs));
+    }
+    assert.deepEqual(entryAfterClear(old({ request: late }), NEW_SID).request, { phase: 'idle', atMs: 0, reason: '' }, 'no options at all');
+  });
+});
+
+test('clear re-key: the carried Ultracode value stands through the first prompt and gives way to a Stop after the re-key', () => {
+  const CLEARED = 1000000;
+  const NOW = CLEARED + 4000;
+  const before = Object.assign(freshEntry(SID), { state: { ultracode: true, last_stop_at: 10 } });
+  const carried = entryAfterClear(before, NEW_SID, { clearedAtMs: CLEARED, nowMs: NOW }).ultraConfirmed;
+  // The hook stamps the cleared session's start as a Stop (ctx_handoff.py ev_sessionstart): no value yet.
+  assert.equal(ultracodeValue({ ultracode: null, ultra_scan: null, last_stop_at: CLEARED / 1000 }, carried), true);
+  // The first prompt: the hook has scanned and found no switch, and the only Stop is still that stamp.
+  assert.equal(ultracodeValue({ ultracode: null, ultra_scan: SCANNED, last_stop_at: CLEARED / 1000 }, carried), true);
+  // The first finished turn: a Stop later than the re-key. Now the hook decides.
+  assert.equal(ultracodeValue({ ultracode: false, ultra_scan: SCANNED, last_stop_at: (NOW + 1000) / 1000 }, carried), false);
+  // Stamped with the clear's own time instead, the value would be lost at the first prompt.
+  assert.equal(ultracodeValue({ ultracode: null, ultra_scan: SCANNED, last_stop_at: CLEARED / 1000 }, { value: true, atMs: CLEARED }), false);
+});
+
+// The two fallbacks of the /clear trial (design entries T2 and T6). Jason's answer D-I of 2026-10-06:
+// only their TEXTS are held now, each by one test; the behaviour is built only if the trial fails.
+
+// T6: the tooltip the Ultracode button would get if a click made straight after a /clear turns out
+// to stick on 'working'. Nothing reads the constant yet.
+test('clear re-key (T6): the text for an Ultracode button that has to wait after a /clear', () => {
+  assert.equal(CLEAR_WAIT_REASON, 'Session is starting again after /clear');
+});
+
+// T2 (a): what the button would read if the program turns out to switch Ultracode off at /clear and
+// nothing is carried. It is the text the button already has for a value that is not known.
+test("clear re-key (T2 a): the text for a value that is not carried is the button's not-known text", () => {
+  assert.equal(ULTRACODE_UNKNOWN_TITLE, "Not known yet. The hook reports it after the session's first turn.");
+});
+
+test('browser: a clear re-key moves the same entry object and leaves the old conversation behind', async () => {
+  const storage = new Map();
+  const h = await bootUltra(true, { storage });
+  h.setState(writtenVmState(h, { ultracode: true }));
+  h.setHandoffFile(true);
+  await h.refresh();
+  assert.ok(String(h.header().primary).startsWith('Continue in new session'), 'before: the cleared conversation had a handoff');
+  h.run(`(() => {
+    const entry = handoffRt.cache.get('${SID}');
+    entry.continueError = 'an old Continue error';
+    entry.continueErrorAtMs = Date.now();
+    entry.request = { phase: 'idle', atMs: Date.now() - 60000, reason: '' };
+    handoffStoreRequest(entry);
+    globalThis.__before = entry;
+  })()`);
+  assert.ok([...storage.keys()].some((key) => key.endsWith(SID)), 'before: this window has something stored under the old id');
+
+  await clearEvent(h, SID, NEW_SID, h.now - 3000);
+
+  assert.equal(h.run(`handoffRt.cache.get('${NEW_SID}') === __before`), true, 'the same object: the typing path and the looks hold it');
+  assert.equal(h.run(`handoffRt.cache.has('${SID}')`), false);
+  const entry = entryOf(h, NEW_SID);
+  assert.equal(entry.id, NEW_SID);
+  assert.deepEqual(Object.keys(entry).sort(), Object.keys(freshEntry(NEW_SID)).sort(), 'no field outside the table rode along');
+  // C2: no reading until the cleared session writes one. (No file exists for the new id yet.)
+  assert.equal(entry.sidecar, null);
+  assert.equal(entry.state, null);
+  assert.equal(entry.turn, null);
+  // C11: the Continue button and its error left with the old conversation.
+  assert.equal(entry.handoffReadable, false);
+  assert.equal(entry.continueError, '');
+  assert.ok(!String(h.header().primary).startsWith('Continue in new session'));
+  assert.equal(h.header().note, null);
+  assert.deepEqual(entry.request, { phase: 'idle', atMs: 0, reason: '' }, 'a request from before the clear stays behind');
+  // Nothing of the old id is left in this window's storage; the carried value is stored under the new id.
+  assert.deepEqual([...storage.keys()].filter((key) => key.endsWith(SID)), []);
+  assert.equal(JSON.parse(storage.get('handoff-ultracode:' + NEW_SID)).value, true);
+  // C2, second half: the first reading of the cleared session shows.
+  h.files.set(VM_DIR + '\\' + NEW_SID + '.json', JSON.stringify({ ...VM_SIDECAR, total_input_tokens: 21000, used_percentage: 2 }));
+  await refreshId(h, NEW_SID);
+  assert.equal(entryOf(h, NEW_SID).sidecar.total_input_tokens, 21000);
+  assert.deepEqual(h.errors, []);
+});
+
+test("browser: a re-key with no reason, or with a reason that is not 'clear', moves the entry whole", async () => {
+  for (const extra of [[], [undefined, undefined], ['fork'], ['Clear', { clearedAtMs: 1 }], [null, { clearedAtMs: 1 }]]) {
+    const h = await bootUltra(true);
+    h.setState(writtenVmState(h, { ultracode: true }));
+    h.setHandoffFile(true);
+    await h.refresh();
+    const before = entryOf(h, SID);
+    assert.ok(before.sidecar && before.state && before.handoffReadable === true, 'before: a reading, a state and a handoff to take along');
+    h.listeners.fork(SID, NEW_SID, ...extra);
+    const after = entryOf(h, NEW_SID);       // read before the refresh the listener started has answered
+    assert.equal(after.id, NEW_SID);
+    for (const field of ['sidecar', 'state', 'handoffReadable', 'readableFor', 'request', 'turn', 'ultraConfirmed', 'continueError']) {
+      assert.deepEqual(after[field], before[field], field + ' ' + JSON.stringify(extra));
+    }
+    await flush();
+  }
+});
+
+// DESIGN acceptance: "text sent, a clear re-key lands, then the text shows: Enter is sent once, under the new id".
+test('browser: text typed before a clear re-key lands gets its Enter once, under the new id', () => withHold(true, async () => {
+  const h = await bootEnded();
+  const clearedAtMs = h.now - 3000;     // the /clear itself was three seconds ago; the click came after it
+  h.knobs.echo = false;                 // the program has not drawn the typed line yet
+  await h.click('primary');
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE]]);
+  await h.advance(100);
+  await clearEvent(h, SID, NEW_SID, clearedAtMs);
+  h.knobs.echo = true;
+  h.knobs.terminal.fakeTyped(REQUEST_LINE);   // now the line shows in the input box
+  await h.advance(150);                 // the look at 250 ms
+  assert.deepEqual(h.sent, [[SID, REQUEST_LINE], [NEW_SID, '\r']]);
+  await h.advance(3000);
+  assert.equal(h.sent.filter(([, data]) => data === '\r').length, 1, 'Enter once');
+  const request = entryOf(h, NEW_SID).request;
+  assert.equal(request.phase, 'requested', 'typed after the clear: the request moved with the terminal');
+  assert.ok(!request.unsent);
+  assert.equal(h.confirms.length, 0);
+}));
+
+// C5.
+test('browser: after a clear re-key Ultracode and the bolt keep the value they showed until the first finished turn, and a click types without asking', async () => {
+  const h = await bootUltra(true);
+  assert.equal(ultraHeader(h).look, 'on');
+  const clearedAtMs = h.now - 2000;
+  // The cleared session's files as the hook leaves them at its start: a reading,
+  // and a state with no Ultracode value, no scan, and the start stamped as a Stop.
+  h.files.set(VM_DIR + '\\' + NEW_SID + '.json', JSON.stringify(VM_SIDECAR));
+  h.files.set(stateFile(NEW_SID), JSON.stringify(endedState(h, { last_prompt_at: null, last_stop_at: clearedAtMs / 1000 })));
+  await clearEvent(h, SID, NEW_SID, clearedAtMs);
+  await refreshId(h, NEW_SID);
+  assert.deepEqual(ultraHeader(h), {
+    shown: true, label: 'Ultracode', enabled: true, asksFirst: false, look: 'on',
+    title: 'Ultracode is on. Click to switch it off.',
+  });
+  assert.notEqual(h.run(`handoffBoltState('${NEW_SID}')`), null, 'the bolt on the row follows the same value');
+  assert.equal(h.header().primary, 'Hand off');
+  assert.equal(h.header().primaryEnabled, true);
+  assert.equal(h.header().primaryOverride, false, 'on an empty prompt Hand off types without asking');
+  // The first prompt: the hook scans and finds no switch record. The value stays.
+  h.files.set(stateFile(NEW_SID), JSON.stringify(endedState(h, {
+    ultracode: null, ultra_scan: SCANNED, last_prompt_at: h.sec, last_stop_at: clearedAtMs / 1000 })));
+  await refreshId(h, NEW_SID);
+  assert.equal(ultraHeader(h).look, 'on');
+  // The first finished turn: the hook reports off, and that is what shows.
+  await h.advance(5000);
+  h.files.set(stateFile(NEW_SID), JSON.stringify(endedState(h, {
+    ultracode: false, ultra_scan: SCANNED, last_prompt_at: h.sec - 3, last_stop_at: h.sec })));
+  await refreshId(h, NEW_SID);
+  assert.equal(ultraHeader(h).look, 'off');
+
+  // A plain click right after the switch types under the new id and asks nothing.
+  const plain = await bootEnded();
+  const cleared = plain.now - 2000;
+  plain.files.set(VM_DIR + '\\' + NEW_SID + '.json', JSON.stringify(VM_SIDECAR));
+  plain.files.set(stateFile(NEW_SID), JSON.stringify(endedState(plain, { last_prompt_at: null, last_stop_at: cleared / 1000 })));
+  await clearEvent(plain, SID, NEW_SID, cleared);
+  await refreshId(plain, NEW_SID);
+  await plain.click('primary');
+  assert.deepEqual(plain.sent, [[NEW_SID, REQUEST_LINE]]);
+  assert.equal(plain.confirms.length, 0);
+});
+
+// A /clear after a turn this window watched from busy to idle. The entry then holds the time of
+// that turn's busy event, which is a fact about the terminal and is carried (every other fixture
+// here has seen an idle event only).
+test('browser: after a clear re-key that follows a watched turn both buttons are plain, and the next idle event marks nothing as not updated', async () => {
+  const h = await bootUltra(true);
+  // A whole turn, watched, with files that move as an ordinary turn's do.
+  h.busyEvent(true);
+  await h.advance(20000);
+  h.setSidecar({ ...VM_SIDECAR, ts: h.sec - 1 });
+  h.setState(endedState(h, { ultracode: true, last_prompt_at: h.sec - 20, last_stop_at: h.sec }));
+  await h.advance(1000);
+  h.busyEvent(false);
+  await h.advance(5000);
+  const busyAtMs = entryOf(h, SID).lastBusyAtMs;
+  assert.equal(typeof busyAtMs, 'number', 'before: the entry holds the time of the busy event');
+  assert.notEqual(entryOf(h, SID).turn, null, 'before: a watched turn');
+  // The /clear. The hook stamps the cleared session's start, which is later than that busy event,
+  // and the cleared session's status line writes its first reading.
+  const clearedAtMs = h.now - 2000;
+  assert.ok(clearedAtMs > busyAtMs);
+  h.files.set(VM_DIR + '\\' + NEW_SID + '.json', JSON.stringify({
+    ...VM_SIDECAR, total_input_tokens: 21000, used_percentage: 2, ts: clearedAtMs / 1000 }));
+  h.files.set(stateFile(NEW_SID), JSON.stringify(endedState(h, { last_prompt_at: null, last_stop_at: clearedAtMs / 1000 })));
+  await clearEvent(h, SID, NEW_SID, clearedAtMs);
+  await refreshId(h, NEW_SID);
+  const entry = entryOf(h, NEW_SID);
+  assert.equal(entry.lastBusyAtMs, busyAtMs, 'a fact about the terminal: carried');
+  assert.equal(entry.turn, null, "the watched turn was the old conversation's");
+  // C5: a busy event from before the clear does not make a click ask first.
+  assert.equal(h.header().primary, 'Hand off');
+  assert.equal(h.header().primaryEnabled, true);
+  assert.equal(h.header().primaryOverride, false);
+  assert.equal(ultraHeader(h).enabled, true);
+  assert.equal(ultraHeader(h).asksFirst, false);
+  // The title goes idle again under the new id. The busy listener builds a watched turn from the
+  // carried time; the cleared session's files are later than it, so nothing is marked (E5).
+  h.listeners.busy(NEW_SID, false);
+  assert.equal(entryOf(h, NEW_SID).turn.busyAtMs, busyAtMs, 'the turn is built from the carried time');
+  await h.advance(STALE_AFTER_MS + 500);
+  await refreshId(h, NEW_SID);
+  assert.equal(meterLook(h).stale, false, 'a followed /clear leaves no "not updated" mark');
+});
+
+// C5 across a reload of the window: the carried value is in this window's storage under the new id.
+test('browser: a window reloaded after a clear re-key, before the first turn has ended, still shows the carried Ultracode value', async () => {
+  const storage = new Map();
+  const first = await bootUltra(true, { storage });
+  const clearedAtMs = first.now - 2000;
+  await clearEvent(first, SID, NEW_SID, clearedAtMs);
+  assert.equal(storage.has('handoff-ultracode:' + NEW_SID), true, 'the value on show is stored under the new id');
+  assert.equal(JSON.parse(storage.get('handoff-ultracode:' + NEW_SID)).atMs, first.now, 'stamped with the time of the re-key');
+
+  // The same window, loaded again five seconds later. Its session is the cleared one now: the row,
+  // the view, the running set and the open terminal are under the new id, and the hook's files for
+  // that id are as it leaves them at the session's start (no Ultracode value, the start stamped as a Stop).
+  const second = await bootUltra(undefined, { storage, startMs: first.now + 5000, reloaded: true });
+  second.run(`(() => {
+    const session = sessionMap.get('${SID}');
+    session.sessionId = '${NEW_SID}';
+    sessionMap.delete('${SID}');
+    sessionMap.set('${NEW_SID}', session);
+    activeSessionId = '${NEW_SID}';
+    activePtyIds = new Set(['${NEW_SID}']);
+    const open = window._openSessions.get('${SID}');
+    window._openSessions.delete('${SID}');
+    window._openSessions.set('${NEW_SID}', open);
+  })()`);
+  second.files.set(VM_DIR + '\\' + NEW_SID + '.json', JSON.stringify(VM_SIDECAR));
+  second.files.set(stateFile(NEW_SID), JSON.stringify(endedState(second, { last_prompt_at: null, last_stop_at: clearedAtMs / 1000 })));
+  await refreshId(second, NEW_SID);
+  assert.equal(ultraHeader(second).look, 'on');
+  assert.notEqual(second.run(`handoffBoltState('${NEW_SID}')`), null, 'the bolt too');
+  // The first finished turn: a Stop later than the stored stamp. Now the hook decides.
+  await second.advance(5000);
+  second.files.set(stateFile(NEW_SID), JSON.stringify(endedState(second, {
+    ultracode: false, ultra_scan: SCANNED, last_prompt_at: second.sec - 3, last_stop_at: second.sec })));
+  await refreshId(second, NEW_SID);
+  assert.equal(ultraHeader(second).look, 'off');
+});
+
+// DESIGN:866: both click paths hold the entry object across the asks-first box and read entry.id
+// after it. So a clear that lands while the box is open must move that same object.
+test('browser: a clear re-key lands while the asks-first box is open: the yes still types, under the new id, and the request is on the moved entry', async () => {
+  const h = await bootReloaded();       // no busy or idle event yet in this window: a click asks first
+  assert.equal(h.header().primaryOverride, true, 'before: the click asks first');
+  const clearedAtMs = h.now - 3000;
+  // The cleared session's files as the hook leaves them at its start.
+  h.files.set(VM_DIR + '\\' + NEW_SID + '.json', JSON.stringify(VM_SIDECAR));
+  h.files.set(stateFile(NEW_SID), JSON.stringify(endedState(h, { last_prompt_at: null, last_stop_at: clearedAtMs / 1000 })));
+  // The box, answered yes; the clear lands while it is open (task 07's way of doing this for a fork).
+  h.knobs.duringQuestion = () => { clearEvent(h, SID, NEW_SID, clearedAtMs); };
+  h.run('confirmDialog = async () => { __knobs.duringQuestion(); return true; }');
+  await h.click('primary');
+  await h.advance(1500);
+  assert.deepEqual(h.sent, [[NEW_SID, REQUEST_LINE], [NEW_SID, '\r']]);
+  assert.equal(entryOf(h, NEW_SID).request.phase, 'requested', 'made after the clear, on the entry that moved');
 });
