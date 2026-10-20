@@ -198,6 +198,7 @@ function childMain() {
     try { require(MAIN); } catch (e) { out.loadError = String((e && e.stack) || e).split('\n').slice(0, 6).join(' | '); }
     out.loadMs = Date.now() - t0;
     out.requires = requested.length;
+    out.requestedReloader = requested.filter((r) => r === 'electron-reloader').length;
     out.handlers = handlers.size;
     out.missingChannels = NEW_CHANNELS.filter((n) => !handlers.has(n));
     out.appEvents = Object.keys(appHandlers);
@@ -298,6 +299,8 @@ function parentMain() {
       const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', MAIN_LOAD_ROOT: root,
         USERPROFILE: home, HOME: home, LOCALAPPDATA: path.join(root, 'local'), APPDATA: path.join(root, 'appdata'),
         SWITCHBOARD_DATA_DIR: path.join(root, 'data') };
+      // Hot reload off, as in a normal start: the child must not inherit it from whoever runs the suite.
+      delete env.SWITCHBOARD_HOT_RELOAD;
       const r = spawnSync(electronBin, [__filename], { cwd: APP_DIR, env, encoding: 'utf8', timeout: 120000 });
       assert.equal(r.status, 0, 'the child failed\n' + r.stderr + '\n' + r.stdout);
       const text = r.stdout.split('\n').filter((l) => l.startsWith('RESULT ')).pop();
@@ -319,6 +322,13 @@ function parentMain() {
     assert.ok(r.handlers > NEW_CHANNELS.length, 'the rest of main.js registered its handlers too: ' + r.handlers);
     assert.ok(r.appEvents.includes('before-quit') && r.appEvents.includes('will-quit'), r.appEvents.join(','));
     assert.equal(r.sameModule, true, 'main.js loaded the real token-usage.js, once');
+  });
+
+  test('with SWITCHBOARD_HOT_RELOAD unset, main.js never asks for electron-reloader', () => {
+    const r = result();
+    assert.equal(r.loadError, undefined, 'main.js threw at module scope: ' + r.loadError);
+    assert.ok(r.requires > 0, 'the load hook recorded the requires of main.js');
+    assert.equal(r.requestedReloader, 0, 'electron-reloader was required with hot reload off');
   });
 
   test('before init the handlers answer { error } from the real module (not the stand-in), and read-ctx-state validates its id', () => {

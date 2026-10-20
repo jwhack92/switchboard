@@ -233,6 +233,14 @@ test('pty-env: an inherited SWITCHBOARD_TERMINAL_ID is stripped', () => {
   assert.equal('SWITCHBOARD_TERMINAL_ID' in statsPtyEnv(buildPtyEnv(inherited, 'linux')), false);
 });
 
+test('pty-env: an inherited SWITCHBOARD_HOT_RELOAD is stripped', () => {
+  // A Switchboard started from a terminal of a hot-reload instance must not turn hot reload on by inheritance.
+  const inherited = { PATH: '/usr/bin', SWITCHBOARD_HOT_RELOAD: '1' };
+  assert.deepEqual(buildPtyEnv(inherited, 'linux'), { PATH: '/usr/bin' });
+  assert.ok(CLAUDE_SESSION_VARS.includes('SWITCHBOARD_HOT_RELOAD'));
+  assert.equal('SWITCHBOARD_HOT_RELOAD' in statsPtyEnv(buildPtyEnv(inherited, 'linux')), false);
+});
+
 // --- launch without Git Bash: the Windows fill-ins (task L) ---
 
 const ptyEnvModule = require('../pty-env');

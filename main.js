@@ -56,12 +56,16 @@ for (const stream of [process.stdout, process.stderr]) {
   });
 }
 
-try { require('electron-reloader')(module, { watchRenderer: true }); } catch {};
+if (process.env.SWITCHBOARD_HOT_RELOAD === '1') { try { require('electron-reloader')(module, { watchRenderer: true }); } catch {} }
+// Hot reload is opt-in: without SWITCHBOARD_HOT_RELOAD=1 a save, merge or checkout
+// in this folder does not relaunch the app (a relaunch kills every session).
+log.info(process.env.SWITCHBOARD_HOT_RELOAD === '1' ? '[hot-reload] on' : '[hot-reload] off');
 
 // The crash guard's fault list (main-faults.js): what the main process does
 // with an error nobody caught, the fault file beside the log, and a line for
 // every way the app can exit. Loaded on this side of the reloader line on
-// purpose, so a change to it needs an app restart. The app can run without it:
+// purpose, so a change to it needs an app restart (the reloader itself runs
+// only when hot reload is on, SWITCHBOARD_HOT_RELOAD=1). The app can run without it:
 // hence the guarded require and a stand-in with the same method names. From here
 // on an uncaught error and an unhandled rejection are handled by main-faults,
 // and Electron's own box no longer shows for them; errors raised by the
@@ -132,7 +136,8 @@ const { encodeProjectPath } = require('./encode-project-path');
 //
 // Required AFTER the electron-reloader line above, deliberately. The reloader
 // freezes module.children at that instant, so a module required BEFORE it
-// relaunches the app on every save — and a relaunch kills every PTY and every
+// relaunches the app on every save (only when hot reload is on,
+// SWITCHBOARD_HOT_RELOAD=1) — and a relaunch kills every PTY and every
 // Claude session running in one. harnesses/ therefore sits on the same side as
 // db.js, session-cache.js, shell-profiles.js and pty-env.js: the cost is that
 // an edit under harnesses/ needs a manual restart before it is in effect (its
@@ -144,7 +149,8 @@ const claudeHarness = getHarness(DEFAULT_HARNESS);
 // Ported-feature modules, all deliberately on THIS side of the reloader line
 // for the same reason harnesses/ is (see the comment above). task-manager owns
 // live task PTYs and preview-assets owns the token→folder map behind every open
-// preview: an auto-relaunch triggered by editing one of them would kill running
+// preview: an auto-relaunch triggered by editing one of them (only when hot
+// reload is on, SWITCHBOARD_HOT_RELOAD=1) would kill running
 // tasks and dead-link every preview URL already handed to the renderer. The
 // cost is the usual one — editing any of these needs a manual restart before it
 // is in effect.
@@ -573,7 +579,8 @@ function buildMenu() {
         // — which is what makes it safe to offer as a normal menu item.
         //
         // Worth having explicitly: electron-reloader hot-reloads renderer files
-        // in dev, but there was no way to reload by hand, and Ctrl+R is not
+        // in dev (only when hot reload is on, SWITCHBOARD_HOT_RELOAD=1), but
+        // there was no way to reload by hand, and Ctrl+R is not
         // bound on its own once a custom application menu replaces the default.
         { role: 'reload' },
         { role: 'forceReload' },
@@ -616,7 +623,8 @@ const { readSessionFile, readFolderFromFilesystem, refreshFolder, reconcileCache
 // Deliberately required HERE, below the electron-reloader line at the top of
 // this file, for the same reason db.js / harnesses/ / task-manager are: the
 // reloader froze module.children at that point, so anything required ABOVE it
-// relaunches the whole app when it is saved — and a relaunch kills every PTY,
+// relaunches the whole app when it is saved (only when hot reload is on,
+// SWITCHBOARD_HOT_RELOAD=1) — and a relaunch kills every PTY,
 // every running Claude session and every task. projects.js is exactly the
 // wrong module to have that property: it holds fs.watch handles for each
 // project's plan tracker AND the in-memory half of the schedule double-fire
@@ -3364,7 +3372,8 @@ if (!gotSingleInstanceLock) {
     // --- Global stop, process custody, shared usage poll -------------
     // Ordered deliberately: reap BEFORE the scheduler can fire, so a child
     // orphaned by a crash or by electron-reloader's app.exit(0) (which emits
-    // neither before-quit nor will-quit) is dealt with before new work starts.
+    // neither before-quit nor will-quit; the reloader runs only when hot reload
+    // is on, SWITCHBOARD_HOT_RELOAD=1) is dealt with before new work starts.
     driverStore.init({ log });
     custody.init({ log, store: driverStore });
     usageSource.init({ log });
@@ -3459,8 +3468,9 @@ app.on('before-quit', () => {
   }
 
   // Token store: stop the scanner and its timers (and an init that has not run
-  // yet). Not relied on for correctness -- a reloader relaunch emits neither
-  // quit event -- so a failure here is only logged.
+  // yet). Not relied on for correctness -- a reloader relaunch (only when hot
+  // reload is on, SWITCHBOARD_HOT_RELOAD=1) emits neither quit event -- so a
+  // failure here is only logged.
   try {
     clearTimeout(tokenUsageInitTimer);
     tokenUsage.shutdown();

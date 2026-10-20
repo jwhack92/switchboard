@@ -1,9 +1,10 @@
 // Main-process half of spoken output: reading what Claude said, and condensing
 // it to fit a spoken window.
 //
-// Deliberately required AFTER main.js:57 so it stays outside electron-reloader's
+// Deliberately required AFTER main.js:59 so it stays outside electron-reloader's
 // main-process snapshot. The cost of that is real and worth stating: editing
-// THIS file reloads the renderer but leaves the old main-process copy running,
+// THIS file reloads the renderer (only when hot reload is on,
+// SWITCHBOARD_HOT_RELOAD=1) but leaves the old main-process copy running,
 // so changes here need a manual restart to take effect.
 
 const { ipcMain } = require('electron');

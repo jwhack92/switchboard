@@ -58,6 +58,9 @@ const CLAUDE_SESSION_VARS = [
   // (main.js sets a fresh one after this strip). It is in this list because
   // the rule is the same: an inherited one must not reach a child.
   'SWITCHBOARD_TERMINAL_ID',
+  // Also Switchboard's own: turns on electron-reloader (main.js). An instance
+  // started from a terminal of a hot-reload instance must not inherit it.
+  'SWITCHBOARD_HOT_RELOAD',
 ];
 
 const LOCALE_VARS = ['LC_ALL', 'LC_CTYPE', 'LANG'];

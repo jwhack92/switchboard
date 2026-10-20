@@ -4,7 +4,8 @@
 // in a local const (main.js:1797) and registered nowhere; `before-quit`
 // (main.js:1841-1862) kills PTYs only; there is no taskkill, no `detached`, and
 // no tree-kill anywhere outside node_modules. And the app can exit without any
-// hook running: electron-reloader calls `app.relaunch(); app.exit(0)`, and
+// hook running: electron-reloader (only when hot reload is on,
+// SWITCHBOARD_HOT_RELOAD=1) calls `app.relaunch(); app.exit(0)`, and
 // `app.exit()` emits neither before-quit nor will-quit.
 //
 // The consequence is that a hung or runaway scheduled run cannot be stopped at

@@ -18,7 +18,8 @@
   const STORE_MUTED = 'speechMutedSessions';
 
   // localStorage, not sessionStorage: this survives the renderer reloads that
-  // electron-reloader fires on every file save, which sessionStorage would not.
+  // electron-reloader fires on every file save (only when hot reload is on,
+  // SWITCHBOARD_HOT_RELOAD=1), which sessionStorage would not.
   // Phase 2 moves the enabled flag into real settings; the muted set stays here
   // because there is no per-session settings table.
   function readStore(key, fallback) {
