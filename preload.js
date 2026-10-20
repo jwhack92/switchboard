@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld('api', {
   // The context-handoff hook's sidecar + state for one session, read by main.
   readCtxState: (sessionId) => ipcRenderer.invoke('read-ctx-state', sessionId),
   readHandoffOff: (sessionId) => ipcRenderer.invoke('read-handoff-off', sessionId),
+  readCtxLimits: (projectPath) => ipcRenderer.invoke('read-ctx-limits', projectPath),
+  writeCtxLimits: (projectPath, limit, rearm) => ipcRenderer.invoke('write-ctx-limits', projectPath, limit, rearm),
   setHandoffOff: (sessionId, off) => ipcRenderer.invoke('set-handoff-off', sessionId, off),
   getMemories: () => ipcRenderer.invoke('get-memories'),
   readMemory: (filePath) => ipcRenderer.invoke('read-memory', filePath),

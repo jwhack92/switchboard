@@ -27,6 +27,12 @@
 // <session_id>.off in that folder. It is the only thing in this file that
 // makes a file (through main).
 //
+// The thresholds are per project (the hook's <ctx folder>/limits.json): the
+// state file carries a session's own limit, rearm and next_trigger, and for a
+// session whose state has none main's read-ctx-limits gives its project's
+// numbers (handoffProjectLimits). The file is written from Project Settings
+// (settings-panel.js), never from here.
+//
 // How the state file is read follows the hook's own "Reader contract"
 // (ctx_handoff.py module docstring): crossed_at ties the file to a request,
 // written_at alone never does, a Stop counts only when it is later than the
@@ -68,10 +74,15 @@
 // typeof-guarded at the call site too.
 
 const REQUEST_LINE = 'Write the context handoff now. [ctx-handoff:request]';
-// Same thresholds as the status line: dim below WARN_AT, amber from it, red
-// from DUE_AT.
+// The thresholds with no limits.json: dim below WARN_AT, amber from it, red
+// from DUE_AT. The hook's limit is per project now (ctx-limits.js): a session's
+// own numbers come from handoffLimits, and these are its fallback.
 const WARN_AT = 300000;
 const DUE_AT = 400000;
+// The hook's re-arm step with no limits.json, and how far below the limit the
+// status line turns amber.
+const REARM_AT = 150000;
+const WARN_BELOW = 100000;
 const OVERRIDE_TITLE = 'This session has not reported the end of its turn. Click to type the request anyway (asks first).';
 // The turn marker says "ended", but this window has not been told whether the
 // session is busy: the same question, a tooltip that gives the real reason.
@@ -144,10 +155,36 @@ function fmtTokens(n) {
   return roundHalfEven(v / 1000) + 'K';
 }
 
-function chipLevel(tokens) {
-  if (tokens >= DUE_AT) return 'danger';
-  if (tokens >= WARN_AT) return 'warn';
+// limits: a handoffLimits() result; none = the built-in 300K / 400K.
+function chipLevel(tokens, limits) {
+  const due = limits && Number.isInteger(limits.dueAt) ? limits.dueAt : DUE_AT;
+  const warn = limits && Number.isInteger(limits.warnAt) ? limits.warnAt : WARN_AT;
+  if (tokens >= due) return 'danger';
+  if (tokens >= warn) return 'warn';
   return '';
+}
+
+// One session's handoff numbers, in the order the reader has them:
+//   1. the state file: the hook writes the effective limit and rearm into it,
+//      and next_trigger is where it asks next;
+//   2. the project's entry in limits.json (main's read-ctx-limits `effective`);
+//   3. the built-in 400K / 150K.
+// dueAt is the next trigger (red from there), warnAt the limit less 100K (the
+// status line's amber). Same validity ranges as ctx-limits.js.
+function handoffLimits(state, project) {
+  const okLimit = (v) => Number.isInteger(v) && v >= 100000 && v <= 950000;
+  const okRearm = (v) => Number.isInteger(v) && v >= 25000 && v <= 500000;
+  const st = state && typeof state === 'object' ? state : {};
+  const pr = project && typeof project === 'object' ? project : {};
+  let limit = DUE_AT;
+  let source = 'builtin';
+  if (okLimit(st.limit)) { limit = st.limit; source = 'state'; }
+  else if (okLimit(pr.limit)) { limit = pr.limit; source = 'project'; }
+  let rearm = REARM_AT;
+  if (okRearm(st.rearm)) rearm = st.rearm;
+  else if (okRearm(pr.rearm)) rearm = pr.rearm;
+  const next = Number.isInteger(st.next_trigger) && st.next_trigger > 0 ? st.next_trigger : limit;
+  return { limit, rearm, nextTrigger: next, dueAt: next, warnAt: limit - WARN_BELOW, source };
 }
 
 // The renderer cannot read %LOCALAPPDATA%, but it can ask main where the
@@ -161,7 +198,7 @@ function deriveCtxDir(diagDir) {
   return (match[1] + '\\AppData\\Local\\claude-ctx').replace(/\//g, '\\');
 }
 
-function meterModel(sidecar) {
+function meterModel(sidecar, limits) {
   if (!sidecar || typeof sidecar !== 'object') return null;
   const tokens = sidecar.total_input_tokens;
   // null = the hook has no reading yet. Nothing to show.
@@ -177,7 +214,7 @@ function meterModel(sidecar) {
     : text;
   return {
     tokens, size, pct, text, full,
-    level: chipLevel(tokens),
+    level: chipLevel(tokens, limits),
     ts: typeof sidecar.ts === 'number' ? sidecar.ts : null,
   };
 }
@@ -241,7 +278,7 @@ function canContinue(state, handoffReadable, running) {
 function chipState(input) {
   const o = input || {};
   if (!o.running || o.isTerminal) return null;
-  const meter = meterModel(o.sidecar);
+  const meter = meterModel(o.sidecar, o.limits);
   if (!meter) return null;
   const info = handoffInfo(o.state, o.handoffReadable);
   let chip = { text: meter.text, level: meter.level, title: 'Context ' + meter.full };
@@ -831,10 +868,20 @@ function pollDue(tick, ids) {
   return [...ids].sort().filter((id, index) => (tick + index) % POLL_EVERY_TICKS === 0);
 }
 
-// The auto handoff switch's tooltips. The 400K and 150K are the hook's
-// THRESHOLD and REARM_STEP, and AUTO_OFF_TITLE says what the hook does today
+// The auto handoff switch's tooltips. The numbers are the session's
+// (handoffLimits): its project's limit and re-arm step, and its next trigger
+// when a handoff has moved it past the limit. AUTO_ON_TITLE is the text with
+// the built-in 400K and 150K. AUTO_OFF_TITLE says what the hook does today
 // with a session that is opted out (ctx_handoff.py, "Opt-out").
-const AUTO_ON_TITLE = 'Automatic handoff prompts are on: the hook asks this session for a handoff when its context passes the trigger (400K, then 150K past each handoff). Click to turn them off for this session. Hand off and Update still work.';
+function autoOnTitle(limits) {
+  const l = limits || handoffLimits(null, null);
+  const when = l.nextTrigger === l.limit
+    ? 'passes the trigger (' + fmtTokens(l.limit) + ', then ' + fmtTokens(l.rearm) + ' past each handoff)'
+    : 'passes its next trigger, ' + fmtTokens(l.nextTrigger) + ' (the trigger is ' + fmtTokens(l.limit) + ', then ' + fmtTokens(l.rearm) + ' past each handoff)';
+  return 'Automatic handoff prompts are on: the hook asks this session for a handoff when its context ' + when +
+    '. Click to turn them off for this session. Hand off and Update still work.';
+}
+const AUTO_ON_TITLE = autoOnTitle(null);
 const AUTO_OFF_TITLE = 'Automatic handoff prompts are off for this session. Hand off and Update still work. Click to turn them back on: if the context is past the trigger, the session is asked for a handoff at its next turn end.';
 const AUTO_ENV_TITLE = 'Automatic handoff prompts are off for every session Switchboard starts: CLAUDE_CTX_HANDOFF is set in its environment. This switch cannot turn them on. Hand off and Update still work.';
 // Why a click on the switch came to nothing: text in the header note, where
@@ -880,7 +927,7 @@ function autoHandoffModel(input) {
   }
   model.enabled = true;
   model.target = !off;
-  model.title = off ? AUTO_OFF_TITLE : AUTO_ON_TITLE;
+  model.title = off ? AUTO_OFF_TITLE : autoOnTitle(o.limits);
   return model;
 }
 
@@ -1208,6 +1255,7 @@ function handoffInputs(id) {
   if (mainBusy === true) busy = true;
   const ultracode = entry ? ultracodeValue(entry.state, entry.ultraConfirmed) : null;
   return {
+    limits: handoffLimits(entry ? entry.state : null, handoffProjectLimits(id, entry)),
     isTerminal: handoffIsTerminal(id),
     running: handoffIsRunning(id),
     ownedElsewhere, pendingRow, busy,
@@ -1248,12 +1296,45 @@ function handoffStale(entry) {
  * never-throwing: sidebar.js calls it while building a row, and it reads only
  * the cache and the app globals -- no IPC.
  */
+// The project's limits.json numbers for a session, for when its state file
+// does not carry its own (handoffLimits). Read through main (read-ctx-limits)
+// at most once per HANDOFF_LIMITS_MS per project folder; until the first
+// answer, and when main has no such handler, null: the built-in numbers.
+const HANDOFF_LIMITS_MS = 15000;
+function handoffProjectLimits(id, entry) {
+  try {
+    let session = null;
+    try { if (typeof sessionMap !== 'undefined') session = sessionMap.get(id) || null; } catch {}
+    const folder = launchFolder(session, entry ? entry.sidecar : null);
+    if (!folder) return null;
+    if (!handoffRt.limits) handoffRt.limits = new Map();
+    let held = handoffRt.limits.get(folder);
+    const nowMs = Date.now();
+    if (!held) { held = { value: null, atMs: -Infinity, busy: false }; handoffRt.limits.set(folder, held); }
+    if (!held.busy && nowMs - held.atMs >= HANDOFF_LIMITS_MS
+        && window.api && typeof window.api.readCtxLimits === 'function') {
+      held.busy = true;
+      held.atMs = nowMs;
+      Promise.resolve()
+        .then(() => window.api.readCtxLimits(folder))
+        .then((reply) => { if (reply && reply.effective && typeof reply.effective === 'object') held.value = reply.effective; })
+        .catch(() => {})
+        .then(() => { held.busy = false; });
+    }
+    return held.value;
+  } catch (err) {
+    handoffLogOnce('handoffProjectLimits failed', err);
+    return null;
+  }
+}
+
 function handoffChipState(sessionId) {
   try {
     const entry = handoffRt.cache.get(sessionId);
     if (!entry) return null;
     const stale = handoffStale(entry);
     return chipState({
+      limits: handoffLimits(entry.state, handoffProjectLimits(sessionId, entry)),
       sidecar: entry.sidecar,
       state: entry.state,
       handoffReadable: entry.handoffReadable,
@@ -1727,7 +1808,7 @@ function handoffRenderHeader() {
   }
 
   const input = handoffInputs(id);
-  const meter = meterModel(input.sidecar);
+  const meter = meterModel(input.sidecar, input.limits);
   const info = handoffInfo(input.state, input.handoffReadable);
 
   handoffShow(els.meter, !!meter || info.status !== 'none');
@@ -2520,6 +2601,7 @@ if (typeof module !== 'undefined' && module.exports) {
     typingGate, gateText, chooseHeaderNote, ultracodeValue, ultracodeModel, ultracodeScreen, ultracodeOutcome,
     parseStoredUltracode, staleReading, staleTitle,
     autoHandoffModel, AUTO_ON_TITLE, AUTO_OFF_TITLE, AUTO_ENV_TITLE, AUTO_FAILED_OFF, AUTO_FAILED_ON, AUTO_REKEYED,
+    REARM_AT, WARN_BELOW, handoffLimits, autoOnTitle,
     handoffChipState, handoffBoltState, onActiveSessionChanged,
   };
 }

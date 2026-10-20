@@ -240,6 +240,39 @@
         </div>
       </div>
 
+      ${isProject ? `<div class="settings-section" id="sv-ctx-limits-section">
+        <div class="settings-section-title">Context Handoff</div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">Handoff Limit (K tokens)</span>
+            <div class="settings-description">The ctx-handoff hook asks a session in this project for a handoff when its context passes this. 100 to 950; blank = the default (<span id="sv-ctx-limit-default">400</span>K).</div>
+          </div>
+          <div class="settings-field-control">
+            <input type="number" class="settings-input settings-input-compact" id="sv-ctx-limit" min="100" max="950" step="1" placeholder="400">
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <span class="settings-label">Re-arm Step (K tokens)</span>
+            <div class="settings-description">After a handoff the hook asks again this far past it. 25 to 500; blank = the default (<span id="sv-ctx-rearm-default">150</span>K). Saved at once to the hook's limits.json, by its own button; running sessions take it at their next event.</div>
+          </div>
+          <div class="settings-field-control">
+            <input type="number" class="settings-input settings-input-compact" id="sv-ctx-rearm" min="25" max="500" step="1" placeholder="150">
+          </div>
+        </div>
+
+        <div class="settings-field">
+          <div class="settings-field-info">
+            <div class="settings-description" id="sv-ctx-limits-note"></div>
+          </div>
+          <div class="settings-field-control">
+            <button class="settings-check-updates-btn" id="sv-ctx-limits-save">Save Handoff Limits</button>
+          </div>
+        </div>
+      </div>` : ''}
+
       ${!isProject ? `<div class="settings-section">
         <div class="settings-section-title">Application</div>
 
@@ -543,6 +576,54 @@
       saveBtn.style.color = '#fff';
       setTimeout(() => closeSettingsViewer(), 600);
     });
+
+    // Context handoff limits: the hook's <ctx folder>/limits.json, through main
+    // (read-ctx-limits / write-ctx-limits, ctx-limits.js). Not part of Save
+    // Settings: it is another file, and main may refuse a value, which is said
+    // here. The inputs are in K tokens; blank = the default's.
+    const ctxSection = settingsViewerBody.querySelector('#sv-ctx-limits-section');
+    if (ctxSection) {
+      const limitIn = settingsViewerBody.querySelector('#sv-ctx-limit');
+      const rearmIn = settingsViewerBody.querySelector('#sv-ctx-rearm');
+      const note = settingsViewerBody.querySelector('#sv-ctx-limits-note');
+      const saveCtx = settingsViewerBody.querySelector('#sv-ctx-limits-save');
+      const k = (tokens) => String(tokens / 1000);
+      const show = (reply) => {
+        if (!reply || reply.error) { note.textContent = 'Could not read the limits' + (reply && reply.error ? ' (' + reply.error + ').' : '.'); return; }
+        limitIn.value = reply.own.limit == null ? '' : k(reply.own.limit);
+        rearmIn.value = reply.own.rearm == null ? '' : k(reply.own.rearm);
+        settingsViewerBody.querySelector('#sv-ctx-limit-default').textContent = k(reply.defaults.limit);
+        settingsViewerBody.querySelector('#sv-ctx-rearm-default').textContent = k(reply.defaults.rearm);
+        limitIn.placeholder = k(reply.defaults.limit);
+        rearmIn.placeholder = k(reply.defaults.rearm);
+        note.textContent = 'In use: ' + k(reply.effective.limit) + 'K, then ' + k(reply.effective.rearm) + 'K past each handoff.'
+          + (reply.code ? ' limits.json could not be read (' + reply.code + '): the built-in numbers apply.' : '');
+      };
+      // '' = blank (null); else K tokens as a whole number of tokens, or an error.
+      const parseK = (text, label) => {
+        const t = String(text).trim();
+        if (!t) return { value: null };
+        const n = Number(t) * 1000;
+        if (!Number.isFinite(n) || Math.abs(n - Math.round(n)) > 1e-6) return { error: label + ' is not a number of K tokens.' };
+        return { value: Math.round(n) };
+      };
+      if (typeof window.api.readCtxLimits !== 'function') {
+        ctxSection.style.display = 'none';
+      } else {
+        window.api.readCtxLimits(projectPath).then(show, () => show(null));
+        saveCtx.addEventListener('click', async () => {
+          const limit = parseK(limitIn.value, 'The limit');
+          const rearm = parseK(rearmIn.value, 'The re-arm step');
+          if (limit.error || rearm.error) { note.textContent = limit.error || rearm.error; return; }
+          let reply;
+          try { reply = await window.api.writeCtxLimits(projectPath, limit.value, rearm.value); }
+          catch (err) { reply = { ok: false, error: String(err && err.message || err) }; }
+          if (!reply || !reply.ok) { note.textContent = 'Not saved: ' + ((reply && reply.error) || 'no answer from Switchboard'); return; }
+          show(reply);
+          note.textContent = 'Saved. ' + note.textContent;
+        });
+      }
+    }
 
     // Cancel button
     settingsViewerBody.querySelector('#sv-cancel-btn').addEventListener('click', () => {

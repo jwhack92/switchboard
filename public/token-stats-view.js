@@ -29,6 +29,9 @@ const TOK_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep
 // local days" to the handlers. Inferred, not measured: no Claude Code
 // transcript is older than this.
 const TOK_ALL_FROM = '2024-01-01';
+// The handoff line with nothing better to go on. The context reply's
+// handoffTrigger (token-usage-queries.js) has the session's own limit: its
+// state file's, else its project's in limits.json.
 const TOK_HANDOFF_TRIGGER = 400000;
 const TOK_PAGE = 200;
 const TOK_MAX_LIMIT = 2000;        // the handlers' own ceiling for `limit`
@@ -1333,7 +1336,12 @@ function tokRenderContext(container, outcome) {
 
   // Reference lines, labelled in place so they need no legend entry.
   const refs = [];
-  if (TOK_HANDOFF_TRIGGER <= yMax && TOK_HANDOFF_TRIGGER !== win) refs.push([TOK_HANDOFF_TRIGGER, 'handoff trigger ' + formatTokens(TOK_HANDOFF_TRIGGER)]);
+  const ht = data.handoffTrigger && typeof data.handoffTrigger === 'object' ? data.handoffTrigger : {};
+  const trigger = Number.isInteger(ht.limit) && ht.limit > 0 ? ht.limit : TOK_HANDOFF_TRIGGER;
+  if (trigger <= yMax && trigger !== win) refs.push([trigger, 'handoff trigger ' + formatTokens(trigger)]);
+  // Past a handoff the hook asks again further up: that line too, when it is on the chart.
+  const next = Number.isInteger(ht.nextTrigger) ? ht.nextTrigger : null;
+  if (next !== null && next > trigger && next <= yMax && next !== win) refs.push([next, 'next handoff trigger ' + formatTokens(next)]);
   if (win > 0) refs.push([win, 'context window ' + formatTokens(win)]);
   for (const [v, label] of refs) {
     const y = sy(v);

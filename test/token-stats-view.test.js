@@ -1025,6 +1025,24 @@ test('sort and Show more re-query sessions only', async () => {
   assert.equal(q.sort, 'peak_ctx', 'sort state survives a rebuild of the table');
 });
 
+test('context over time: the handoff line is the session\'s own limit, and its next trigger past a handoff', async () => {
+  const withTrigger = (handoffTrigger) => (name) => (name === 'getTokenStatsContext'
+    ? { ...okData().context, handoffTrigger } : okData()[METHODS[name]]);
+  const labels = async (handoffTrigger) => {
+    const app = boot({ respond: withTrigger(handoffTrigger) });
+    await openTokens(app);
+    byClass(app.tokensBody, 'token-session-row')[0].fire('click');
+    await flush();
+    assert.deepEqual(app.errors, []);
+    return byClass(byTag(app.tokensBody, 'svg')[0], 'token-ctx-ref-label').map(n => n.textContent);
+  };
+  assert.deepEqual(await labels({ limit: 500000, rearm: 150000, nextTrigger: 660000, source: 'state' }),
+    ['handoff trigger 500K', 'next handoff trigger 660K', 'context window 1M']);
+  assert.deepEqual(await labels({ limit: 500000, rearm: 150000, nextTrigger: null, source: 'project' }),
+    ['handoff trigger 500K', 'context window 1M']);
+  assert.deepEqual(await labels(undefined), ['handoff trigger 400K', 'context window 1M']);
+});
+
 test('context over time: step line, reference lines, compaction and handoff marks, one tooltip', async () => {
   const app = boot();
   await openTokens(app);

@@ -1571,6 +1571,39 @@ ipcMain.handle('get-usage', async () => {
   }
 });
 
+// --- IPC: ctx-handoff limits (<ctx folder>/limits.json, per project) ---
+//
+// The hook's handoff limit and re-arm step, per project (ctx-limits.js says
+// how the file is read and written). The renderer names a project by its path;
+// the key in the file is Claude Code's folder name for it (encodeProjectPath),
+// which is what the hook's project_slug() gives for the same folder. The
+// folder is read-ctx-state's (claudeCtxDir). Kept out of the read-ctx-state
+// reply for the reason the handoff switch is: four tests pin that reply.
+const ctxLimits = require('./ctx-limits');
+function ctxLimitsSlug(projectPath) {
+  if (typeof projectPath !== 'string' || !projectPath) return null;
+  const slug = encodeProjectPath(projectPath);
+  return ctxLimits.SLUG_RE.test(slug) ? slug : null;
+}
+try {
+  ipcMain.handle('read-ctx-limits', (_event, projectPath) => {
+    const slug = ctxLimitsSlug(projectPath);
+    if (!slug) return { error: 'bad project' };
+    return ctxLimits.readProjectLimits(claudeCtxDir(), slug);
+  });
+  // limit, rearm: integers in tokens, or null for "the default's".
+  ipcMain.handle('write-ctx-limits', (_event, projectPath, limit, rearm) => {
+    const slug = ctxLimitsSlug(projectPath);
+    if (!slug) return { ok: false, error: 'bad project' };
+    const result = ctxLimits.writeProjectLimits(claudeCtxDir(), slug, limit, rearm);
+    if (result.ok) log.info(`[ctx-limits] ${slug} limit=${limit == null ? 'default' : limit} rearm=${rearm == null ? 'default' : rearm}`);
+    else log.warn(`[ctx-limits] ${slug} refused: ${result.error}`);
+    return result;
+  });
+} catch (err) {
+  try { log.error('[ctx-limits] handler registration failed', err); } catch {}
+}
+
 // --- IPC: handoff switch (the ctx-handoff hook's opt-out marker <id>.off) ---
 //
 // While <ctx folder>/<session id>.off exists the hook asks that session for no

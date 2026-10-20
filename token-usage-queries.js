@@ -1,6 +1,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const ctxLimits = require('./ctx-limits');
 
 /**
  * Read-only queries behind the Tokens tab (design section 4; build contract 6.4).
@@ -402,6 +403,29 @@ function intOrNull(v) {
 
 function strOrNull(v) {
   return typeof v === 'string' && v ? v : null;
+}
+
+/**
+ * The session's handoff limit for the chart's reference line: the state file's
+ * own limit/rearm/next_trigger (the hook writes them), else its project's in
+ * <ctx dir>/limits.json (ctx-limits.js), else the built-in 400K / 150K.
+ * nextTrigger is null when the state file names none.
+ */
+function readHandoffTrigger(sessionId, slug, ctxDir) {
+  const out = { limit: ctxLimits.DEFAULT_LIMIT, rearm: ctxLimits.DEFAULT_REARM, nextTrigger: null, source: 'builtin' };
+  try {
+    if (!ctxDir) return out;
+    const doc = ctxLimits.readLimitsDoc(ctxDir).doc;
+    const project = ctxLimits.effectiveLimits(doc, typeof slug === 'string' ? slug : null);
+    out.limit = project.limit; out.rearm = project.rearm; out.source = project.source;
+    const state = readJson(path.join(ctxDir, sessionId + '.state.json'));
+    if (isPlainObject(state)) {
+      if (ctxLimits.validLimit(state.limit)) { out.limit = state.limit; out.source = 'state'; }
+      if (ctxLimits.validRearm(state.rearm)) out.rearm = state.rearm;
+      if (Number.isInteger(state.next_trigger) && state.next_trigger > 0) out.nextTrigger = state.next_trigger;
+    }
+  } catch {}
+  return out;
 }
 
 /**
@@ -1158,6 +1182,7 @@ function createQueries(db, deps) {
       points: sampled.points,
       compactions,
       handoffs: readHandoffs(sessionId, slug, ctxDir, handoffsDir),
+      handoffTrigger: readHandoffTrigger(sessionId, slug, ctxDir),
       downsampled: sampled.downsampled,
       totalPoints: allPoints.length,
     };
@@ -1179,6 +1204,7 @@ module.exports = {
   wireRequest,
   // For tests and for the renderer's own expectations:
   downsamplePoints,
+  readHandoffTrigger,
   writtenAtMs,
   modelLabel,
   contextWindowFor,

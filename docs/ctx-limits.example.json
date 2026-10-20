@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "default": {
+    "limit": 400000,
+    "rearm": 150000
+  },
+  "projects": {
+    "C--Users-jhack-Bitbucket-tools-po-project": {
+      "limit": 500000,
+      "rearm": 150000
+    }
+  }
+}
