@@ -598,6 +598,7 @@
         rearmIn.placeholder = k(reply.defaults.rearm);
         note.textContent = 'In use: ' + k(reply.effective.limit) + 'K, then ' + k(reply.effective.rearm) + 'K past each handoff.'
           + (reply.code === 'EVERSION' ? ' limits.json is not version 1, so the hook ignores it: the built-in numbers apply, and it is not saved over.'
+            : reply.code === 'ESIZE' ? ' limits.json is over 64 KB, so the hook ignores it: the built-in numbers apply, and it is not saved over.'
             : reply.code ? ' limits.json could not be read (' + reply.code + '): the built-in numbers apply.' : '');
       };
       // parseLimitK (ctx-handoff.js): blank = null, text the input could not

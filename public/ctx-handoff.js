@@ -172,7 +172,7 @@ function chipLevel(tokens, limits) {
 //      and next_trigger is where it asks next;
 //   2. the project's entry in limits.json (main's read-ctx-limits `effective`);
 //   3. the built-in 400K / 150K.
-// dueAt is the next trigger (where the hook asks next), warnAt the limit less
+// dueAt is the next trigger (where the hook asks next: never below the limit), warnAt the limit less
 // 100K (the status line's amber; red is from the limit). Same validity ranges
 // as ctx-limits.js.
 function handoffLimits(state, project) {
@@ -187,7 +187,9 @@ function handoffLimits(state, project) {
   let rearm = REARM_AT;
   if (okRearm(st.rearm)) rearm = st.rearm;
   else if (okRearm(pr.rearm)) rearm = pr.rearm;
-  const next = Number.isInteger(st.next_trigger) && st.next_trigger > 0 ? st.next_trigger : limit;
+  // The hook asks at tokens >= max(next_trigger, limit): a raised limit is
+  // above a next_trigger the state still holds.
+  const next = Math.max(Number.isInteger(st.next_trigger) && st.next_trigger > 0 ? st.next_trigger : limit, limit);
   return { limit, rearm, nextTrigger: next, dueAt: next, warnAt: limit - WARN_BELOW, source };
 }
 

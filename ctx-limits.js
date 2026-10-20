@@ -42,6 +42,9 @@ const REARM_MIN = 25000;
 const REARM_MAX = 500000;
 const LIMITS_FILE = 'limits.json';
 const LIMITS_VERSION = 1;
+// The hook's LIMITS_MAX_BYTES: a larger file is ignored there (the built-in
+// numbers), so it is not used here either, and nothing larger is written.
+const LIMITS_MAX_BYTES = 64 * 1024;
 // Claude Code's folder names are [A-Za-z0-9-] (encodeProjectPath), and the
 // long-path form adds a dash and a base-36 hash (at most 208). 255 is the
 // hook's own cap on a key. The slug is only ever a JSON key, never a path, but
@@ -74,7 +77,9 @@ function slugForProject(projectPath) {
 }
 
 // The key in projects that stands for slug: the same string, else the first
-// key (file order) that differs from it only in case, else null.
+// key (file order) that differs from it only in case, else null. An exact key
+// wins whatever its value (null, a number): its entry is then empty, the
+// default's, as the hook's _project_entry.
 function projectKey(projects, slug) {
   if (!isPlainObject(projects) || typeof slug !== 'string') return null;
   if (Object.prototype.hasOwnProperty.call(projects, slug)) return slug;
@@ -84,14 +89,33 @@ function projectKey(projects, slug) {
 }
 
 // → { doc, code }: doc is the parsed object or null; code null = read,
-// 'ENOENT' = no file (normal), 'EPARSE' = not JSON, 'ESHAPE' = JSON but not an
+// 'ENOENT' = no file (normal), 'ESIZE' = over LIMITS_MAX_BYTES (read no
+// further, as the hook), 'EPARSE' = not JSON, 'ESHAPE' = JSON but not an
 // object, 'EVERSION' = an object whose version is not 1 (doc is still given:
 // it is not to be used for numbers, only kept from being overwritten), else
-// the read error's code.
+// the read error's code. One leading BOM is dropped, as the hook reads the
+// file as utf-8-sig (PowerShell writes one); Switchboard writes none.
 function readLimitsDoc(ctxDir, fsMod = fs) {
-  let text;
-  try { text = fsMod.readFileSync(limitsPath(ctxDir), 'utf8'); }
-  catch (err) { return { doc: null, code: err && err.code === 'ENOENT' ? 'ENOENT' : (err && err.code) || 'EREAD' }; }
+  let raw;
+  let fd = null;
+  try {
+    fd = fsMod.openSync(limitsPath(ctxDir), 'r');
+    const buf = Buffer.alloc(LIMITS_MAX_BYTES + 1);
+    let got = 0;
+    while (got < buf.length) {
+      const n = fsMod.readSync(fd, buf, got, buf.length - got, null);
+      if (!n) break;
+      got += n;
+    }
+    raw = buf.subarray(0, got);
+  } catch (err) {
+    return { doc: null, code: err && err.code === 'ENOENT' ? 'ENOENT' : (err && err.code) || 'EREAD' };
+  } finally {
+    if (fd !== null) { try { fsMod.closeSync(fd); } catch {} }
+  }
+  if (raw.length > LIMITS_MAX_BYTES) return { doc: null, code: 'ESIZE' };
+  let text = raw.toString('utf8');
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   let doc;
   try { doc = JSON.parse(text); } catch { return { doc: null, code: 'EPARSE' }; }
   if (!isPlainObject(doc)) return { doc: null, code: 'ESHAPE' };
@@ -154,6 +178,9 @@ function writeProjectLimits(ctxDir, slug, limit, rearm, fsMod = fs) {
   if (read.code === 'EVERSION') {
     return { ok: false, error: 'limits.json is not version 1, so the hook does not use it; it was left as it is.' };
   }
+  if (read.code === 'ESIZE') {
+    return { ok: false, error: 'limits.json is over 64 KB, so the hook does not use it; it was left as it is.' };
+  }
   if (read.code && read.code !== 'ENOENT') {
     return { ok: false, error: 'limits.json could not be read (' + read.code + '); it was left as it is.' };
   }
@@ -171,12 +198,17 @@ function writeProjectLimits(ctxDir, slug, limit, rearm, fsMod = fs) {
   if (Object.keys(entry).length) projects[key] = entry; else delete projects[key];
   doc.projects = projects;
 
+  const out = JSON.stringify(doc, null, 2) + '\n';
+  if (Buffer.byteLength(out, 'utf8') > LIMITS_MAX_BYTES) {
+    return { ok: false, error: 'limits.json would be over 64 KB, which the hook ignores; nothing was written.' };
+  }
+
   const target = limitsPath(ctxDir);
   const tmp = target + '.' + process.pid + '.' + Date.now() + '.tmp';
   let lastErr = null;
   try {
     fsMod.mkdirSync(ctxDir, { recursive: true });
-    fsMod.writeFileSync(tmp, JSON.stringify(doc, null, 2) + '\n', 'utf8');
+    fsMod.writeFileSync(tmp, out, 'utf8');
     for (let attempt = 0; attempt < RENAME_RETRIES; attempt++) {
       try { fsMod.renameSync(tmp, target); lastErr = null; break; }
       catch (err) {
@@ -195,7 +227,7 @@ function writeProjectLimits(ctxDir, slug, limit, rearm, fsMod = fs) {
 }
 
 module.exports = {
-  DEFAULT_LIMIT, DEFAULT_REARM, LIMIT_MIN, LIMIT_MAX, REARM_MIN, REARM_MAX, LIMITS_FILE, LIMITS_VERSION, SLUG_RE,
+  DEFAULT_LIMIT, DEFAULT_REARM, LIMIT_MIN, LIMIT_MAX, REARM_MIN, REARM_MAX, LIMITS_FILE, LIMITS_VERSION, LIMITS_MAX_BYTES, SLUG_RE,
   RENAME_RETRIES, validLimit, validRearm, limitsPath, slugForProject, projectKey, readLimitsDoc, effectiveLimits,
   readProjectLimits,
   validationError, writeProjectLimits,

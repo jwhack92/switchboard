@@ -244,6 +244,73 @@ test('ctx-limits: a project key that differs only in case is read, and updated r
   } finally { t.cleanup(); }
 });
 
+test('ctx-limits: an exact key wins even when its value is null or not an object, as the hook (T4)', () => {
+  const t = tempDir();
+  try {
+    const upper = PO.toUpperCase();
+    for (const v of [null, 5, 'x', [600000]]) {
+      const doc = { version: 1, default: { limit: 450000 }, projects: { [upper]: { limit: 600000 }, [PO]: v } };
+      assert.equal(ctxLimits.projectKey(doc.projects, PO), PO, JSON.stringify(v));
+      fs.writeFileSync(t.file, JSON.stringify(doc));
+      const r = ctxLimits.readProjectLimits(t.dir, PO);
+      assert.deepEqual([r.effective.limit, r.effective.source, r.own.limit], [450000, 'default', null], JSON.stringify(v));
+      // The write replaces the exact key; the case variant is left alone.
+      assert.equal(ctxLimits.writeProjectLimits(t.dir, PO, 500000, null).ok, true);
+      assert.deepEqual(JSON.parse(fs.readFileSync(t.file, 'utf8')).projects, { [upper]: { limit: 600000 }, [PO]: { limit: 500000 } });
+    }
+  } finally { t.cleanup(); }
+});
+
+test('ctx-limits: a file with a leading BOM reads as its numbers and can be saved over, without a BOM (T1)', () => {
+  const t = tempDir();
+  try {
+    fs.writeFileSync(t.file, '﻿' + JSON.stringify({ version: 1, projects: { [PO]: { limit: 500000, rearm: 100000 } } }), 'utf8');
+    assert.equal(fs.readFileSync(t.file)[0], 0xEF);
+    const r = ctxLimits.readProjectLimits(t.dir, PO);
+    assert.equal(r.code, null);
+    assert.deepEqual([r.effective.limit, r.effective.rearm, r.effective.source], [500000, 100000, 'project']);
+    assert.equal(ctxLimits.writeProjectLimits(t.dir, PO, 600000, null).ok, true);
+    const bytes = fs.readFileSync(t.file);
+    assert.equal(bytes[0], '{'.charCodeAt(0), 'no BOM written');
+    assert.deepEqual(JSON.parse(bytes.toString('utf8')).projects[PO], { limit: 600000 });
+    // Only one BOM is dropped, as utf-8-sig.
+    fs.writeFileSync(t.file, '﻿﻿{"version": 1}', 'utf8');
+    assert.equal(ctxLimits.readLimitsDoc(t.dir).code, 'EPARSE');
+  } finally { t.cleanup(); }
+});
+
+test('ctx-limits: a file over 64 KB is the built-in 400K / 150K and not saved over; a write past 64 KB is refused (T2)', () => {
+  const t = tempDir();
+  try {
+    const cap = ctxLimits.LIMITS_MAX_BYTES;
+    assert.equal(cap, 65536);
+    const doc = JSON.stringify({ version: 1, projects: { [PO]: { limit: 500000 } } });
+    // Exactly 64 KB is read, as the hook.
+    fs.writeFileSync(t.file, doc + ' '.repeat(cap - doc.length));
+    assert.equal(ctxLimits.readProjectLimits(t.dir, PO).effective.limit, 500000);
+    // One byte more is ESIZE: the built-in numbers, and no write over it.
+    const big = doc + ' '.repeat(cap + 1 - doc.length);
+    fs.writeFileSync(t.file, big);
+    assert.equal(ctxLimits.readLimitsDoc(t.dir).code, 'ESIZE');
+    const r = ctxLimits.readProjectLimits(t.dir, PO);
+    assert.deepEqual([r.effective.limit, r.effective.rearm, r.effective.source, r.code], [400000, 150000, 'builtin', 'ESIZE']);
+    const w = ctxLimits.writeProjectLimits(t.dir, PO, 600000, null);
+    assert.equal(w.ok, false);
+    assert.match(w.error, /64 KB/);
+    assert.equal(fs.readFileSync(t.file, 'utf8'), big, 'left as it was');
+    // A file that is fine but whose written form would pass 64 KB: refused, nothing written.
+    const pad = 'p'.repeat(cap - 100);
+    const near = JSON.stringify({ version: 1, pad, projects: {} });
+    assert.ok(Buffer.byteLength(near) <= cap);
+    fs.writeFileSync(t.file, near);
+    const w2 = ctxLimits.writeProjectLimits(t.dir, PO, 600000, 150000);
+    assert.equal(w2.ok, false);
+    assert.match(w2.error, /64 KB/);
+    assert.equal(fs.readFileSync(t.file, 'utf8'), near);
+    assert.deepEqual(fs.readdirSync(t.dir), ['limits.json']);
+  } finally { t.cleanup(); }
+});
+
 test('ctx-limits: the slug main writes under is Claude Code\'s folder name for the project path', () => {
   assert.equal(encodeProjectPath('C:\\Users\\jhack\\Bitbucket\\tools\\po-project'), PO);
   assert.equal(ctxLimits.SLUG_RE.test(PO), true);
@@ -283,6 +350,17 @@ test('handoffLimits: the state file\'s next_trigger, limit and rearm first, then
   assert.equal(handoffLimits({ next_trigger: 560000 }, null).dueAt, 560000);
   // Invalid values are skipped, booleans included.
   assert.deepEqual(handoffLimits({ limit: true, rearm: 1 }, { limit: 99, rearm: '5' }).limit, 400000);
+});
+
+test('handoffLimits: the next trigger is max(next_trigger, limit), where the hook asks (T3)', () => {
+  // An old state with no limit key, the project raised to 500K.
+  const raised = handoffLimits({ next_trigger: 400000 }, { limit: 500000, rearm: 150000 });
+  assert.deepEqual([raised.limit, raised.nextTrigger, raised.dueAt], [500000, 500000, 500000]);
+  // A pending crossing below a raised limit (apply_limits leaves a pending next_trigger alone).
+  const pending = handoffLimits({ pending: true, limit: 600000, next_trigger: 400000 }, null);
+  assert.deepEqual([pending.nextTrigger, pending.dueAt], [600000, 600000]);
+  // A next_trigger past a handoff, above the limit, stays.
+  assert.equal(handoffLimits({ limit: 500000, next_trigger: 660000 }, null).nextTrigger, 660000);
 });
 
 test('the chip colours are the hook status line\'s: amber from limit less 100K, red from the limit (not next_trigger) (S7)', () => {
