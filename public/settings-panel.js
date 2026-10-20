@@ -597,23 +597,18 @@
         limitIn.placeholder = k(reply.defaults.limit);
         rearmIn.placeholder = k(reply.defaults.rearm);
         note.textContent = 'In use: ' + k(reply.effective.limit) + 'K, then ' + k(reply.effective.rearm) + 'K past each handoff.'
-          + (reply.code ? ' limits.json could not be read (' + reply.code + '): the built-in numbers apply.' : '');
+          + (reply.code === 'EVERSION' ? ' limits.json is not version 1, so the hook ignores it: the built-in numbers apply, and it is not saved over.'
+            : reply.code ? ' limits.json could not be read (' + reply.code + '): the built-in numbers apply.' : '');
       };
-      // '' = blank (null); else K tokens as a whole number of tokens, or an error.
-      const parseK = (text, label) => {
-        const t = String(text).trim();
-        if (!t) return { value: null };
-        const n = Number(t) * 1000;
-        if (!Number.isFinite(n) || Math.abs(n - Math.round(n)) > 1e-6) return { error: label + ' is not a number of K tokens.' };
-        return { value: Math.round(n) };
-      };
-      if (typeof window.api.readCtxLimits !== 'function') {
+      // parseLimitK (ctx-handoff.js): blank = null, text the input could not
+      // read (validity.badInput) refused, else whole tokens.
+      if (typeof window.api.readCtxLimits !== 'function' || typeof parseLimitK !== 'function') {
         ctxSection.style.display = 'none';
       } else {
         window.api.readCtxLimits(projectPath).then(show, () => show(null));
         saveCtx.addEventListener('click', async () => {
-          const limit = parseK(limitIn.value, 'The limit');
-          const rearm = parseK(rearmIn.value, 'The re-arm step');
+          const limit = parseLimitK(limitIn, 'The limit');
+          const rearm = parseLimitK(rearmIn, 'The re-arm step');
           if (limit.error || rearm.error) { note.textContent = limit.error || rearm.error; return; }
           let reply;
           try { reply = await window.api.writeCtxLimits(projectPath, limit.value, rearm.value); }

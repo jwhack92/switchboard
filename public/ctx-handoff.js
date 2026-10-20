@@ -155,9 +155,12 @@ function fmtTokens(n) {
   return roundHalfEven(v / 1000) + 'K';
 }
 
+// The hook's status line colours, exactly: green below the limit less 100K,
+// amber below the limit, red at or above it -- the limit, not the next
+// trigger, so a session past a handoff stays red as it does there.
 // limits: a handoffLimits() result; none = the built-in 300K / 400K.
 function chipLevel(tokens, limits) {
-  const due = limits && Number.isInteger(limits.dueAt) ? limits.dueAt : DUE_AT;
+  const due = limits && Number.isInteger(limits.limit) ? limits.limit : DUE_AT;
   const warn = limits && Number.isInteger(limits.warnAt) ? limits.warnAt : WARN_AT;
   if (tokens >= due) return 'danger';
   if (tokens >= warn) return 'warn';
@@ -169,8 +172,9 @@ function chipLevel(tokens, limits) {
 //      and next_trigger is where it asks next;
 //   2. the project's entry in limits.json (main's read-ctx-limits `effective`);
 //   3. the built-in 400K / 150K.
-// dueAt is the next trigger (red from there), warnAt the limit less 100K (the
-// status line's amber). Same validity ranges as ctx-limits.js.
+// dueAt is the next trigger (where the hook asks next), warnAt the limit less
+// 100K (the status line's amber; red is from the limit). Same validity ranges
+// as ctx-limits.js.
 function handoffLimits(state, project) {
   const okLimit = (v) => Number.isInteger(v) && v >= 100000 && v <= 950000;
   const okRearm = (v) => Number.isInteger(v) && v >= 25000 && v <= 500000;
@@ -185,6 +189,21 @@ function handoffLimits(state, project) {
   else if (okRearm(pr.rearm)) rearm = pr.rearm;
   const next = Number.isInteger(st.next_trigger) && st.next_trigger > 0 ? st.next_trigger : limit;
   return { limit, rearm, nextTrigger: next, dueAt: next, warnAt: limit - WARN_BELOW, source };
+}
+
+// One of Project Settings' handoff inputs (settings-panel.js), in K tokens:
+// { value: null } for blank (the default's), { value: tokens }, or { error }.
+// A number input that holds text it cannot read ("550-", "5e") has value ''
+// and validity.badInput, which is refused, not taken for blank: blank would
+// delete the project's entry.
+function parseLimitK(input, label) {
+  const o = input || {};
+  if (o.validity && o.validity.badInput) return { error: label + ' is not a number of K tokens.' };
+  const t = String(o.value == null ? '' : o.value).trim();
+  if (!t) return { value: null };
+  const n = Number(t) * 1000;
+  if (!Number.isFinite(n) || Math.abs(n - Math.round(n)) > 1e-6) return { error: label + ' is not a number of K tokens.' };
+  return { value: Math.round(n) };
 }
 
 // The renderer cannot read %LOCALAPPDATA%, but it can ask main where the
@@ -873,11 +892,14 @@ function pollDue(tick, ids) {
 // when a handoff has moved it past the limit. AUTO_ON_TITLE is the text with
 // the built-in 400K and 150K. AUTO_OFF_TITLE says what the hook does today
 // with a session that is opted out (ctx_handoff.py, "Opt-out").
+// Past a handoff the meter is red from the limit while the hook waits for the
+// next trigger, so that text says both.
 function autoOnTitle(limits) {
   const l = limits || handoffLimits(null, null);
   const when = l.nextTrigger === l.limit
     ? 'passes the trigger (' + fmtTokens(l.limit) + ', then ' + fmtTokens(l.rearm) + ' past each handoff)'
-    : 'passes its next trigger, ' + fmtTokens(l.nextTrigger) + ' (the trigger is ' + fmtTokens(l.limit) + ', then ' + fmtTokens(l.rearm) + ' past each handoff)';
+    : 'passes its next trigger, ' + fmtTokens(l.nextTrigger) + ' (the trigger is ' + fmtTokens(l.limit) + ', then ' + fmtTokens(l.rearm)
+      + ' past each handoff; the meter is red from ' + fmtTokens(l.limit) + ')';
   return 'Automatic handoff prompts are on: the hook asks this session for a handoff when its context ' + when +
     '. Click to turn them off for this session. Hand off and Update still work.';
 }
@@ -2601,7 +2623,7 @@ if (typeof module !== 'undefined' && module.exports) {
     typingGate, gateText, chooseHeaderNote, ultracodeValue, ultracodeModel, ultracodeScreen, ultracodeOutcome,
     parseStoredUltracode, staleReading, staleTitle,
     autoHandoffModel, AUTO_ON_TITLE, AUTO_OFF_TITLE, AUTO_ENV_TITLE, AUTO_FAILED_OFF, AUTO_FAILED_ON, AUTO_REKEYED,
-    REARM_AT, WARN_BELOW, handoffLimits, autoOnTitle,
+    REARM_AT, WARN_BELOW, handoffLimits, autoOnTitle, parseLimitK,
     handoffChipState, handoffBoltState, onActiveSessionChanged,
   };
 }

@@ -1580,11 +1580,7 @@ ipcMain.handle('get-usage', async () => {
 // folder is read-ctx-state's (claudeCtxDir). Kept out of the read-ctx-state
 // reply for the reason the handoff switch is: four tests pin that reply.
 const ctxLimits = require('./ctx-limits');
-function ctxLimitsSlug(projectPath) {
-  if (typeof projectPath !== 'string' || !projectPath) return null;
-  const slug = encodeProjectPath(projectPath);
-  return ctxLimits.SLUG_RE.test(slug) ? slug : null;
-}
+const ctxLimitsSlug = ctxLimits.slugForProject;
 try {
   ipcMain.handle('read-ctx-limits', (_event, projectPath) => {
     const slug = ctxLimitsSlug(projectPath);

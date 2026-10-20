@@ -12,7 +12,7 @@ const os = require('os');
 const path = require('path');
 
 const ctxLimits = require('../ctx-limits');
-const { handoffLimits, autoOnTitle, AUTO_ON_TITLE, autoHandoffModel, chipLevel, meterModel, chipState } = require('../public/ctx-handoff');
+const { handoffLimits, autoOnTitle, AUTO_ON_TITLE, autoHandoffModel, chipLevel, meterModel, chipState, parseLimitK } = require('../public/ctx-handoff');
 const { readHandoffTrigger } = require('../token-usage-queries');
 const { encodeProjectPath } = require('../encode-project-path');
 
@@ -114,14 +114,43 @@ test('ctx-limits: the write goes to a temp file in the same folder, renamed over
     assert.notEqual(calls[0][1], t.file);
     assert.deepEqual(calls[1], ['rename', calls[0][1], t.file]);
 
-    // A failed rename leaves the old file and no temp file.
+    // A rename that stays busy past the retries leaves the old file and no temp file.
     const before = fs.readFileSync(t.file, 'utf8');
-    const broken = { ...spy, renameSync: () => { const e = new Error('busy'); e.code = 'EBUSY'; throw e; } };
+    let tries = 0;
+    const broken = { ...spy, renameSync: () => { tries++; const e = new Error('busy'); e.code = 'EBUSY'; throw e; } };
     const r = ctxLimits.writeProjectLimits(t.dir, PO, 600000, null, broken);
     assert.equal(r.ok, false);
     assert.match(r.error, /EBUSY/);
+    assert.equal(tries, ctxLimits.RENAME_RETRIES);
     assert.equal(fs.readFileSync(t.file, 'utf8'), before);
     assert.deepEqual(fs.readdirSync(t.dir), ['limits.json']);
+
+    // Another error is not retried.
+    tries = 0;
+    const denied = { ...spy, renameSync: () => { tries++; const e = new Error('no'); e.code = 'ENOENT'; throw e; } };
+    assert.equal(ctxLimits.writeProjectLimits(t.dir, PO, 600000, null, denied).ok, false);
+    assert.equal(tries, 1);
+    assert.deepEqual(fs.readdirSync(t.dir), ['limits.json']);
+  } finally { t.cleanup(); }
+});
+
+test('ctx-limits: the rename is retried on EPERM / EBUSY / EACCES while the hook has the file open (S6)', () => {
+  const t = tempDir();
+  try {
+    for (const code of ['EPERM', 'EBUSY', 'EACCES']) {
+      let tries = 0;
+      const flaky = { ...fs, renameSync: (a, b) => {
+        tries++;
+        if (tries < 3) { const e = new Error('held'); e.code = code; throw e; }
+        return fs.renameSync(a, b);
+      } };
+      const r = ctxLimits.writeProjectLimits(t.dir, PO, 500000, null, flaky);
+      assert.equal(r.ok, true, code + ': ' + r.error);
+      assert.equal(tries, 3, code);
+      assert.equal(JSON.parse(fs.readFileSync(t.file, 'utf8')).projects[PO].limit, 500000);
+      assert.deepEqual(fs.readdirSync(t.dir), ['limits.json']);
+      fs.rmSync(t.file);
+    }
   } finally { t.cleanup(); }
 });
 
@@ -146,20 +175,96 @@ test('ctx-limits: a corrupt, non-object or missing file reads as the built-in 40
   } finally { t.cleanup(); }
 });
 
-test('ctx-limits: per value: a project key wins, an absent one is the default\'s, an invalid one is the built-in', () => {
-  const doc = { default: { limit: 450000, rearm: 100000 }, projects: { [PO]: { limit: 500000 }, bad: { limit: 5, rearm: true }, odd: 7 } };
+test('ctx-limits: per value, as the hook: the project\'s when valid, else the default\'s when valid, else the built-in', () => {
+  const doc = { version: 1, default: { limit: 450000, rearm: 100000 }, projects: { [PO]: { limit: 500000 }, bad: { limit: 5, rearm: true }, odd: 7 } };
   assert.deepEqual(ctxLimits.effectiveLimits(doc, PO), { limit: 500000, rearm: 100000, source: 'project', rearmSource: 'default' });
-  assert.deepEqual(ctxLimits.effectiveLimits(doc, 'bad'), { limit: 400000, rearm: 150000, source: 'builtin', rearmSource: 'builtin' });
+  // An invalid project value falls to the default's (S2), not to the built-in.
+  assert.deepEqual(ctxLimits.effectiveLimits(doc, 'bad'), { limit: 450000, rearm: 100000, source: 'default', rearmSource: 'default' });
   assert.deepEqual(ctxLimits.effectiveLimits(doc, 'odd'), { limit: 450000, rearm: 100000, source: 'default', rearmSource: 'default' });
   assert.deepEqual(ctxLimits.effectiveLimits(doc, 'unknown'), { limit: 450000, rearm: 100000, source: 'default', rearmSource: 'default' });
-  assert.deepEqual(ctxLimits.effectiveLimits({ default: { limit: 'x' } }, PO).limit, 400000);
+  // An invalid default value, and an invalid project value over it, are the built-in.
+  const badDefault = { version: 1, default: { limit: 'x', rearm: 600000 }, projects: { [PO]: { limit: 99 } } };
+  assert.deepEqual(ctxLimits.effectiveLimits(badDefault, PO), { limit: 400000, rearm: 150000, source: 'builtin', rearmSource: 'builtin' });
   assert.deepEqual(ctxLimits.effectiveLimits(null, PO), { limit: 400000, rearm: 150000, source: 'builtin', rearmSource: 'builtin' });
-  assert.equal(ctxLimits.effectiveLimits({ projects: {} }, '__proto__').limit, 400000, 'no prototype key is an entry');
+  assert.equal(ctxLimits.effectiveLimits({ version: 1, projects: {} }, '__proto__').limit, 400000, 'no prototype key is an entry');
+});
+
+test('ctx-limits: whole-number floats in the file (500000.0, 5e5) are integers, as the hook takes them', () => {
+  const t = tempDir();
+  try {
+    fs.writeFileSync(t.file, '{"version": 1.0, "default": {"rearm": 1.2e5}, "projects": {"' + PO + '": {"limit": 500000.0}, "' + OTHER + '": {"limit": 5e5, "rearm": 150000.5}}}');
+    const r = ctxLimits.readProjectLimits(t.dir, PO);
+    assert.deepEqual([r.effective.limit, r.effective.rearm, r.code], [500000, 120000, null]);
+    assert.deepEqual(r.own, { limit: 500000, rearm: null });
+    const o = ctxLimits.readProjectLimits(t.dir, OTHER);
+    assert.deepEqual([o.effective.limit, o.effective.rearm, o.effective.rearmSource], [500000, 120000, 'default']);
+  } finally { t.cleanup(); }
+});
+
+test('ctx-limits: a file whose version is not the integer 1 reads as 400K / 150K and is not overwritten (S1)', () => {
+  const t = tempDir();
+  try {
+    const body = (v) => JSON.stringify({ ...(v === undefined ? {} : { version: v }), default: { limit: 300000 }, projects: { [PO]: { limit: 500000, rearm: 100000 } } });
+    for (const v of [undefined, 2, 0, '1', true, null, [1], 1.5]) {
+      const text = body(v);
+      fs.writeFileSync(t.file, text);
+      const r = ctxLimits.readProjectLimits(t.dir, PO);
+      assert.deepEqual([r.effective.limit, r.effective.rearm, r.effective.source], [400000, 150000, 'builtin'], text);
+      assert.deepEqual(r.own, { limit: null, rearm: null }, text);
+      assert.deepEqual([r.defaults.limit, r.defaults.rearm], [400000, 150000], text);
+      assert.equal(r.code, 'EVERSION', text);
+      const w = ctxLimits.writeProjectLimits(t.dir, PO, 600000, null);
+      assert.equal(w.ok, false, 'refused: ' + text);
+      assert.match(w.error, /not version 1/);
+      assert.equal(fs.readFileSync(t.file, 'utf8'), text, 'left as it was');
+      assert.equal(readHandoffTrigger(SID, PO, t.dir).limit, 400000, 'the token chart too: ' + text);
+    }
+    assert.deepEqual(fs.readdirSync(t.dir), ['limits.json']);
+  } finally { t.cleanup(); }
+});
+
+test('ctx-limits: a project key that differs only in case is read, and updated rather than joined by a second (S3)', () => {
+  const t = tempDir();
+  try {
+    const upper = PO.toUpperCase();
+    fs.writeFileSync(t.file, JSON.stringify({ version: 1, projects: { [upper]: { limit: 300000, note: 'x' } } }));
+    assert.equal(ctxLimits.readProjectLimits(t.dir, PO).effective.limit, 300000);
+    assert.deepEqual(ctxLimits.readProjectLimits(t.dir, PO).own, { limit: 300000, rearm: null });
+    assert.equal(ctxLimits.writeProjectLimits(t.dir, PO, 500000, 150000).ok, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(t.file, 'utf8')).projects, { [upper]: { limit: 500000, note: 'x', rearm: 150000 } });
+    // An exact key wins over a case variant, for reading and writing.
+    fs.writeFileSync(t.file, JSON.stringify({ version: 1, projects: { [upper]: { limit: 300000 }, [PO]: { limit: 700000 } } }));
+    assert.equal(ctxLimits.readProjectLimits(t.dir, PO).effective.limit, 700000);
+    assert.equal(ctxLimits.writeProjectLimits(t.dir, PO, 800000, null).ok, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(t.file, 'utf8')).projects, { [upper]: { limit: 300000 }, [PO]: { limit: 800000 } });
+    // Clearing a case-variant entry removes that key.
+    fs.writeFileSync(t.file, JSON.stringify({ version: 1, projects: { [upper]: { limit: 300000 } } }));
+    assert.equal(ctxLimits.writeProjectLimits(t.dir, PO, null, null).ok, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(t.file, 'utf8')).projects, {});
+  } finally { t.cleanup(); }
 });
 
 test('ctx-limits: the slug main writes under is Claude Code\'s folder name for the project path', () => {
   assert.equal(encodeProjectPath('C:\\Users\\jhack\\Bitbucket\\tools\\po-project'), PO);
   assert.equal(ctxLimits.SLUG_RE.test(PO), true);
+  assert.equal(ctxLimits.slugForProject('C:\\Users\\jhack\\Bitbucket\\tools\\po-project'), PO);
+  for (const bad of ['', null, 7]) assert.equal(ctxLimits.slugForProject(bad), null);
+});
+
+test('ctx-limits: keys up to 255 characters, the hook\'s cap, and the long-path dash-and-hash folder name (S4)', () => {
+  // A path past 200 characters: Claude Code's folder is the first 200, a dash and a base-36 hash.
+  const long = 'C:\\' + 'deep\\'.repeat(45) + 'project';
+  const slug = ctxLimits.slugForProject(long);
+  assert.equal(slug, encodeProjectPath(long));
+  assert.match(slug, /^[A-Za-z0-9-]{200}-[0-9a-z]+$/);
+  assert.equal(slug.slice(0, 200), long.replace(/[^a-zA-Z0-9]/g, '-').slice(0, 200));
+  const t = tempDir();
+  try {
+    assert.equal(ctxLimits.writeProjectLimits(t.dir, slug, 500000, null).ok, true);
+    assert.equal(ctxLimits.readProjectLimits(t.dir, slug).effective.limit, 500000);
+    for (const n of [241, 255]) assert.equal(ctxLimits.writeProjectLimits(t.dir, 'a'.repeat(n), 500000, null).ok, true, String(n));
+    assert.equal(ctxLimits.writeProjectLimits(t.dir, 'a'.repeat(256), 500000, null).ok, false, '256');
+  } finally { t.cleanup(); }
 });
 
 // ── the numbers the renderer shows ──────────────────────────────────────────
@@ -180,17 +285,20 @@ test('handoffLimits: the state file\'s next_trigger, limit and rearm first, then
   assert.deepEqual(handoffLimits({ limit: true, rearm: 1 }, { limit: 99, rearm: '5' }).limit, 400000);
 });
 
-test('the due colour and the auto switch tooltip carry the session\'s numbers', () => {
+test('the chip colours are the hook status line\'s: amber from limit less 100K, red from the limit (not next_trigger) (S7)', () => {
   const sidecar = (n) => ({ total_input_tokens: n, context_window_size: 1000000 });
   const fromState = handoffLimits({ limit: 500000, rearm: 150000, next_trigger: 660000 }, null);
+  assert.equal(fromState.dueAt, 660000, 'due stays the next trigger');
   assert.equal(chipLevel(399999, fromState), '');
   assert.equal(chipLevel(400000, fromState), 'warn');
-  assert.equal(chipLevel(659999, fromState), 'warn');
-  assert.equal(chipLevel(660000, fromState), 'danger');
+  assert.equal(chipLevel(499999, fromState), 'warn');
+  assert.equal(chipLevel(500000, fromState), 'danger');
+  assert.equal(chipLevel(659999, fromState), 'danger');
   assert.equal(meterModel(sidecar(450000), fromState).level, 'warn');
-  assert.equal(chipState({ running: true, sidecar: sidecar(660000), limits: fromState }).level, 'danger');
+  assert.equal(meterModel(sidecar(550000), fromState).level, 'danger');
+  assert.equal(chipState({ running: true, sidecar: sidecar(550000), limits: fromState }).level, 'danger');
   assert.equal(autoOnTitle(fromState),
-    'Automatic handoff prompts are on: the hook asks this session for a handoff when its context passes its next trigger, 660K (the trigger is 500K, then 150K past each handoff). Click to turn them off for this session. Hand off and Update still work.');
+    'Automatic handoff prompts are on: the hook asks this session for a handoff when its context passes its next trigger, 660K (the trigger is 500K, then 150K past each handoff; the meter is red from 500K). Click to turn them off for this session. Hand off and Update still work.');
 
   const fromProject = handoffLimits(null, { limit: 500000, rearm: 100000 });
   assert.equal(chipLevel(499999, fromProject), 'warn');
@@ -221,4 +329,23 @@ test('the token chart\'s trigger: the state file\'s, else limits.json\'s for the
     fs.rmSync(path.join(t.dir, SID + '.state.json'));
     assert.deepEqual(readHandoffTrigger(SID, PO, t.dir), { limit: 400000, rearm: 150000, nextTrigger: null, source: 'builtin' });
   } finally { t.cleanup(); }
+});
+
+// ── the settings panel's inputs ─────────────────────────────────────────────
+
+test('parseLimitK: text a number input cannot read (validity.badInput) is refused, not taken for blank (S5)', () => {
+  const input = (value, badInput = false) => ({ value, validity: { badInput } });
+  // Chromium gives '' for "550-" and "5e" with badInput set; blank would delete the entry.
+  for (const typed of ['550-', '5e']) {
+    const r = parseLimitK(input('', true), 'The limit');
+    assert.match(r.error || '', /The limit is not a number of K tokens/, typed);
+    assert.equal('value' in r, false, typed);
+  }
+  assert.deepEqual(parseLimitK(input(''), 'The limit'), { value: null });
+  assert.deepEqual(parseLimitK(input('  '), 'The limit'), { value: null });
+  assert.deepEqual(parseLimitK(input('550'), 'The limit'), { value: 550000 });
+  assert.deepEqual(parseLimitK(input('150.5'), 'The re-arm step'), { value: 150500 });
+  assert.match(parseLimitK(input('0.0001'), 'The limit').error, /not a number/);
+  assert.match(parseLimitK(input('abc'), 'The limit').error, /not a number/);
+  assert.deepEqual(parseLimitK({ value: '400' }, 'The limit'), { value: 400000 }, 'no validity: the value alone');
 });
