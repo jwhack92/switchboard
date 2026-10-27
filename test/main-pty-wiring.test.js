@@ -212,7 +212,7 @@ function boot({ blocks = [], globals = {}, modules = {} } = {}) {
     contexts.resolve = load(block('resolve'), { file: BLOCKS.resolve.file, globals: shared, modules });
     shared.resolveLiveSession = contexts.resolve.resolveLiveSession;
   }
-  contexts.guard = load(block('guard'), { file: BLOCKS.guard.file, globals: shared, modules: { './pty-guard': null, ...modules } });
+  contexts.guard = load(block('guard'), { file: BLOCKS.guard.file, globals: shared, modules: { './pty-guard': null, './pty-close': null, ...modules } });
   shared.ptyGuard = peek(contexts.guard, 'ptyGuard');
   for (const name of blocks) {
     assert.notEqual(name, 'registry', 'the registry is always loaded; name only blocks of main.js');

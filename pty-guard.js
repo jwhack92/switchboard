@@ -24,12 +24,14 @@ const messageOf = (error) => String(error && error.message !== undefined ? error
 const isSize = (n) => Number.isInteger(n) && n >= 1 && n <= 32767;
 
 /**
- * createPtyGuard({ log, setTimer, clearTimer, onStall })
+ * createPtyGuard({ log, setTimer, clearTimer, onStall, killPty })
  *   log         { debug, info, warn, error }
  *   setTimer    (fn, ms) => handle; clearTimer(handle) calls it off
  *   onStall     (session) => void: a kill has not ended its terminal after 8 s
+ *   killPty     (pty) => void: how a kill reaches the pty; a throw is a failed
+ *               kill. Default pty.kill(); main.js hands in pty-close.js closePty.
  */
-function createPtyGuard({ log, setTimer, clearTimer, onStall }) {
+function createPtyGuard({ log, setTimer, clearTimer, onStall, killPty = (pty) => pty.kill() }) {
   /**
    * The record's gate object, made the first time the guard keeps something
    * for it. A gate the record already carries is used as it is: a field it
@@ -138,7 +140,7 @@ function createPtyGuard({ log, setTimer, clearTimer, onStall }) {
     const id = typeof sessionId === 'string' && sessionId !== '' ? sessionId : 'unknown';
     gate.killRequested = true;
     try {
-      session.pty.kill();
+      killPty(session.pty);
     } catch (error) {
       // A stall timer that waits for an earlier kill is left alone.
       gate.failed = true;

@@ -106,10 +106,14 @@ if (launchFacts) {
 // (pty-guard.js). Nothing else in this file calls a session's pty. Required
 // after the electron-reloader line: a change in pty-guard.js needs an app restart.
 const { createPtyGuard } = require('./pty-guard');
+const { closePty } = require('./pty-close');
 const ptyGuard = createPtyGuard({
   log,
   setTimer: setTimeout,
   clearTimer: clearTimeout,
+  // node-pty's own kill() freezes this thread about 1 s per terminal on Windows
+  // ConPTY (a synchronous fork; 21 s at a 14-session quit); closePty does not.
+  killPty: (p) => closePty(p),
   // A stop that has not ended its terminal after 8 s. The id is asked at that
   // moment: a re-key may have moved the record since the kill.
   onStall: (session) => mainFaults.report('stop-stalled', null, { sessionId: sessionTransitions.keyOf(session) }),

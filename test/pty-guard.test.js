@@ -400,3 +400,45 @@ test("pty-guard: the file says a change needs an app restart, names task-manager
   assert.equal(/\brequire\(/.test(src), false, 'pure: it requires nothing');
   assert.equal(/setTimeout|setImmediate|setInterval|Date\.now/.test(src), false, 'every wait goes through the handed-in setTimer; these words may not stand in a comment either');
 });
+
+test('pty-guard: kill goes through killPty, once, with the session pty; the guard does not call pty.kill itself', () => {
+  const clk = clock();
+  const handed = [];
+  const guard = createPtyGuard({ log: { debug() {}, info() {}, warn() {}, error() {} }, setTimer: clk.setTimer, clearTimer: clk.clearTimer, onStall() {}, killPty: (pty) => { handed.push(pty); } });
+  const s = printed();
+  assert.deepEqual(guard.kill(s, '[stop]', STOP), { ok: true });
+  assert.equal(handed.length, 1);
+  assert.equal(handed[0], s.pty);
+  assert.deepEqual(s.pty.calls, [], 'pty.kill was not called by the guard');
+});
+
+test('pty-guard: no killPty given, pty.kill is called (the default)', () => {
+  const { guard } = make();
+  const s = printed();
+  assert.deepEqual(guard.kill(s, '[stop]', STOP), { ok: true });
+  assert.deepEqual(s.pty.calls, [['kill']]);
+});
+
+test('pty-guard: a killPty that throws gives ok false, stop failed, the same cause, and the kill failed line', () => {
+  const clk = clock();
+  const lines = [];
+  const at = (level) => (...args) => { lines.push([level, String(args[0]), args[1]]); };
+  const boom = new Error('the pty is closed');
+  const guard = createPtyGuard({ log: { debug: at('debug'), info: at('info'), warn: at('warn'), error: at('error') }, setTimer: clk.setTimer, clearTimer: clk.clearTimer, onStall() {}, killPty: () => { throw boom; } });
+  const s = printed();
+  assert.deepEqual(guard.kill(s, '[stop]', STOP), { ok: false, error: 'stop failed', cause: boom });
+  assert.equal(guard.stopState(s), 'failed');
+  assert.deepEqual(lines.filter((l) => l[0] === 'error').map((l) => l[1]), ['[stop] session=s1 kill failed: the pty is closed']);
+  assert.equal(lines.find((l) => l[0] === 'error')[2], boom);
+});
+
+test('pty-guard: with killPty, a forced second kill at quit calls killPty again', () => {
+  const clk = clock();
+  let kills = 0;
+  const guard = createPtyGuard({ log: { debug() {}, info() {}, warn() {}, error() {} }, setTimer: clk.setTimer, clearTimer: clk.clearTimer, onStall() {}, killPty: () => { kills++; } });
+  const s = printed();
+  guard.kill(s, '[stop]', STOP);
+  assert.deepEqual(guard.kill(s, '[stop]', STOP), { ok: true, already: true });
+  assert.deepEqual(guard.kill(s, '[quit]', { force: true, sessionId: 's1' }), { ok: true });
+  assert.equal(kills, 2);
+});
