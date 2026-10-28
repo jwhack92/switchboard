@@ -104,6 +104,7 @@ contextBridge.exposeInMainWorld('api', {
   addProjectFiles: (id, sourcePaths) => ipcRenderer.invoke('add-project-files', id, sourcePaths),
   listRecentProjectFiles: (id) => ipcRenderer.invoke('list-recent-project-files', id),
   getProjectPlan: (id) => ipcRenderer.invoke('get-project-plan', id),
+  readProjectSideFile: (id, name) => ipcRenderer.invoke('read-project-side-file', id, name),
   setPlanItem: (id, kind, line, done) => ipcRenderer.invoke('set-plan-item', id, kind, line, done),
   appendPlanItem: (id, kind, text) => ipcRenderer.invoke('append-plan-item', id, kind, text),
   editPlanItem: (id, kind, line, text) => ipcRenderer.invoke('edit-plan-item', id, kind, line, text),

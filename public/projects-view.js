@@ -1536,7 +1536,10 @@ async function loadProjectFiles(project, { force = false } = {}) {
     const cached = projectsUi.files.get(key);
     if (!force && cached && Date.now() - cached.at < 5000) return;
     let content = '';
-    try { content = await window.api.readMemory(project.root + '/' + name); } catch {}
+    try {
+      const res = await window.api.readProjectSideFile(project.id, name);
+      content = res && res.ok ? res.content : '';
+    } catch {}
     projectsUi.files.set(key, { content: typeof content === 'string' ? content : '', at: Date.now() });
   }));
 }

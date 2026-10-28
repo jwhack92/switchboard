@@ -925,6 +925,7 @@ ipcMain.handle('manage-project-entry', async (event, projectPath, relativePath, 
 ipcMain.handle('add-project-files', guarded((id, sourcePaths) => projects.addProjectFiles(id, sourcePaths)));
 ipcMain.handle('list-recent-project-files', guarded((id) => projects.listRecentProjectFiles(id)));
 ipcMain.handle('get-project-plan', guarded((id) => projects.readProjectPlan(id)));
+ipcMain.handle('read-project-side-file', guarded((id, name) => projects.readProjectSideFile(id, name)));
 ipcMain.handle('set-plan-item', guarded((id, kind, line, done) => projects.setPlanItem(id, kind, line, done)));
 ipcMain.handle('append-plan-item', guarded((id, kind, text) => projects.appendPlanItem(id, kind, text)));
 ipcMain.handle('edit-plan-item', guarded((id, kind, line, text) => projects.editPlanItem(id, kind, line, text)));

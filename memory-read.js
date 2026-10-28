@@ -9,7 +9,7 @@
 // main seeds from its own Memory scan (main.js, collectAndIndexMemories); the
 // read now asks the same set. Only the Memory tab calls it (openMemory, whose
 // items come from that scan); the Projects view's side cards read through
-// `read-project-file`, by project id.
+// `read-project-side-file`, by project id.
 //
 // Pure: no Electron, no other module of the app, no side effect on load. The
 // guard is handed in, so main passes memoryPaths.allows and tests a stub.
