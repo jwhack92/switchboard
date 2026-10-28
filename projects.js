@@ -1729,6 +1729,8 @@ function buildProjectTree(showArchived) {
 const TRACKER_FILE = 'plan-tracker.md';
 const TODOS_FILE = 'todos.md';
 const PLAN_FILE_BY_KIND = { plan: TRACKER_FILE, todos: TODOS_FILE };
+// The files the Projects view shows as side cards, read by readProjectFile.
+const PROJECT_SIDE_FILES = ['CLAUDE.md', 'plan.md', TRACKER_FILE, TODOS_FILE];
 
 function readTextOrEmpty(filePath) {
   try { return fs.readFileSync(filePath, 'utf8'); } catch { return ''; }
@@ -1758,6 +1760,19 @@ function readProjectPlan(projectId) {
     hasTracker: fs.existsSync(trackerPath),
     hasTodos: fs.existsSync(todosPath),
   };
+}
+
+/**
+ * One side card's text, '' when the file is missing. The name must be one of
+ * PROJECT_SIDE_FILES exactly and the folder is the project's own root, so the
+ * window names a project and a card, never a path (it used to read these
+ * through read-memory, which read any .md on disk).
+ */
+function readProjectFile(projectId, name) {
+  if (!PROJECT_SIDE_FILES.includes(name)) return { error: `Unknown file: ${String(name)}` };
+  const project = db.getProject(projectId);
+  if (!project) return { error: 'Project not found' };
+  return { ok: true, content: readTextOrEmpty(path.join(project.root, name)) };
 }
 
 /** Tick or untick one line of the tracker ('plan') or the todos ('todos'). */
@@ -1987,7 +2002,7 @@ module.exports = {
   syncProjectBrief, syncAllProjectBriefs, saveBrief, createProjectFile, addProjectFiles, listAddedFiles, listRecentProjectFiles,
   launchContext, mergeAddDirs, worktreeParentFor,
   PROJECT_FILES, ADDED_FILES_DIR,
-  readProjectPlan, setPlanItem, appendPlanItem, recordPlanLink, adoptPlan,
+  readProjectPlan, readProjectFile, PROJECT_SIDE_FILES, setPlanItem, appendPlanItem, recordPlanLink, adoptPlan,
   initPlanWatch, refreshPlanWatchers, stopPlanWatchers,
   listTemplates, templatesRoot, renderTemplateText, editPlanItem,
   listEnvFiles, defaultEnvSelection, copyEnvFiles,
