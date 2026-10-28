@@ -164,6 +164,7 @@ const { manageProjectEntry } = require('./file-management');
 const { PREVIEW_SCHEME, PREVIEW_SCHEMES, handlePreviewAssetRequest } = require('./preview-assets');
 const { createTaskManager } = require('./task-manager');
 const { createPanelPathGuard } = require('./save-containment');
+const { readMemoryFile } = require('./memory-read');
 
 // Token analytics (the Stats > Tokens tab). The store is derived data and must
 // never be able to stop the app: a syntax error, a missing file or a missing
@@ -210,9 +211,9 @@ const panelPaths = createPanelPathGuard({ log });
 // locations -- so "savable" means "the Memory tab listed this", which is
 // precisely the set of files the editor can open.
 //
-// NOT seeded from `read-memory`: that handler reads any .md that exists, so
-// recording what it read would let the renderer launder a path of its choosing
-// into this set with a read of its choosing. That is the hole, not the fix.
+// NOT seeded from `read-memory`: that handler only reads what this set already
+// holds (memory-read.js). Recording its reads would let the renderer launder a
+// path of its choosing into the set, which is the hole, not the fix.
 //
 // The limit is far above any plausible memory-file count and deliberately not
 // the default 4096: one scan seeds the whole set in one go, and a scan that
@@ -1832,18 +1833,9 @@ function collectAndIndexMemories() {
 ipcMain.handle('get-memories', () => collectAndIndexMemories());
 
 // --- IPC: read-memory ---
-ipcMain.handle('read-memory', (_event, filePath) => {
-  try {
-    const resolved = path.resolve(filePath);
-    // Allow paths under ~/.claude/ or any .md file that exists
-    if (!resolved.endsWith('.md')) return '';
-    if (!resolved.startsWith(CLAUDE_DIR) && !fs.existsSync(resolved)) return '';
-    return fs.readFileSync(resolved, 'utf8');
-  } catch (err) {
-    console.error('Error reading memory file:', err);
-    return '';
-  }
-});
+// Contained like `save-memory` below: only a file the Memory tab listed
+// (memoryPaths) is read; anything else is '' and a warn. See memory-read.js.
+ipcMain.handle('read-memory', (_event, filePath) => readMemoryFile(filePath, { allows: (p) => memoryPaths.allows(p), log }));
 
 // --- IPC: save-memory ---
 // Contained to the files the Memory tab itself listed (memoryPaths, seeded by
