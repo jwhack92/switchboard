@@ -46,4 +46,17 @@ jobs:
         run: npm ci
 
       - name: Full suite
-        run: npm test
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee suite.log
+
+      # The totals as a notice on the run page: the public API serves notices
+      # without a login, job logs only with one. Covers tap and spec output.
+      - name: Suite counts
+        if: always()
+        shell: bash
+        run: |
+          c=$(grep -E '^(# |ℹ )(tests|pass|fail|cancelled|skipped|todo) [0-9]+' suite.log \
+              | sed -E 's/^(# |ℹ )//' | paste -sd' ' -)
+          echo "::notice title=Suite counts (${{ matrix.os }})::${c:-no summary found}"
