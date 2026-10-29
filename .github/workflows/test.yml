@@ -18,7 +18,9 @@ jobs:
         os: [windows-2022, ubuntu-latest]
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # About twice the slower leg of the first run (windows-2022, 3.0 min with
+    # an empty npm cache, run 40809535728).
+    timeout-minutes: 6
 
     env:
       # Lets test/schedule-dst.test.js run; it skips where the zone has no
